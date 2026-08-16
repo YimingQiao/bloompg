@@ -170,9 +170,9 @@ bloompg_state_precedes(BloomPGRelationState *left,
 
 /* Preserve the fixed point's smallest-active order, with one exception:
  * delay the first physical read of a non-small relation when an incoming
- * exact join-key set could unlock its index.  If every active relation is
- * delayed, scan the smallest one to break the wait instead of inventing a
- * second scheduling policy. */
+ * exact join-key set could unlock its index.  This function still identifies
+ * the smallest guarded relation when every active relation waits; the caller
+ * may scan it only when its estimated output is a bounded exact-key driver. */
 static BloomPGRelationState *
 bloompg_select_active(BloomPGRelationState **states, int count)
 {
@@ -193,6 +193,7 @@ bloompg_select_active(BloomPGRelationState **states, int count)
 		state->selection_index_ready = index_ready;
 		state->selection_guarded = guarded;
 		state->selection_guard_fallback = false;
+		state->selection_native_fallback = false;
 		if (guarded)
 		{
 			if (bloompg_state_precedes(state, fallback))
@@ -554,6 +555,27 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 
 		if (source == NULL)
 			break;
+		/* A guarded source with at most this many rows is a safe small-driver
+		 * escape hatch: its distinct key set cannot exceed the exact-key probe
+		 * limit.  Above that bound, scanning it would silently turn an index
+		 * scheduling heuristic into an unbounded optimizer-time heap scan.  Keep
+		 * the already-built native preview instead. */
+		if (source->selection_guard_fallback &&
+			!source->selection_index_ready &&
+			source->current_rows > (double) bloompg_index_transfer_max_keys &&
+			bloompg_transfer_worker_count(source, query_parallel_safe) <= 0)
+		{
+			source->selection_guard_fallback = false;
+			source->selection_native_fallback = true;
+			outcome.applied = false;
+			outcome.native_fallback = true;
+			outcome.native_fallback_reason = "index-guard-stalemate";
+			appendStringInfo(&detail,
+				" native_fallback=%s:rti=%u:rows=%.0f>keys=%d",
+				outcome.native_fallback_reason, source->rti,
+				source->current_rows, bloompg_index_transfer_max_keys);
+			break;
+		}
 		appendStringInfo(&detail,
 			" select=%u:index_ready=%s:guarded=%s:fallback=%s",
 			source->rti, source->selection_index_ready ? "yes" : "no",
@@ -906,9 +928,10 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	}
 	bloompg_equality_domains_finish(equality_domains, &outcome, &detail);
 
-	bloompg_finalize_replacements(candidate, graph, states, relation_count,
-		query_string, bound_params, runtime_owner, query_parallel_safe,
-		&next_plan_node_id, &outcome, &detail);
+	if (!outcome.native_fallback)
+		bloompg_finalize_replacements(candidate, graph, states, relation_count,
+			query_string, bound_params, runtime_owner, query_parallel_safe,
+			&next_plan_node_id, &outcome, &detail);
 	outcome.profile_json = bloompg_transfer_finish_profile(states,
 		relation_count, outcome, &detail,
 		collect_profile ? &profile_steps : NULL);

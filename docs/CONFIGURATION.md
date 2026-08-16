@@ -63,8 +63,13 @@ concurrently.
 
 The index guard delays only relations whose base cardinality reaches the
 threshold and whose join key has a compatible B-tree index. If every active
-candidate is waiting, BloomPG scans the smallest current candidate so the
-fixed point can continue.
+candidate is waiting, BloomPG selects the smallest current candidate. It may
+scan that candidate when its current row estimate is no larger than
+`index_transfer_max_keys`, because its distinct key count cannot be larger, or
+when the scan has an eligible parallel transfer path. A larger serial
+candidate with no ready exact-key index path ends transfer and retains the
+native PostgreSQL preview plan. The structured profile reports
+`native_fallback_reason = "index-guard-stalemate"` for this case.
 
 ## P1 and materialization
 

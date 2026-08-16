@@ -53,11 +53,13 @@ bloompg_transfer_profile_append_step(StringInfo json, int step,
 	appendStringInfo(json,
 		",\"selection_join_index_sources\":%d,"
 		"\"selection_index_ready\":%s,\"selection_guarded\":%s,"
-		"\"selection_guard_fallback\":%s",
+		"\"selection_guard_fallback\":%s,"
+		"\"selection_native_fallback\":%s",
 		bms_num_members(source->join_index_sources),
 		source->selection_index_ready ? "true" : "false",
 		source->selection_guarded ? "true" : "false",
-		source->selection_guard_fallback ? "true" : "false");
+		source->selection_guard_fallback ? "true" : "false",
+		source->selection_native_fallback ? "true" : "false");
 	appendStringInfo(json, ",\"destination_rti\":%u,\"destination\":",
 		pending->destination->rti);
 	escape_json(json, pending->destination->table->alias != NULL ?
@@ -441,7 +443,8 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 					"\"materialization\":{\"access_path\":\"%s\","
 				"\"selection\":{\"policy\":\"index-wait-guard-v1\","
 				"\"join_index_sources\":%d,\"index_ready\":%s,"
-				"\"guarded\":%s,\"fallback\":%s},"
+				"\"guarded\":%s,\"fallback\":%s,"
+				"\"native_fallback\":%s},"
 				"\"access_plan\":{\"attempts\":" UINT64_FORMAT
 				",\"planning_ms\":%.3f,\"kind\":\"%s\","
 				"\"rejection\":\"%s\",\"exact_filters\":" UINT64_FORMAT
@@ -490,6 +493,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->selection_index_ready ? "true" : "false",
 				state->selection_guarded ? "true" : "false",
 				state->selection_guard_fallback ? "true" : "false",
+				state->selection_native_fallback ? "true" : "false",
 				state->access_plan_attempts, state->access_plan_ms,
 				state->access_plan_kind != NULL ?
 					state->access_plan_kind : "none",
@@ -695,7 +699,9 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 
 		initStringInfo(&profile_json);
 		appendStringInfo(&profile_json,
-			"{\"summary\":{\"applied\":%s,\"progress_metric\":\"%s\","
+			"{\"summary\":{\"applied\":%s,\"native_fallback\":%s,"
+			"\"native_fallback_reason\":\"%s\","
+			"\"progress_metric\":\"%s\","
 			"\"steps\":%d,"
 			"\"filters\":%d,\"build_rows\":" UINT64_FORMAT
 			",\"equality_domain_classes\":" UINT64_FORMAT
@@ -727,6 +733,9 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				",\"parallel_wave_relations\":" UINT64_FORMAT "},"
 			"\"steps\":[%s],\"relations\":[%s]}",
 			outcome.applied ? "true" : "false",
+			outcome.native_fallback ? "true" : "false",
+			outcome.native_fallback_reason != NULL ?
+				outcome.native_fallback_reason : "none",
 			bloompg_transfer_progress_metric ==
 				BLOOMPG_TRANSFER_PROGRESS_NDV ? "ndv" : "rows",
 			outcome.steps,

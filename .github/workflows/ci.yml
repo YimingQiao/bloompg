@@ -40,7 +40,37 @@ jobs:
         run: |
           make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
             PGHOST="$RUNNER_TEMP" PGPORT=55432
-          make pythoncheck
+          make pythoncheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+      - name: Extension upgrade smoke test
+        env:
+          PGHOST: ${{ runner.temp }}
+          PGPORT: "55432"
+        run: |
+          psql -v ON_ERROR_STOP=1 postgres <<'SQL'
+          CREATE EXTENSION bloompg VERSION '0.1.0';
+          DO $$
+          BEGIN
+            IF (SELECT extversion FROM pg_extension
+                WHERE extname = 'bloompg') <> '0.1.0' THEN
+              RAISE EXCEPTION 'expected bloompg 0.1.0 before upgrade';
+            END IF;
+          END
+          $$;
+          ALTER EXTENSION bloompg UPDATE TO '0.1.1';
+          DO $$
+          BEGIN
+            IF (SELECT extversion FROM pg_extension
+                WHERE extname = 'bloompg') <> '0.1.1' THEN
+              RAISE EXCEPTION 'expected bloompg 0.1.1 after upgrade';
+            END IF;
+            IF bloompg_version() <> 'bloompg 0.1.1 (PostgreSQL 18)' THEN
+              RAISE EXCEPTION 'BloomPG library version does not match SQL';
+            END IF;
+          END
+          $$;
+          DROP EXTENSION bloompg;
+          SQL
 
       - name: Show PostgreSQL log on failure
         if: failure()

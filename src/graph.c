@@ -17,41 +17,75 @@ typedef struct BloomPGQualContext
 	Bitmapset *right_relids;
 } BloomPGQualContext;
 
+typedef struct BloomPGRequiredAttributeContext
+{
+	Index		rti;
+	Index		sublevels_up;
+	Bitmapset *attributes;
+	bool		unsafe_reference;
+} BloomPGRequiredAttributeContext;
+
 static Bitmapset *bloompg_jointree_relids(Node *node);
 static void bloompg_visit_jointree(Node *node, BloomPGJoinGraph *graph);
 static void bloompg_visit_plan(Plan *plan, BloomPGJoinGraph *graph);
 
+static bool
+bloompg_required_attribute_walker(Node *node, void *context)
+{
+	BloomPGRequiredAttributeContext *required = context;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var *variable = castNode(Var, node);
+
+		if ((Index) variable->varno == required->rti &&
+			variable->varlevelsup == required->sublevels_up)
+		{
+			if (!AttributeNumberIsValid(variable->varattno))
+			{
+				required->unsafe_reference = true;
+				return true;
+			}
+			required->attributes = bms_add_member(required->attributes,
+				variable->varattno - FirstLowInvalidHeapAttributeNumber);
+		}
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		bool aborted;
+
+		required->sublevels_up++;
+		aborted = query_tree_walker(castNode(Query, node),
+			bloompg_required_attribute_walker, required,
+			QTW_IGNORE_JOINALIASES);
+		required->sublevels_up--;
+		return aborted;
+	}
+	return expression_tree_walker(node, bloompg_required_attribute_walker,
+		context);
+}
+
 static Bitmapset *
 bloompg_query_required_attributes(Query *query, Index rti)
 {
-	Bitmapset *result = NULL;
-	ListCell *cell;
+	BloomPGRequiredAttributeContext required;
 
-	/* pull_varattnos deliberately rejects unplanned Query nodes below a
-	 * SubLink.  Correlated/subplan cases keep the original full scan output. */
-	if (query == NULL || query->hasSubLinks)
+	if (query == NULL)
 		return NULL;
-	pull_varattnos((Node *) query->targetList, rti, &result);
-	pull_varattnos((Node *) query->jointree, rti, &result);
-	pull_varattnos(query->havingQual, rti, &result);
-	pull_varattnos(query->limitOffset, rti, &result);
-	pull_varattnos(query->limitCount, rti, &result);
+	MemSet(&required, 0, sizeof(required));
+	required.rti = rti;
+	query_tree_walker(query, bloompg_required_attribute_walker, &required,
+		QTW_IGNORE_JOINALIASES);
 
-	/*
-	 * PostgreSQL 18 represents grouped output columns with Vars referencing
-	 * an RTE_GROUP entry.  Their base-relation Vars live in the RTE's
-	 * groupexprs rather than in the top-level target list.  Include those
-	 * expressions explicitly, otherwise a column used only by GROUP BY and
-	 * the final output can be incorrectly pruned from the detached scan.
-	 */
-	foreach(cell, query->rtable)
-	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, cell);
-
-		if (rte->rtekind == RTE_GROUP)
-			pull_varattnos((Node *) rte->groupexprs, rti, &result);
-	}
-	return result;
+	/* A whole-row or system-column reference needs the scan's original tuple
+	 * shape.  Positive attributes, including correlated references from any
+	 * nested SubLink level, are safe to project independently. */
+	if (required.unsafe_reference)
+		return NULL;
+	return required.attributes;
 }
 
 static Bitmapset *

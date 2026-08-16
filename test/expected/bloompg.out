@@ -1,5 +1,5 @@
 CREATE EXTENSION bloompg;
-SELECT bloompg_version() = 'bloompg 0.1.0 (PostgreSQL 18)' AS version_ok;
+SELECT bloompg_version() = 'bloompg 0.1.1 (PostgreSQL 18)' AS version_ok;
  version_ok 
 ------------
  t
@@ -619,11 +619,63 @@ SELECT EXISTS (
  t
 (1 row)
 
+-- A guarded relation may be scanned to break a wait only when its estimated
+-- rows also bound the exact key driver.  Otherwise the optimizer must keep
+-- PostgreSQL's native plan instead of silently scanning a large input.  The
+-- incoming seed filter deliberately targets an unindexed column; only a later
+-- edge targets the guarded relation's leading index column.
+CREATE TABLE guard_seed(k integer, keep boolean);
+CREATE TABLE guard_middle(seed_key integer, indexed_key integer);
+CREATE TABLE guard_tail(indexed_key integer);
+INSERT INTO guard_seed
+SELECT g, g = 1 FROM generate_series(1, 100) AS g;
+INSERT INTO guard_middle
+SELECT g % 10, g FROM generate_series(1, 1000) AS g;
+INSERT INTO guard_tail SELECT g FROM generate_series(1, 1000) AS g;
+CREATE INDEX guard_middle_indexed_key_idx
+    ON guard_middle(indexed_key);
+ANALYZE guard_seed, guard_middle, guard_tail;
+SET bloompg.index_transfer_max_keys = 50;
+CALL assert_same('index_guard_native_fallback',
+    'SELECT count(*) FROM guard_seed s JOIN guard_middle m ON s.k = m.seed_key JOIN guard_tail t ON m.indexed_key = t.indexed_key WHERE s.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 100 AS index_guard_native_fallback_query_ok
+FROM guard_seed s
+JOIN guard_middle m ON s.k = m.seed_key
+JOIN guard_tail t ON m.indexed_key = t.indexed_key
+WHERE s.keep;
+ index_guard_native_fallback_query_ok 
+--------------------------------------
+ t
+(1 row)
+
+SELECT COALESCE(
+    (bloompg_last_profile()->'transfer'->'summary'
+        ->>'native_fallback')::boolean
+    AND bloompg_last_profile()->'transfer'->'summary'
+        ->>'native_fallback_reason' = 'index-guard-stalemate'
+    AND (bloompg_last_profile()->'transfer'->'summary'
+        ->>'applied')::boolean = false
+    AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(
+            bloompg_last_profile()->'transfer'->'relations') AS relation
+        WHERE relation->>'alias' = 'm'
+          AND (relation->'materialization'->'selection'
+              ->>'native_fallback')::boolean
+          AND (relation->'materialization'->>'exact_scans')::integer = 0),
+    false) AS index_guard_native_fallback_profile_ok;
+ index_guard_native_fallback_profile_ok 
+----------------------------------------
+ t
+(1 row)
+
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 RESET bloompg.transfer_progress_metric;
 RESET bloompg.index_guard_min_rows;
 RESET bloompg.index_transfer_max_fraction;
+RESET bloompg.index_transfer_max_keys;
 SET bloompg.excitation_threshold = 0.0;
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
@@ -846,6 +898,36 @@ WHERE name LIKE 'BloomPG%filter%';
 SET max_parallel_workers_per_gather = 0;
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
+SET bloompg.late_materialize = off;
+SELECT count(*) > 0 AS correlated_projection_query_ok
+FROM a JOIN c ON a.k = c.k
+WHERE a.keep
+  AND EXISTS (
+      SELECT 1 FROM b
+      WHERE b.k = a.k AND b.k2 = a.k2);
+ correlated_projection_query_ok 
+--------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT (relation->'projection'->>'columns')::integer = 3
+       AND ARRAY(
+           SELECT (attribute->>'attno')::integer
+           FROM jsonb_array_elements(
+               relation->'projection'->'attributes') AS attribute
+           ORDER BY (attribute->>'attno')::integer
+       ) = ARRAY[1, 2, 5]
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 'a'
+), false) AS correlated_projection_profile_ok;
+ correlated_projection_profile_ok 
+----------------------------------
+ t
+(1 row)
+
+SET bloompg.late_materialize = on;
 SELECT count(*) > 0 AS profiled_query_ok
 FROM a JOIN b ON a.k = b.k
 WHERE a.keep;

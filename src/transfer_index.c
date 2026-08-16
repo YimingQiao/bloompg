@@ -534,38 +534,6 @@ bloompg_bitmap_candidates_preferred(BloomPGRelationState *state,
 		(*selected_count > 1 && estimated_rows >= 1024.0);
 }
 
-bool
-bloompg_index_bitmap_prefilter_preferred(BloomPGRelationState *state)
-{
-	BloomPGIndexCandidate *candidates;
-	Relation heap_relation;
-	int *selected;
-	int count;
-	int selected_count;
-	int dominated_count;
-	bool preferred;
-
-	if (state == NULL || state->table == NULL ||
-		state->table->rte_kind != RTE_RELATION ||
-		!OidIsValid(state->table->relation_oid))
-		return false;
-	heap_relation = table_open(state->table->relation_oid, AccessShareLock);
-	count = bloompg_collect_index_candidates(heap_relation, state,
-		&candidates);
-	if (count == 0)
-	{
-		table_close(heap_relation, AccessShareLock);
-		return false;
-	}
-	selected = palloc_array(int, count);
-	preferred = bloompg_bitmap_candidates_preferred(state, candidates, count,
-		selected, &selected_count, &dominated_count);
-	pfree(selected);
-	pfree(candidates);
-	table_close(heap_relation, AccessShareLock);
-	return preferred;
-}
-
 static TIDBitmap *
 bloompg_build_candidate_bitmap(Snapshot snapshot,
 	BloomPGIndexCandidate *candidate, uint64 *keys_probed,

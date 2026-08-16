@@ -1,0 +1,46 @@
+{
+  "name": "bloompg",
+  "abstract": "Adaptive Bloom-filter transfer for PostgreSQL",
+  "description": "BloomPG executes selected relation inputs during planning, propagates exact Bloom or bitmap filters through an equality-join graph, and gives reduced relations back to PostgreSQL for a second planning pass.",
+  "version": "0.1.1",
+  "maintainer": [
+    "Yiming Qiao"
+  ],
+  "license": "mit",
+  "provides": {
+    "bloompg": {
+      "file": "sql/bloompg--0.1.1.sql",
+      "version": "0.1.1",
+      "abstract": "Adaptive Bloom-filter transfer for PostgreSQL"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": "18.0.0"
+      }
+    }
+  },
+  "resources": {
+    "homepage": "https://github.com/YimingQiao/bloompg",
+    "bugtracker": {
+      "web": "https://github.com/YimingQiao/bloompg/issues"
+    },
+    "repository": {
+      "url": "https://github.com/YimingQiao/bloompg.git",
+      "web": "https://github.com/YimingQiao/bloompg",
+      "type": "git"
+    }
+  },
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "http://pgxn.org/meta/spec.txt"
+  },
+  "generated_by": "BloomPG release process",
+  "tags": [
+    "bloom filter",
+    "join",
+    "optimizer",
+    "analytics"
+  ]
+}

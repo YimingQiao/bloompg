@@ -333,6 +333,8 @@ bloompg_planner(Query *parse,
 				ReleaseCurrentSubTransaction();
 				MemoryContextSwitchTo(planner_context);
 				CurrentResourceOwner = planner_owner;
+				if (transfer.native_fallback)
+					bloompg_runtime_cleanup_since(runtime_mark);
 				transfer_ms = bloompg_planner_elapsed_ms(transfer_started);
 			}
 			PG_CATCH(_transfer);

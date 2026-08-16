@@ -465,7 +465,7 @@ Datum
 bloompg_version(PG_FUNCTION_ARGS)
 {
 	(void) fcinfo;
-	PG_RETURN_TEXT_P(cstring_to_text("bloompg 0.1.0 (PostgreSQL 18)"));
+	PG_RETURN_TEXT_P(cstring_to_text("bloompg 0.1.1 (PostgreSQL 18)"));
 }
 
 Datum

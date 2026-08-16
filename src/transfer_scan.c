@@ -451,7 +451,6 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	state->materialization_used_filters |= state->filters != NIL;
 	INSTR_TIME_SET_CURRENT(started);
 	access_planned = state->filters != NIL &&
-		!bloompg_index_bitmap_prefilter_preferred(state) &&
 		bloompg_plan_transfer_access(state, query_string, bound_params,
 			&access_statement);
 	if (access_planned)

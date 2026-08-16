@@ -14,8 +14,5 @@ test/results/
 test/regression.diffs
 test/regression.out
 
-# Development runs are intentionally local.  Release evidence uses stable
-# names and is the only benchmark output tracked in the repository.
-benchmark_results/*
-!benchmark_results/README.md
-!benchmark_results/release_*.jsonl
+# Benchmark output is local.  README carries only the release summary.
+benchmark_results/

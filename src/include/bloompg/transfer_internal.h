@@ -147,6 +147,7 @@ typedef struct BloomPGRelationState
 	bool		selection_index_ready;
 	bool		selection_guarded;
 	bool		selection_guard_fallback;
+	bool		selection_native_fallback;
 	uint64		column_compactions;
 	uint64		slot_compactions;
 	uint64		vector_filter_builds;
@@ -295,8 +296,6 @@ extern char *bloompg_transfer_finish_profile(
 /* Exact-bitmap-driven B-tree access (transfer_index.c). */
 typedef bool (*BloomPGIndexTupleCallback)(TupleTableSlot *slot, void *context);
 extern bool bloompg_index_prefilter_available(BloomPGRelationState *state);
-extern bool bloompg_index_bitmap_prefilter_preferred(
-	BloomPGRelationState *state);
 extern bool bloompg_index_prefilter_estimate(BloomPGRelationState *state,
 	double *fraction, uint64 *keys, Oid *index_oid);
 extern bool bloompg_relation_has_transfer_index(BloomPGRelationState *state,

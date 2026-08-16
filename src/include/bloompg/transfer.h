@@ -37,6 +37,11 @@ typedef struct BloomPGReplacement
 typedef struct BloomPGTransferOutcome
 {
 	bool		applied;
+	/* The transfer scheduler reached a state where every remaining large
+	 * source was waiting for an index-driving exact key set.  The caller must
+	 * discard optimizer-time artifacts and execute the native preview plan. */
+	bool		native_fallback;
+	const char *native_fallback_reason;
 	bool		analysis_plan_modified;
 	int			steps;
 	int			filters;

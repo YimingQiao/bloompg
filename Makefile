@@ -1,5 +1,6 @@
 EXTENSION = bloompg
 MODULE_big = bloompg
+PGFILEDESC = "bloompg - adaptive Bloom-filter transfer for PostgreSQL"
 .DEFAULT_GOAL := all
 
 OBJS = \
@@ -36,7 +37,10 @@ OBJS = \
 	src/statistics.o \
 	src/runtime.o
 
-DATA = sql/bloompg--0.1.0.sql
+DATA = \
+	sql/bloompg--0.1.0.sql \
+	sql/bloompg--0.1.1.sql \
+	sql/bloompg--0.1.0--0.1.1.sql
 REGRESS = bloompg
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
