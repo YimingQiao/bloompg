@@ -1,0 +1,47 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgresql-18:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 18
+        run: |
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-server-dev-18
+
+      - name: Build and install
+        run: |
+          make -j2 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+      - name: Start test server
+        run: |
+          /usr/lib/postgresql/18/bin/initdb -D "$RUNNER_TEMP/pgdata" --no-locale
+          /usr/lib/postgresql/18/bin/pg_ctl -D "$RUNNER_TEMP/pgdata" \
+            -l "$RUNNER_TEMP/postgres.log" -o "-k $RUNNER_TEMP -p 55432" -w start
+
+      - name: Regression and unit tests
+        run: |
+          make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            PGHOST="$RUNNER_TEMP" PGPORT=55432
+          make pythoncheck
+
+      - name: Show PostgreSQL log on failure
+        if: failure()
+        run: test ! -f "$RUNNER_TEMP/postgres.log" || tail -n 200 "$RUNNER_TEMP/postgres.log"

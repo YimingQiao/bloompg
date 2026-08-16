@@ -1,0 +1,21 @@
+*.bc
+*.o
+*.so
+*.pyc
+__pycache__/
+results/
+regression.diffs
+regression.out
+tmp_check/
+tmp_check_iso/
+log/
+output_iso/
+test/results/
+test/regression.diffs
+test/regression.out
+
+# Development runs are intentionally local.  Release evidence uses stable
+# names and is the only benchmark output tracked in the repository.
+benchmark_results/*
+!benchmark_results/README.md
+!benchmark_results/release_*.jsonl
