@@ -2,6 +2,34 @@
 
 All notable changes to BloomPG are documented here.
 
+## 0.1.2 - 2026-08-17
+
+- Parallelize eligible transfer scans with relation-sized worker groups and
+  preserve relation-local parallelism when an unrelated SubLink restricts the
+  outer query.
+- Use exact P1 inputs from 10,000 rows to expose parallel hash alternatives,
+  avoiding serial join cliffs after successful transfer.
+- Columnize scan output in workers, send vector packets through Gather, and
+  bulk-import fixed-width and variable-width columns in the leader.
+- Use the same vector packets for shared Parallel Append waves, including
+  relations with different projections, instead of reconstructing rows in the
+  leader.
+- Build outgoing filters directly from arriving worker vectors, eliminating a
+  second column-store pass on parallel materializations.
+- Enforce one query-wide materialization budget across column stores, parallel
+  packet buffers, and P1 DSM copies; if it cannot be reserved, retain the
+  native PostgreSQL plan instead of spilling.
+- Bound backend-level prepared CTID and hydrated tuple caches and validate
+  every serialized vector, selection, filter, and by-reference datum before
+  worker access.
+- Preserve selective index-only paths, use exact-key PostgreSQL index/bitmap
+  plans where appropriate, and retain the native plan for parameterized index
+  joins and unsafe index-guard stalemates.
+- Prune materialized projections through nested correlated SubLinks and retain
+  fail-closed behavior for whole-row and system-column references.
+- Add assertion-enabled regression coverage for vector packets, toasted and
+  NULL values, parallel safety, index guards, and correlated projection.
+
 ## 0.1.1 - 2026-08-16
 
 - Stop an all-waiting index guard from performing an unbounded serial heap

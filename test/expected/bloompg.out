@@ -1,5 +1,5 @@
 CREATE EXTENSION bloompg;
-SELECT bloompg_version() = 'bloompg 0.1.1 (PostgreSQL 18)' AS version_ok;
+SELECT bloompg_version() = 'bloompg 0.1.2 (PostgreSQL 18)' AS version_ok;
  version_ok 
 ------------
  t
@@ -495,9 +495,6 @@ CALL assert_plan_contains('p1_parameterized_index_filter',
 CALL assert_plan_contains('p1_parameterized_index_path',
     'SELECT sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep',
     'p1_param_probe_k_idx');
-CALL assert_plan_contains('p1_parameterized_index_property',
-    'SELECT sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep',
-    'Parameterized Child: true');
 SELECT COALESCE(
     (bloompg_last_profile()->'planning'->'path_transform'->>'parameterized')::integer > 0
     AND (bloompg_last_profile()->'planning'->'path_transform'->>'input_paths')::integer =
@@ -670,12 +667,75 @@ SELECT COALESCE(
  t
 (1 row)
 
+-- A wide exact set on one index must not force materialization while a
+-- smaller producer is deliberately retaining a different parameterized
+-- index path.  The result is still too large to discard those native paths.
+CREATE TABLE protected_dimension(id integer, keep boolean);
+CREATE TABLE protected_source(id integer, dimension_id integer);
+CREATE TABLE guarded_dimension(id integer, keep boolean);
+CREATE TABLE protected_guarded_fact(protected_id integer, guarded_id integer);
+INSERT INTO protected_dimension
+SELECT g, g < 9 FROM generate_series(0, 9) AS g;
+INSERT INTO protected_source
+SELECT g, g % 10 FROM generate_series(1, 10000) AS g;
+INSERT INTO guarded_dimension
+SELECT g, g < 2 FROM generate_series(0, 999) AS g;
+INSERT INTO protected_guarded_fact
+SELECT 1 + (g % 10000), g % 1000 FROM generate_series(1, 100000) AS g;
+CREATE UNIQUE INDEX protected_source_id_idx ON protected_source(id);
+CREATE INDEX protected_source_dimension_idx
+    ON protected_source(dimension_id);
+CREATE INDEX protected_guarded_fact_protected_idx
+    ON protected_guarded_fact(protected_id);
+CREATE INDEX protected_guarded_fact_guarded_idx
+    ON protected_guarded_fact(guarded_id);
+ANALYZE protected_dimension, protected_source, guarded_dimension,
+    protected_guarded_fact;
+SET bloompg.index_transfer_max_fraction = 0.15;
+SET bloompg.index_transfer_max_keys = 50;
+SET bloompg.index_transfer_planner_max_keys = 1;
+CALL assert_same('index_guard_protected_source',
+    'SELECT count(*) FROM protected_dimension d JOIN protected_source p ON d.id = p.dimension_id JOIN protected_guarded_fact f ON p.id = f.protected_id JOIN guarded_dimension g ON g.id = f.guarded_id WHERE d.keep AND g.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 200 AS index_guard_protected_source_query_ok
+FROM protected_dimension d
+JOIN protected_source p ON d.id = p.dimension_id
+JOIN protected_guarded_fact f ON p.id = f.protected_id
+JOIN guarded_dimension g ON g.id = f.guarded_id
+WHERE d.keep AND g.keep;
+ index_guard_protected_source_query_ok 
+---------------------------------------
+ t
+(1 row)
+
+SELECT COALESCE(
+    (bloompg_last_profile()->'transfer'->'summary'
+        ->>'native_fallback')::boolean
+    AND bloompg_last_profile()->'transfer'->'summary'
+        ->>'native_fallback_reason' = 'index-guard-protected-source'
+    AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(
+            bloompg_last_profile()->'transfer'->'relations') AS relation
+        WHERE relation->>'alias' = 'f'
+          AND (relation->'materialization'->'selection'
+              ->>'index_ready')::boolean
+          AND (relation->'materialization'->'selection'
+              ->>'native_fallback')::boolean
+          AND (relation->'materialization'->>'base_scans')::integer = 0),
+    false) AS index_guard_protected_source_profile_ok;
+ index_guard_protected_source_profile_ok 
+-----------------------------------------
+ t
+(1 row)
+
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 RESET bloompg.transfer_progress_metric;
 RESET bloompg.index_guard_min_rows;
 RESET bloompg.index_transfer_max_fraction;
 RESET bloompg.index_transfer_max_keys;
+RESET bloompg.index_transfer_planner_max_keys;
 SET bloompg.excitation_threshold = 0.0;
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
@@ -745,17 +805,20 @@ SET bloompg.replan_after_transfer = off;
 CALL assert_same('direct_p0_execution',
     'SELECT a.k, a.k2, b.payload FROM a JOIN b ON a.k = b.k WHERE a.keep');
 SET bloompg.replan_after_transfer = on;
-SET work_mem = '64kB';
 SET bloompg.materialization_memory = '64kB';
 SET bloompg.late_materialize = off;
-CALL assert_same('spilled_materialization',
+CALL assert_same('memory_budget_fallback',
     'SELECT count(*), sum(length(a.payload)) FROM a JOIN b ON a.k = b.k WHERE a.k < 200');
-CALL assert_plan_contains('spilled_materialization_plan',
-    'SELECT count(*), sum(length(a.payload)) FROM a JOIN b ON a.k = b.k WHERE a.k < 200',
-    'Custom Scan (BloomPG Memory)');
-CALL assert_same('spilled_materialization_repeat',
+SELECT bloompg_last_trace() LIKE
+    '%fallback=optimizer_execution_error sqlstate=54000%'
+    AS memory_budget_fallback_ok;
+ memory_budget_fallback_ok 
+---------------------------
+ t
+(1 row)
+
+CALL assert_same('memory_budget_fallback_repeat',
     'SELECT count(*), sum(length(a.payload)) FROM a JOIN b ON a.k = b.k WHERE a.k < 200');
-RESET work_mem;
 RESET bloompg.materialization_memory;
 SET bloompg.late_materialize = on;
 SET bloompg.enable = on;
@@ -833,6 +896,8 @@ WHERE h.keep;
 SELECT (bloompg_last_profile()->'transfer'->'summary'->>'parallel_append_waves')::integer >= 1
    AND (bloompg_last_profile()->'transfer'->'summary'->>'parallel_waves')::integer
        < (bloompg_last_profile()->'transfer'->'summary'->>'parallel_scans')::integer
+   AND (bloompg_last_profile()->'transfer'->'summary'
+       ->>'parallel_workers_launched')::integer > 0
    AND (
        SELECT count(*)
        FROM jsonb_array_elements(
@@ -845,13 +910,83 @@ SELECT (bloompg_last_profile()->'transfer'->'summary'->>'parallel_append_waves')
  t
 (1 row)
 
+-- A SubLink can restrict the whole query without making unrelated detached
+-- relation scans unsafe.  Those local scans must retain parallel transfer.
+CALL assert_same('parallel_transfer_restricted_query',
+    'SELECT count(*) FROM parallel_wave_hub h JOIN parallel_wave_left l USING (k) JOIN parallel_wave_right r USING (k) WHERE h.keep AND h.k <= (SELECT max(h2.k) FROM parallel_wave_hub h2 WHERE h2.k = h.k)');
+SET bloompg.enable = on;
+SELECT count(*) = 50000 AS parallel_restricted_query_ok
+FROM parallel_wave_hub h
+JOIN parallel_wave_left l USING (k)
+JOIN parallel_wave_right r USING (k)
+WHERE h.keep
+  AND h.k <= (SELECT max(h2.k) FROM parallel_wave_hub h2
+              WHERE h2.k = h.k);
+ parallel_restricted_query_ok 
+------------------------------
+ t
+(1 row)
+
+SELECT (bloompg_last_profile()->'transfer'->'summary'
+       ->>'parallel_workers_launched')::integer > 0
+    AS parallel_restricted_source_scan_ok;
+ parallel_restricted_source_scan_ok 
+------------------------------------
+ t
+(1 row)
+
+-- Exercise the worker packet path itself, including NULL and toasted varlena
+-- values.  The leader should import vectors without reconstructing slots.
+CREATE TABLE parallel_pack_hub(k integer, keep boolean);
+CREATE TABLE parallel_pack_source(k integer, payload text);
+INSERT INTO parallel_pack_hub
+SELECT g, g <= 5 FROM generate_series(1, 1000) AS g;
+INSERT INTO parallel_pack_source
+SELECT 1 + (g % 200),
+       CASE WHEN g % 113 = 0 THEN NULL
+            WHEN g % 1000 = 0 THEN repeat('x', 5000)
+            ELSE repeat('x', 1 + (g % 7)) END
+FROM generate_series(1, 320000) AS g;
+ANALYZE parallel_pack_hub, parallel_pack_source;
+CALL assert_same('parallel_transfer_vector_packet',
+    'SELECT sum(length(s.payload)) > 0 FROM parallel_pack_hub h JOIN parallel_pack_source s USING (k) WHERE h.keep');
+SET bloompg.enable = on;
+SELECT sum(length(s.payload)) > 0 AS parallel_packet_query_ok
+FROM parallel_pack_hub h
+JOIN parallel_pack_source s USING (k)
+WHERE h.keep;
+ parallel_packet_query_ok 
+--------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT relation->'materialization'->>'access_path' = 'parallel-p0'
+       AND (relation->'materialization'->'parallel'
+            ->>'workers_launched')::integer > 0
+       AND (relation->'materialization'->'store'
+            ->>'varlen_values')::integer > 0
+       AND (relation->'materialization'->'store'
+            ->>'slot_reconstructions')::integer = 0
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 's'
+), false) AS parallel_packet_profile_ok;
+ parallel_packet_profile_ok 
+----------------------------
+ t
+(1 row)
+
 CREATE TABLE heterogeneous_wave_hub(k integer, keep boolean);
 CREATE TABLE heterogeneous_wave_left(k integer, payload text);
 CREATE TABLE heterogeneous_wave_right(k integer, payload bigint);
 INSERT INTO heterogeneous_wave_hub
 SELECT g, g <= 5 FROM generate_series(1, 1000) AS g;
 INSERT INTO heterogeneous_wave_left
-SELECT 1 + (g % 200), repeat('x', 1 + (g % 7))
+SELECT 1 + (g % 200),
+       CASE WHEN g % 113 = 0 THEN NULL
+            WHEN g % 10 = 0 THEN repeat('x', 5000)
+            ELSE repeat('x', 1 + (g % 7)) END
 FROM generate_series(1, 20000) AS g;
 INSERT INTO heterogeneous_wave_right
 SELECT 1 + (g % 200), g FROM generate_series(1, 20000) AS g;
@@ -927,9 +1062,84 @@ SELECT COALESCE((
  t
 (1 row)
 
+-- Track an outer Var through more than one SubLink level.  The expected set
+-- is semantic (join key, correlated key, local qual), not a physical-width
+-- shortcut tied to a benchmark table.
+SELECT count(*) > 0 AS nested_correlated_projection_query_ok
+FROM a JOIN c ON a.k = c.k
+WHERE a.keep
+  AND EXISTS (
+      SELECT 1 FROM b
+      WHERE b.k = a.k
+        AND EXISTS (
+            SELECT 1 FROM c AS nested_c
+            WHERE nested_c.k = b.k AND nested_c.k2 = a.k2));
+ nested_correlated_projection_query_ok 
+---------------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT ARRAY(
+           SELECT (attribute->>'attno')::integer
+           FROM jsonb_array_elements(
+               relation->'projection'->'attributes') AS attribute
+           ORDER BY (attribute->>'attno')::integer
+       ) = ARRAY[1, 2, 5]
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 'a'
+), false) AS nested_correlated_projection_profile_ok;
+ nested_correlated_projection_profile_ok 
+-----------------------------------------
+ t
+(1 row)
+
+-- Whole-row and system-column Vars deliberately keep the native scan tuple
+-- shape.  Projection is an optimization and must fail closed for both.
+SELECT count(a) > 0 AS whole_row_projection_query_ok
+FROM a JOIN c ON a.k = c.k
+WHERE a.keep;
+ whole_row_projection_query_ok 
+-------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT (relation->'projection'->>'columns')::integer =
+           (relation->'projection'->>'original_columns')::integer
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 'a'
+), false) AS whole_row_projection_fail_closed_ok;
+ whole_row_projection_fail_closed_ok 
+-------------------------------------
+ t
+(1 row)
+
+SELECT count(a.ctid) > 0 AS system_column_projection_query_ok
+FROM a JOIN c ON a.k = c.k
+WHERE a.keep;
+ system_column_projection_query_ok 
+-----------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT (relation->'projection'->>'columns')::integer =
+           (relation->'projection'->>'original_columns')::integer
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 'a'
+), false) AS system_column_projection_fail_closed_ok;
+ system_column_projection_fail_closed_ok 
+-----------------------------------------
+ t
+(1 row)
+
 SET bloompg.late_materialize = on;
 SELECT count(*) > 0 AS profiled_query_ok
-FROM a JOIN b ON a.k = b.k
+FROM a JOIN c ON a.k = c.k
 WHERE a.keep;
  profiled_query_ok 
 -------------------

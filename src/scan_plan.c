@@ -8,6 +8,7 @@
 
 #include "access/tableam.h"
 #include "access/htup_details.h"
+#include "catalog/pg_type_d.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
@@ -18,6 +19,7 @@
 #include "port/atomics.h"
 #include "utils/snapmgr.h"
 
+#include <math.h>
 
 static List *
 bloompg_oid_array_to_list(const Oid *values, int count)
@@ -365,6 +367,49 @@ bloompg_make_filter_scan(Plan *fallback_plan,
 	return plan;
 }
 
+/* Post-planner worker-side column packet.  The raw CustomScan exposes one
+ * bytea, while its child retains the relation's already-pruned projection. */
+Plan *
+bloompg_make_pack_scan(Plan *fallback_plan, int plan_node_id,
+	int parallel_workers)
+{
+	CustomScan *scan = makeNode(CustomScan);
+	Plan *plan = &scan->scan.plan;
+	TargetEntry *raw_entry = makeTargetEntry(
+		(Expr *) makeNullConst(BYTEAOID, -1, InvalidOid), 1,
+		pstrdup("__bloompg_vector_packet"), false);
+	List *raw_targetlist = list_make1(raw_entry);
+
+	plan->startup_cost = fallback_plan->startup_cost;
+	plan->total_cost = fallback_plan->total_cost;
+	plan->plan_rows = ceil(Max(fallback_plan->plan_rows, 1.0) /
+		(double) BLOOMPG_VECTOR_SIZE);
+	plan->plan_width = fallback_plan->plan_width >
+		(int) (MaxAllocSize / BLOOMPG_VECTOR_SIZE) ? (int) MaxAllocSize :
+		Max(fallback_plan->plan_width, 1) * BLOOMPG_VECTOR_SIZE;
+	plan->parallel_aware = false;
+	plan->parallel_safe = fallback_plan->parallel_safe;
+	plan->async_capable = false;
+	plan->plan_node_id = plan_node_id;
+	plan->targetlist = bloompg_make_index_targetlist(raw_targetlist);
+	plan->qual = NIL;
+	plan->lefttree = NULL;
+	plan->righttree = NULL;
+	plan->initPlan = NIL;
+	plan->extParam = bms_copy(fallback_plan->extParam);
+	plan->allParam = bms_copy(fallback_plan->allParam);
+
+	scan->scan.scanrelid = 0;
+	scan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	scan->custom_plans = list_make1(fallback_plan);
+	scan->custom_exprs = NIL;
+	scan->custom_scan_tlist = raw_targetlist;
+	scan->custom_relids = NULL;
+	scan->custom_private = list_make1(makeInteger(parallel_workers));
+	scan->methods = &bloompg_pack_scan_methods;
+	return plan;
+}
+
 bool
 bloompg_memory_scan_info(Plan *plan, uint64 *token, uint64 *rows)
 {
@@ -449,4 +494,5 @@ bloompg_scan_init(void)
 	RegisterCustomScanMethods(&bloompg_tid_scan_methods);
 	RegisterCustomScanMethods(&bloompg_filter_scan_methods);
 	RegisterCustomScanMethods(&bloompg_prefilter_scan_methods);
+	RegisterCustomScanMethods(&bloompg_pack_scan_methods);
 }

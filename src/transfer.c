@@ -36,6 +36,21 @@
 static bool bloompg_edge_matches_direction(const BloomPGJoinEdge *edge,
 	Index source_rti, Index destination_rti);
 
+typedef enum BloomPGScheduleAction
+{
+	BLOOMPG_SCHEDULE_STOP,
+	BLOOMPG_SCHEDULE_MATERIALIZE,
+	BLOOMPG_SCHEDULE_REQUIRE_INDEX,
+	BLOOMPG_SCHEDULE_NATIVE_FALLBACK
+} BloomPGScheduleAction;
+
+typedef struct BloomPGScheduleDecision
+{
+	BloomPGScheduleAction action;
+	BloomPGRelationState *source;
+	const char *reason;
+} BloomPGScheduleDecision;
+
 static bool
 bloompg_is_excited(double rows, double baseline)
 {
@@ -146,6 +161,31 @@ bloompg_has_pending_smaller_index_source(BloomPGRelationState *destination,
 	return false;
 }
 
+/* A smaller producer can deliberately stay native because PostgreSQL already
+ * has a parameterized index path for it.  Such a producer will never publish
+ * the key set awaited by a larger neighbour.  Treat it as a protected pending
+ * source rather than silently breaking the wait with a large materialization
+ * that would discard the neighbour's own join indexes. */
+static bool
+bloompg_has_protected_smaller_index_source(
+	BloomPGRelationState *destination, BloomPGRelationState **states, int count)
+{
+	int member = -1;
+
+	while ((member = bms_next_member(destination->join_index_sources,
+		member)) >= 0)
+	{
+		BloomPGRelationState *source = member <= count ? states[member] : NULL;
+
+		if (source != NULL && source != destination &&
+			source->native_index_guarded &&
+			source->base_rows < destination->base_rows &&
+			!bloompg_filter_received_from(destination, source->rti))
+			return true;
+	}
+	return false;
+}
+
 static bool
 bloompg_index_guard_delays(BloomPGRelationState *state,
 	BloomPGRelationState **states, int count, bool *index_ready)
@@ -157,7 +197,8 @@ bloompg_index_guard_delays(BloomPGRelationState *state,
 		return false;
 	*index_ready = bloompg_index_prefilter_available(state);
 	return !*index_ready ||
-		bloompg_has_pending_smaller_index_source(state, states, count);
+		bloompg_has_pending_smaller_index_source(state, states, count) ||
+		bloompg_has_protected_smaller_index_source(state, states, count);
 }
 
 static bool
@@ -168,14 +209,15 @@ bloompg_state_precedes(BloomPGRelationState *left,
 		(left->current_rows == right->current_rows && left->rti < right->rti);
 }
 
-/* Preserve the fixed point's smallest-active order, with one exception:
- * delay the first physical read of a non-small relation when an incoming
- * exact join-key set could unlock its index.  This function still identifies
- * the smallest guarded relation when every active relation waits; the caller
- * may scan it only when its estimated output is a bounded exact-key driver. */
-static BloomPGRelationState *
-bloompg_select_active(BloomPGRelationState **states, int count)
+/* Preserve the fixed point's smallest-active order, delaying the first
+ * physical read of a non-small relation when an exact incoming key set could
+ * unlock its index.  The scheduler owns the complete wait-break decision so
+ * callers never have to reconstruct a state from independent booleans. */
+static BloomPGScheduleDecision
+bloompg_schedule_next(BloomPGRelationState **states, int count,
+	bool query_parallel_safe)
 {
+	BloomPGScheduleDecision decision = {BLOOMPG_SCHEDULE_STOP, NULL, NULL};
 	BloomPGRelationState *best = NULL;
 	BloomPGRelationState *fallback = NULL;
 	int rti;
@@ -190,10 +232,9 @@ bloompg_select_active(BloomPGRelationState **states, int count)
 			continue;
 		guarded = bloompg_index_guard_delays(state, states, count,
 			&index_ready);
-		state->selection_index_ready = index_ready;
-		state->selection_guarded = guarded;
-		state->selection_guard_fallback = false;
-		state->selection_native_fallback = false;
+		state->selection.index_ready = index_ready;
+		state->selection.disposition = guarded ? BLOOMPG_SELECTION_WAITING :
+			BLOOMPG_SELECTION_ELIGIBLE;
 		if (guarded)
 		{
 			if (bloompg_state_precedes(state, fallback))
@@ -203,10 +244,44 @@ bloompg_select_active(BloomPGRelationState **states, int count)
 			best = state;
 	}
 	if (best != NULL)
-		return best;
-	if (fallback != NULL)
-		fallback->selection_guard_fallback = true;
-	return fallback;
+	{
+		decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
+		decision.source = best;
+		return decision;
+	}
+	if (fallback == NULL)
+		return decision;
+
+	fallback->selection.disposition = BLOOMPG_SELECTION_WAIT_BREAK;
+	/* A protected producer cannot become ready later.  Small outcomes remain
+	 * safe to materialize; a non-small relation must first prove that its
+	 * available exact keys produce a real index access path. */
+	if (fallback->current_rows >
+			(double) bloompg_index_transfer_max_keys &&
+		bloompg_has_protected_smaller_index_source(fallback, states, count))
+	{
+		decision.action = BLOOMPG_SCHEDULE_REQUIRE_INDEX;
+		decision.source = fallback;
+		return decision;
+	}
+	/* A small guarded source is a safe escape hatch because its row estimate
+	 * bounds the exact key population.  A large source may use a parallel heap
+	 * path only when the whole query is parallel-safe; relation-local safety is
+	 * sufficient for ordinary materialization, but must not turn a restricted
+	 * index stalemate into a speculative fact-table scan. */
+	if (!fallback->selection.index_ready &&
+		fallback->current_rows > (double) bloompg_index_transfer_max_keys &&
+		(!query_parallel_safe ||
+		 bloompg_transfer_worker_count(fallback, query_parallel_safe) <= 0))
+	{
+		fallback->selection.disposition = BLOOMPG_SELECTION_NATIVE_FALLBACK;
+		decision.action = BLOOMPG_SCHEDULE_NATIVE_FALLBACK;
+		decision.reason = "index-guard-stalemate";
+	}
+	else
+		decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
+	decision.source = fallback;
+	return decision;
 }
 
 static bool
@@ -267,24 +342,39 @@ bloompg_make_apply_spec(const BloomPGJoinGraph *graph,
 }
 
 /*
- * A large outer key population paired with PostgreSQL's parameterized index
- * path is the case where eager transfer is least attractive: materializing
- * the outer and then probing hundreds of thousands of keys duplicates work
- * that the native nested-loop/semi-join already performs efficiently.  If
- * the smallest initial source has no other useful destination, keep the
- * entire statement native before any optimizer-time heap scan occurs.
+ * A parameterized native index path already performs the same key-driven
+ * probe as transfer.  For an isolated two-relation join whose outer scan is
+ * large enough to run in parallel, PostgreSQL can distribute those probes
+ * across the outer workers and there is nowhere else to propagate the
+ * materialized result.  The same duplication occurs for a large outer key
+ * population even in a wider graph.  Keep those statements native before
+ * any optimizer-time scan.
  */
 static BloomPGRelationState *
 bloompg_initial_native_index_guard(BloomPGRelationState **states,
-	int relation_count, const BloomPGJoinGraph *graph)
+	int relation_count, const BloomPGJoinGraph *graph,
+	bool query_parallel_safe)
 {
-	BloomPGRelationState *source = bloompg_select_active(states,
-		relation_count);
+	BloomPGScheduleDecision schedule = bloompg_schedule_next(states,
+		relation_count, query_parallel_safe);
+	BloomPGRelationState *source = schedule.source;
 	int destination_rti;
 	int destinations = 0;
 	int protected_destinations = 0;
+	int participating_relations = 0;
+	bool terminal_parallel_pair;
 
-	if (source == NULL ||
+	if (source == NULL)
+		return NULL;
+	for (destination_rti = 1; destination_rti <= relation_count;
+		 destination_rti++)
+	{
+		if (states[destination_rti] != NULL)
+			participating_relations++;
+	}
+	terminal_parallel_pair = participating_relations == 2 &&
+		bloompg_transfer_worker_count(source, query_parallel_safe) > 0;
+	if (!terminal_parallel_pair &&
 		source->current_rows <= (double) bloompg_index_transfer_max_keys)
 		return NULL;
 	for (destination_rti = 1; destination_rti <= relation_count;
@@ -355,11 +445,11 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 						const char *query_string,
 						int cursor_options,
 						ParamListInfo bound_params,
-						ResourceOwner runtime_owner,
 						bool query_parallel_safe,
 						const Bitmapset *native_parameterized_indexes)
 {
 	BloomPGTransferOutcome outcome = {0};
+	BloomPGMemoryBudget *memory_budget;
 	BloomPGRelationState **states;
 	BloomPGEqualityDomains *equality_domains;
 	Bitmapset **sent_lineage;
@@ -391,7 +481,11 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 				"\"steps\":[],\"relations\":[]}");
 		return outcome;
 	}
+	memory_budget = bloompg_memory_budget_create(TopTransactionContext,
+		mul_size((Size) bloompg_materialization_memory_kb, (Size) 1024));
 
+	PG_TRY();
+	{
 	states = palloc0_array(BloomPGRelationState *, matrix_width);
 	sent_lineage = palloc0_array(Bitmapset *, matrix_width * matrix_width);
 	main_plan_relids = bloompg_plan_relids(candidate->planTree);
@@ -412,6 +506,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		state = palloc0(sizeof(BloomPGRelationState));
 		state->rti = table->rti;
 		state->replacement_rti = table->rti;
+		state->memory_budget = memory_budget;
 		state->table = table;
 		state->analysis_query = analysis_query;
 		state->cursor_options = cursor_options;
@@ -518,7 +613,8 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	equality_domains = bloompg_equality_domains_create(graph, relation_count);
 	{
 		BloomPGRelationState *guard_source =
-			bloompg_initial_native_index_guard(states, relation_count, graph);
+			bloompg_initial_native_index_guard(states, relation_count, graph,
+				query_parallel_safe);
 
 		if (guard_source != NULL)
 		{
@@ -540,8 +636,9 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	next_plan_node_id = bloompg_max_plan_node_id(candidate->planTree) + 1;
 	for (;;)
 	{
-		BloomPGRelationState *source = bloompg_select_active(states,
-			relation_count);
+		BloomPGScheduleDecision schedule = bloompg_schedule_next(states,
+			relation_count, query_parallel_safe);
+		BloomPGRelationState *source = schedule.source;
 		List *pending_transfers = NIL;
 		BloomPGColumnStore *store;
 		TupleDesc descriptor = NULL;
@@ -553,23 +650,35 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		int destination_rti;
 		instr_time source_started;
 
-		if (source == NULL)
+		if (schedule.action == BLOOMPG_SCHEDULE_STOP)
 			break;
-		/* A guarded source with at most this many rows is a safe small-driver
-		 * escape hatch: its distinct key set cannot exceed the exact-key probe
-		 * limit.  Above that bound, scanning it would silently turn an index
-		 * scheduling heuristic into an unbounded optimizer-time heap scan.  Keep
-		 * the already-built native preview instead. */
-		if (source->selection_guard_fallback &&
-			!source->selection_index_ready &&
-			source->current_rows > (double) bloompg_index_transfer_max_keys &&
-			bloompg_transfer_worker_count(source, query_parallel_safe) <= 0)
+		Assert(source != NULL);
+		if (schedule.action == BLOOMPG_SCHEDULE_REQUIRE_INDEX)
 		{
-			source->selection_guard_fallback = false;
-			source->selection_native_fallback = true;
+			PlannedStmt *access_statement = NULL;
+
+			/* Breaking a protected wait is safe only when PostgreSQL itself can
+			 * turn the available exact keys into an index access path.  Cache the
+			 * auxiliary plan so physical materialization does not plan it twice. */
+			if (bloompg_plan_transfer_access(source, query_string, bound_params,
+					&access_statement))
+			{
+				source->preplanned_access = access_statement;
+				schedule.action = BLOOMPG_SCHEDULE_MATERIALIZE;
+			}
+			else
+			{
+				source->selection.disposition =
+					BLOOMPG_SELECTION_NATIVE_FALLBACK;
+				schedule.action = BLOOMPG_SCHEDULE_NATIVE_FALLBACK;
+				schedule.reason = "index-guard-protected-source";
+			}
+		}
+		if (schedule.action == BLOOMPG_SCHEDULE_NATIVE_FALLBACK)
+		{
 			outcome.applied = false;
 			outcome.native_fallback = true;
-			outcome.native_fallback_reason = "index-guard-stalemate";
+			outcome.native_fallback_reason = schedule.reason;
 			appendStringInfo(&detail,
 				" native_fallback=%s:rti=%u:rows=%.0f>keys=%d",
 				outcome.native_fallback_reason, source->rti,
@@ -578,9 +687,10 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		}
 		appendStringInfo(&detail,
 			" select=%u:index_ready=%s:guarded=%s:fallback=%s",
-			source->rti, source->selection_index_ready ? "yes" : "no",
-			source->selection_guarded ? "yes" : "no",
-			source->selection_guard_fallback ? "yes" : "no");
+			source->rti, source->selection.index_ready ? "yes" : "no",
+			bloompg_selection_is_guarded(source->selection) ? "yes" : "no",
+			source->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
+				"yes" : "no");
 		source->active = false;
 		for (destination_rti = 1; destination_rti <= relation_count;
 			 destination_rti++)
@@ -656,7 +766,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 				source->materialized ? "yes" : "no");
 		if (!source->materialized && !source->prefetched)
 			(void) bloompg_prefetch_active_pair(source, states, relation_count,
-				graph, candidate, query_string, bound_params, runtime_owner,
+				graph, candidate, query_string, bound_params,
 				query_parallel_safe, &next_plan_node_id,
 				&next_parallel_wave_id);
 		if (source->prefetched)
@@ -684,9 +794,9 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		else
 		{
 			materialization_token = bloompg_runtime_next_token();
-			store = bloompg_begin_runtime_store(runtime_owner);
-			/* Register immediately so the planner catch path can close a spilled
-			 * store even when execution errors before its descriptor is known. */
+			store = bloompg_begin_runtime_store(source->memory_budget);
+			/* Register immediately so the planner catch path can close the store
+			 * even when execution errors before its descriptor is known. */
 			bloompg_runtime_register_materialization(materialization_token,
 				GetActiveSnapshot(), store, NULL, 0);
 			rows_seen = bloompg_execute_state_source(source, candidate,
@@ -701,9 +811,8 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		}
 		if (bloompg_log_transfer_steps)
 			elog(LOG, "bloompg transfer source %u finish rows=" UINT64_FORMAT
-				" elapsed=%.3fms store=%s bytes=%zu",
+				" elapsed=%.3fms store=column bytes=%zu",
 				source->rti, rows_seen, bloompg_transfer_elapsed_ms(source_started),
-				bloompg_column_store_spilled(store) ? "spill" : "column",
 				bloompg_column_store_memory_bytes(store));
 		source->current_rows = (double) rows_seen;
 		excited = bloompg_is_excited(source->current_rows,
@@ -930,11 +1039,17 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 
 	if (!outcome.native_fallback)
 		bloompg_finalize_replacements(candidate, graph, states, relation_count,
-			query_string, bound_params, runtime_owner, query_parallel_safe,
+			query_string, bound_params, query_parallel_safe,
 			&next_plan_node_id, &outcome, &detail);
 	outcome.profile_json = bloompg_transfer_finish_profile(states,
 		relation_count, outcome, &detail,
 		collect_profile ? &profile_steps : NULL);
 	outcome.detail = detail.data;
+	}
+	PG_FINALLY();
+	{
+		bloompg_memory_budget_release(memory_budget);
+	}
+	PG_END_TRY();
 	return outcome;
 }

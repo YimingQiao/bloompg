@@ -7,7 +7,6 @@
 #include "bloompg/statistics.h"
 #include "nodes/params.h"
 #include "nodes/plannodes.h"
-#include "utils/resowner.h"
 
 typedef enum BloomPGReplacementKind
 {
@@ -31,6 +30,9 @@ typedef struct BloomPGReplacement
 	 * Bloom filter.  This lets P1 retain keyed lookup without weakening the
 	 * relation-replacement contract. */
 	bool		native_parameterized_paths_equivalent;
+	/* Parallel P1 scans serialize the materialization into DSM.  Expose that
+	 * path only when the copy was reserved from the query-wide budget. */
+	bool		parallel_dsm_allowed;
 	BloomPGMaterializedStatistics *statistics;
 } BloomPGReplacement;
 
@@ -69,7 +71,6 @@ extern BloomPGTransferOutcome bloompg_apply_transfers(PlannedStmt *candidate,
 											 const char *query_string,
 											 int cursor_options,
 											 ParamListInfo bound_params,
-											 ResourceOwner runtime_owner,
 											 bool query_parallel_safe,
 											 const Bitmapset *native_parameterized_indexes);
 extern Bitmapset *bloompg_parameterized_index_relids(PlannedStmt *statement);

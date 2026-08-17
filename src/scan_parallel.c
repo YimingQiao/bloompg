@@ -104,44 +104,12 @@ bloompg_estimate_parallel_column_store(BloomPGRuntimeMaterializationEntry *entry
 	return size;
 }
 
-static Size
-bloompg_estimate_parallel_tuple_store(BloomPGRuntimeMaterializationEntry *entry)
-{
-	TupleTableSlot *slot;
-	BloomPGColumnStoreScan scan;
-	Size data_bytes = 0;
-	uint64 rows = 0;
-
-	if (entry == NULL || entry->store == NULL || entry->descriptor == NULL)
-		return bloompg_parallel_store_header_size(0);
-	slot = MakeSingleTupleTableSlot(entry->descriptor, &TTSOpsVirtual);
-	bloompg_column_store_begin_scan(entry->store, &scan, EXEC_FLAG_REWIND);
-	while (bloompg_column_store_next(entry->store, &scan, true, slot, NULL))
-	{
-		bool should_free;
-		MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &should_free);
-
-		data_bytes = add_size(data_bytes, MAXALIGN(tuple->t_len));
-		rows++;
-		if (should_free)
-			heap_free_minimal_tuple(tuple);
-		ExecClearTuple(slot);
-	}
-	ExecDropSingleTupleTableSlot(slot);
-	bloompg_column_store_end_scan(&scan);
-	if (rows != entry->rows)
-		elog(ERROR, "bloompg materialization row count changed before parallel execution");
-	return add_size(bloompg_parallel_store_header_size(rows), data_bytes);
-}
-
 Size
 bloompg_estimate_parallel_store(BloomPGRuntimeMaterializationEntry *entry)
 {
 	if (entry == NULL || entry->store == NULL || entry->descriptor == NULL)
 		return bloompg_parallel_store_header_size(0);
-	if (!bloompg_column_store_spilled(entry->store))
-		return bloompg_estimate_parallel_column_store(entry);
-	return bloompg_estimate_parallel_tuple_store(entry);
+	return bloompg_estimate_parallel_column_store(entry);
 }
 
 static void
@@ -225,50 +193,6 @@ bloompg_fill_parallel_column_store(BloomPGRuntimeMaterializationEntry *entry,
 	parallel_store->data_bytes = used - parallel_store->data_offset;
 }
 
-static void
-bloompg_fill_parallel_tuple_store(BloomPGRuntimeMaterializationEntry *entry,
-	BloomPGParallelStore *parallel_store, Size allocated_size)
-{
-	TupleTableSlot *slot;
-	BloomPGColumnStoreScan scan;
-	char *data;
-	Size used = 0;
-	uint64 rows = 0;
-
-	parallel_store->format = BLOOMPG_PARALLEL_STORE_TUPLES;
-	parallel_store->rows = entry->rows;
-	parallel_store->data_offset = bloompg_parallel_store_header_size(entry->rows);
-	if (parallel_store->data_offset > allocated_size)
-		elog(ERROR, "bloompg parallel materialization metadata overflow");
-	data = (char *) parallel_store + parallel_store->data_offset;
-	slot = MakeSingleTupleTableSlot(entry->descriptor, &TTSOpsVirtual);
-	bloompg_column_store_begin_scan(entry->store, &scan, EXEC_FLAG_REWIND);
-	while (bloompg_column_store_next(entry->store, &scan, true, slot, NULL))
-	{
-		bool should_free;
-		MinimalTuple tuple = ExecFetchSlotMinimalTuple(slot, &should_free);
-		Size tuple_space = MAXALIGN(tuple->t_len);
-
-		if (rows >= entry->rows ||
-			parallel_store->data_offset + used > allocated_size ||
-			tuple_space > allocated_size - parallel_store->data_offset - used)
-			elog(ERROR, "bloompg parallel materialization exceeded its DSM estimate");
-		parallel_store->offsets[rows] = used;
-		memcpy(data + used, tuple, tuple->t_len);
-		used += tuple_space;
-		rows++;
-		if (should_free)
-			heap_free_minimal_tuple(tuple);
-		ExecClearTuple(slot);
-	}
-	ExecDropSingleTupleTableSlot(slot);
-	bloompg_column_store_end_scan(&scan);
-	if (rows != entry->rows)
-		elog(ERROR, "bloompg materialization row count changed during parallel setup");
-	parallel_store->offsets[rows] = used;
-	parallel_store->data_bytes = used;
-}
-
 void
 bloompg_fill_parallel_store(BloomPGRuntimeMaterializationEntry *entry,
 	BloomPGParallelStore *parallel_store, Size allocated_size)
@@ -278,62 +202,140 @@ bloompg_fill_parallel_store(BloomPGRuntimeMaterializationEntry *entry,
 	parallel_store->total_size = allocated_size;
 	if (entry == NULL || entry->store == NULL || entry->descriptor == NULL)
 		return;
-	if (!bloompg_column_store_spilled(entry->store))
-		bloompg_fill_parallel_column_store(entry, parallel_store, allocated_size);
-	else
-		bloompg_fill_parallel_tuple_store(entry, parallel_store, allocated_size);
+	bloompg_fill_parallel_column_store(entry, parallel_store, allocated_size);
 	parallel_store->available = true;
 }
 
-MinimalTuple
-bloompg_parallel_next_tuple(BloomPGParallelStore *parallel_store)
-{
-	uint64 index;
-	uint64 offset;
-	uint64 next_offset;
-	char *data;
-
-	if (parallel_store == NULL || !parallel_store->available ||
-		parallel_store->format != BLOOMPG_PARALLEL_STORE_TUPLES)
-		return NULL;
-	index = pg_atomic_fetch_add_u64(&parallel_store->next_item, 1);
-	if (index >= parallel_store->rows)
-		return NULL;
-	offset = parallel_store->offsets[index];
-	next_offset = parallel_store->offsets[index + 1];
-	if (offset >= next_offset || next_offset > parallel_store->data_bytes)
-		elog(ERROR, "invalid bloompg parallel materialization offset");
-	data = (char *) parallel_store + parallel_store->data_offset;
-	return (MinimalTuple) (data + offset);
-}
-
 static bool
-bloompg_parallel_range_valid(const BloomPGParallelStore *store,
-	Size offset, Size bytes)
+bloompg_parallel_range_valid(Size lower, Size upper, Size offset, Size bytes)
 {
-	return offset <= store->total_size && bytes <= store->total_size - offset;
+	return offset >= lower && offset <= upper && bytes <= upper - offset;
 }
 
 static BloomPGParallelColumnChunk *
-bloompg_parallel_column_chunk(BloomPGParallelStore *store, uint64 chunk_index)
+bloompg_parallel_validate_column_chunk(BloomPGParallelStore *store,
+	uint64 chunk_index, TupleDesc descriptor)
 {
+	char *base = (char *) store;
 	uint64 offset;
 	uint64 next_offset;
 	Size header_size;
+	Size expected;
 	BloomPGParallelColumnChunk *chunk;
+	const uint16 *selection;
+	uint32 attribute;
+	uint32 selected;
 
-	if (chunk_index >= store->chunks)
-		return NULL;
+	if (store->format != BLOOMPG_PARALLEL_STORE_COLUMNS ||
+		store->natts != (uint32) descriptor->natts || store->natts == 0)
+		elog(ERROR, "invalid bloompg parallel store descriptor");
+	header_size = bloompg_parallel_store_header_size(store->chunks);
+	if (header_size > store->total_size || store->data_offset != header_size ||
+		store->data_bytes != store->total_size - store->data_offset ||
+		store->offsets[store->chunks] != store->total_size ||
+		chunk_index >= store->chunks)
+		elog(ERROR, "invalid bloompg parallel store header");
 	offset = store->offsets[chunk_index];
 	next_offset = store->offsets[chunk_index + 1];
-	if (offset >= next_offset || next_offset > store->total_size)
+	if (offset < store->data_offset || offset >= next_offset ||
+		next_offset > store->total_size ||
+		next_offset - offset < offsetof(BloomPGParallelColumnChunk, vectors))
 		elog(ERROR, "invalid bloompg parallel column chunk offset");
-	chunk = (BloomPGParallelColumnChunk *) ((char *) store + offset);
-	if (chunk->vector_count != store->natts)
+	chunk = (BloomPGParallelColumnChunk *) (base + offset);
+	if (chunk->vector_count != store->natts ||
+		chunk->count > BLOOMPG_VECTOR_SIZE ||
+		chunk->selected_count > chunk->count)
 		elog(ERROR, "invalid bloompg parallel column count");
 	header_size = bloompg_parallel_column_chunk_header_size(chunk->vector_count);
 	if (header_size > next_offset - offset)
 		elog(ERROR, "invalid bloompg parallel column metadata");
+	expected = add_size((Size) offset, header_size);
+	if (chunk->selection_offset != expected ||
+		!bloompg_parallel_range_valid(offset, next_offset,
+			chunk->selection_offset,
+			mul_size(chunk->selected_count, sizeof(uint16))))
+		elog(ERROR, "invalid bloompg parallel selection vector");
+	selection = (const uint16 *) (base + chunk->selection_offset);
+	for (selected = 0; selected < chunk->selected_count; selected++)
+	{
+		if (selection[selected] >= chunk->count ||
+			(selected > 0 && selection[selected] <= selection[selected - 1]))
+			elog(ERROR, "invalid bloompg parallel selected row");
+	}
+	expected = add_size(expected, MAXALIGN(mul_size(chunk->selected_count,
+		sizeof(uint16))));
+	for (attribute = 0; attribute < store->natts; attribute++)
+	{
+		BloomPGParallelColumnVector *vector = &chunk->vectors[attribute];
+		Form_pg_attribute form = TupleDescAttr(descriptor, attribute);
+		BloomPGVectorPhysicalType physical_type;
+		Size data_bytes;
+		Size validity_bytes;
+		uint32 validity_words =
+			(chunk->count + BLOOMPG_VALIDITY_BITS - 1) /
+			BLOOMPG_VALIDITY_BITS;
+
+		if (!form->attbyval)
+			physical_type = BLOOMPG_VECTOR_BYREF;
+		else if (form->attlen == 1)
+			physical_type = BLOOMPG_VECTOR_BYVAL_1;
+		else if (form->attlen == 2)
+			physical_type = BLOOMPG_VECTOR_BYVAL_2;
+		else if (form->attlen == 4)
+			physical_type = BLOOMPG_VECTOR_BYVAL_4;
+		else if (form->attlen == 8)
+			physical_type = BLOOMPG_VECTOR_BYVAL_8;
+		else
+			elog(ERROR, "invalid bloompg parallel by-value width");
+		if (vector->type_oid != form->atttypid ||
+			vector->typlen != form->attlen ||
+			vector->physical_type != (uint8) physical_type)
+			elog(ERROR, "invalid bloompg parallel vector descriptor");
+		data_bytes = mul_size(chunk->count,
+			bloompg_parallel_vector_width(physical_type));
+		validity_bytes = mul_size(validity_words, sizeof(uint64));
+		if (vector->data_offset != expected ||
+			!bloompg_parallel_range_valid(offset, next_offset,
+				vector->data_offset, data_bytes))
+			elog(ERROR, "invalid bloompg parallel vector data");
+		expected = add_size(expected, MAXALIGN(data_bytes));
+		if (vector->validity_offset != expected ||
+			!bloompg_parallel_range_valid(offset, next_offset,
+				vector->validity_offset, validity_bytes))
+			elog(ERROR, "invalid bloompg parallel vector validity");
+		expected = add_size(expected, MAXALIGN(validity_bytes));
+		if (physical_type == BLOOMPG_VECTOR_BYREF)
+		{
+			const uint64 *validity =
+				(const uint64 *) (base + vector->validity_offset);
+			const uint32 *offsets =
+				(const uint32 *) (base + vector->data_offset);
+			uint32 row;
+
+			if (vector->heap_offset != expected ||
+				!bloompg_parallel_range_valid(offset, next_offset,
+					vector->heap_offset, vector->heap_used))
+				elog(ERROR, "invalid bloompg parallel vector heap");
+			for (row = 0; row < chunk->count; row++)
+			{
+				Size datum_size;
+
+				if ((validity[row / BLOOMPG_VALIDITY_BITS] &
+						(UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS))) == 0)
+					continue;
+				if ((offsets[row] % MAXIMUM_ALIGNOF) != 0 ||
+					!bloompg_byref_datum_size(base + vector->heap_offset,
+						vector->heap_used, vector->typlen, offsets[row],
+						&datum_size))
+					elog(ERROR, "invalid bloompg parallel by-reference datum");
+			}
+			expected = add_size(expected, MAXALIGN(vector->heap_used));
+		}
+		else if (vector->heap_offset != 0 || vector->heap_used != 0)
+			elog(ERROR, "invalid bloompg fixed-width parallel vector heap");
+	}
+	if (expected != next_offset)
+		elog(ERROR, "invalid bloompg parallel column chunk length");
 	return chunk;
 }
 
@@ -358,22 +360,19 @@ bloompg_parallel_next_column(BloomPGParallelStore *store,
 			if (cursor->chunk_index >= store->chunks)
 				return false;
 			cursor->selected_index = 0;
+			chunk = bloompg_parallel_validate_column_chunk(store,
+				cursor->chunk_index, slot->tts_tupleDescriptor);
 			cursor->chunk_valid = true;
 		}
-		chunk = bloompg_parallel_column_chunk(store, cursor->chunk_index);
+		else
+			chunk = (BloomPGParallelColumnChunk *) (base +
+				store->offsets[cursor->chunk_index]);
 		if (cursor->selected_index < chunk->selected_count)
 			break;
 		cursor->chunk_valid = false;
 	}
-	if (!bloompg_parallel_range_valid(store, chunk->selection_offset,
-		mul_size(chunk->selected_count, sizeof(uint16))))
-		elog(ERROR, "invalid bloompg parallel selection vector");
 	selection = (const uint16 *) (base + chunk->selection_offset);
 	row = selection[cursor->selected_index++];
-	if (row >= chunk->count)
-		elog(ERROR, "invalid bloompg parallel selected row");
-	if ((uint32) slot->tts_tupleDescriptor->natts != store->natts)
-		elog(ERROR, "bloompg parallel slot descriptor changed");
 
 	ExecClearTuple(slot);
 	for (attribute = 0; attribute < store->natts; attribute++)
@@ -381,17 +380,9 @@ bloompg_parallel_next_column(BloomPGParallelStore *store,
 		BloomPGParallelColumnVector *vector = &chunk->vectors[attribute];
 		BloomPGVectorPhysicalType physical_type =
 			(BloomPGVectorPhysicalType) vector->physical_type;
-		Size width = bloompg_parallel_vector_width(physical_type);
-		uint32 validity_words = (chunk->count + BLOOMPG_VALIDITY_BITS - 1) /
-			BLOOMPG_VALIDITY_BITS;
 		const uint64 *validity;
 		const char *data;
 
-		if (!bloompg_parallel_range_valid(store, vector->data_offset,
-			mul_size(chunk->count, width)) ||
-			!bloompg_parallel_range_valid(store, vector->validity_offset,
-				mul_size(validity_words, sizeof(uint64))))
-			elog(ERROR, "invalid bloompg parallel column vector");
 		validity = (const uint64 *) (base + vector->validity_offset);
 		slot->tts_isnull[attribute] =
 			(validity[row / BLOOMPG_VALIDITY_BITS] &
@@ -420,10 +411,6 @@ bloompg_parallel_next_column(BloomPGParallelStore *store,
 			{
 				uint32 heap_offset = ((const uint32 *) data)[row];
 
-				if (heap_offset >= vector->heap_used ||
-					!bloompg_parallel_range_valid(store, vector->heap_offset,
-						vector->heap_used))
-					elog(ERROR, "invalid bloompg parallel by-reference datum");
 				slot->tts_values[attribute] = PointerGetDatum(
 					base + vector->heap_offset + heap_offset);
 				break;

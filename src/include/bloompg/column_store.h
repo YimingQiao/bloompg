@@ -4,9 +4,9 @@
 #include "postgres.h"
 
 #include "executor/tuptable.h"
-#include "utils/resowner.h"
 
 typedef struct BloomPGColumnStore BloomPGColumnStore;
+typedef struct BloomPGMemoryBudget BloomPGMemoryBudget;
 
 #define BLOOMPG_VECTOR_SIZE 2048
 #define BLOOMPG_VALIDITY_BITS 64
@@ -44,7 +44,7 @@ typedef struct BloomPGColumnVector
 
 /* A zero-copy view over one in-memory vector chunk.  Selection entries are
  * physical row indexes into every vector in the chunk.  Views are invalidated
- * when the store is appended to, spilled, filtered, or destroyed. */
+ * when the store is appended to, filtered, or destroyed. */
 typedef struct BloomPGColumnStoreChunkView
 {
 	uint64		row_base;
@@ -100,25 +100,45 @@ bloompg_column_chunk_get_datum(const BloomPGColumnStoreChunkView *view,
 	return true;
 }
 
+extern bool bloompg_byref_datum_size(const char *heap, uint32 heap_used,
+	int16 typlen, uint32 offset, Size *size);
+
 typedef struct BloomPGColumnStoreScan
 {
-	int			read_pointer;
 	uint64		position;
-	TupleTableSlot *spill_slot;
 	uint32		memory_chunk;
 	bool		memory_chunk_valid;
 } BloomPGColumnStoreScan;
 
+extern BloomPGMemoryBudget *bloompg_memory_budget_create(MemoryContext parent,
+	Size memory_limit);
+extern void bloompg_memory_budget_retain(BloomPGMemoryBudget *budget);
+extern void bloompg_memory_budget_release(BloomPGMemoryBudget *budget);
+extern Size bloompg_memory_budget_limit(const BloomPGMemoryBudget *budget);
+extern Size bloompg_memory_budget_remaining(const BloomPGMemoryBudget *budget);
+extern bool bloompg_memory_budget_reserve(BloomPGMemoryBudget *budget,
+	Size bytes);
+extern void bloompg_memory_budget_release_reservation(
+	BloomPGMemoryBudget *budget, Size bytes);
+extern bool bloompg_memory_budget_reserve_dsm(BloomPGMemoryBudget *budget,
+	Size bytes);
+
 extern BloomPGColumnStore *bloompg_column_store_create(MemoryContext parent,
-	ResourceOwner runtime_owner, Size memory_limit);
+	BloomPGMemoryBudget *memory_budget);
+extern BloomPGMemoryBudget *bloompg_column_store_memory_budget(
+	const BloomPGColumnStore *store);
 extern void bloompg_column_store_set_descriptor(BloomPGColumnStore *store,
 	TupleDesc descriptor);
 extern void bloompg_column_store_append_slot(BloomPGColumnStore *store,
 	TupleTableSlot *slot);
+extern void bloompg_column_store_append_dense(
+	BloomPGColumnStore *store,
+	const BloomPGColumnVector *vectors,
+	uint32 vector_count,
+	uint32 count);
 extern void bloompg_column_store_begin_scan(BloomPGColumnStore *store,
-	BloomPGColumnStoreScan *scan, int eflags);
-extern void bloompg_column_store_rescan(BloomPGColumnStore *store,
 	BloomPGColumnStoreScan *scan);
+extern void bloompg_column_store_rescan(BloomPGColumnStoreScan *scan);
 extern bool bloompg_column_store_next(BloomPGColumnStore *store,
 	BloomPGColumnStoreScan *scan, bool forward, TupleTableSlot *slot,
 	uint64 *row_index);
@@ -129,18 +149,15 @@ extern bool bloompg_column_store_chunk_view(const BloomPGColumnStore *store,
 extern void bloompg_column_store_set_chunk_selection(
 	BloomPGColumnStore *store, uint32 chunk_index, const uint16 *selection,
 	uint32 selected_count);
-extern void bloompg_column_store_end_scan(BloomPGColumnStoreScan *scan);
 extern void bloompg_column_store_deactivate(BloomPGColumnStore *store,
 	uint64 row_index);
 extern void bloompg_column_store_deactivate_all(BloomPGColumnStore *store);
 extern uint64 bloompg_column_store_rows(const BloomPGColumnStore *store);
 extern uint64 bloompg_column_store_live_rows(const BloomPGColumnStore *store);
-extern bool bloompg_column_store_spilled(const BloomPGColumnStore *store);
 extern Size bloompg_column_store_memory_bytes(const BloomPGColumnStore *store);
 extern Size bloompg_column_store_peak_memory_bytes(
 	const BloomPGColumnStore *store);
 extern Size bloompg_column_store_memory_limit(const BloomPGColumnStore *store);
-extern uint64 bloompg_column_store_spill_rows(const BloomPGColumnStore *store);
 extern uint32 bloompg_column_store_vector_chunks(
 	const BloomPGColumnStore *store);
 extern uint64 bloompg_column_store_varlen_values(

@@ -6,6 +6,7 @@
 #include "bloompg/graph.h"
 #include "bloompg/runtime.h"
 #include "bloompg/sampling.h"
+#include "bloompg/scan_internal.h"
 #include "bloompg/transfer.h"
 #include "bloompg/transfer_internal.h"
 
@@ -41,13 +42,23 @@ void
 bloompg_finalize_replacements(PlannedStmt *candidate,
 	BloomPGJoinGraph *graph, BloomPGRelationState **states,
 	int relation_count, const char *query_string,
-	ParamListInfo bound_params, ResourceOwner runtime_owner,
+	ParamListInfo bound_params,
 	bool query_parallel_safe, int *next_plan_node_id_target,
 	BloomPGTransferOutcome *outcome_target, StringInfoData *detail_target)
 {
 	BloomPGTransferOutcome outcome = *outcome_target;
 	StringInfoData detail = *detail_target;
 	int next_plan_node_id = *next_plan_node_id_target;
+	BloomPGMemoryBudget *query_budget = NULL;
+
+	for (int rti = 1; rti <= relation_count; rti++)
+	{
+		if (states[rti] != NULL)
+		{
+			query_budget = states[rti]->memory_budget;
+			break;
+		}
+	}
 
 	for (int rti = 1; rti <= relation_count; rti++)
 	{
@@ -122,7 +133,7 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 			else
 			{
 				final_token = bloompg_runtime_next_token();
-				final_store = bloompg_begin_runtime_store(runtime_owner);
+				final_store = bloompg_begin_runtime_store(state->memory_budget);
 				bloompg_runtime_register_materialization(final_token,
 					GetActiveSnapshot(), final_store, NULL, 0);
 				final_rows = bloompg_execute_state_source(state, candidate,
@@ -170,7 +181,7 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 			full_entry = bloompg_runtime_find_materialization(final_token,
 				GetActiveSnapshot());
 			tid_token = bloompg_create_tid_materialization(full_entry,
-				state->ctid_attribute, final_rows, runtime_owner);
+				state->ctid_attribute, final_rows);
 
 			if (tid_token != 0)
 			{
@@ -214,6 +225,52 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 		}
 		else
 			appendStringInfo(&detail, " skip_replacement=%u", state->rti);
+	}
+	/* A parallel CustomScan serializes its vectors or filters into DSM while the
+	 * originals remain resident. Reserve every possible copy only after all
+	 * materializations are complete, so path exposure cannot exceed the
+	 * query-wide budget. */
+	if (query_parallel_safe && query_budget != NULL)
+	{
+		ListCell *cell;
+
+		foreach(cell, outcome.replacements)
+		{
+			BloomPGReplacement *replacement = lfirst(cell);
+			BloomPGRuntimeMaterializationEntry *entry;
+			Size dsm_bytes;
+
+			if (replacement->kind == BLOOMPG_REPLACEMENT_FILTER)
+			{
+				dsm_bytes = bloompg_parallel_filter_header_size(
+					list_length(replacement->filters));
+				foreach_ptr(BloomPGSampleFilter, sample_filter,
+					replacement->filters)
+					dsm_bytes = bloompg_parallel_filter_add_size(dsm_bytes,
+						sample_filter->filter);
+				replacement->parallel_dsm_allowed =
+					bloompg_memory_budget_reserve_dsm(query_budget, dsm_bytes);
+				appendStringInfo(&detail, " parallel_filter_dsm=%u:%s:%zuB",
+					replacement->rti,
+					replacement->parallel_dsm_allowed ? "reserved" : "serial",
+					dsm_bytes);
+				continue;
+			}
+			if (replacement->kind != BLOOMPG_REPLACEMENT_MEMORY &&
+				replacement->kind != BLOOMPG_REPLACEMENT_TID)
+				continue;
+			entry = bloompg_runtime_find_materialization(replacement->token,
+				GetActiveSnapshot());
+			if (entry == NULL || entry->store == NULL || entry->descriptor == NULL)
+				elog(ERROR, "bloompg lost parallel replacement materialization");
+			dsm_bytes = bloompg_estimate_parallel_store(entry);
+			replacement->parallel_dsm_allowed =
+				bloompg_memory_budget_reserve_dsm(query_budget, dsm_bytes);
+			appendStringInfo(&detail, " parallel_dsm=%u:%s:%zuB",
+				replacement->rti,
+				replacement->parallel_dsm_allowed ? "reserved" : "serial",
+				dsm_bytes);
+		}
 	}
 	*outcome_target = outcome;
 	*detail_target = detail;

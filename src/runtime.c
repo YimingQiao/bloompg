@@ -126,9 +126,8 @@ bloompg_runtime_register_filter(uint64 token,
 		if (entry->token == token)
 		{
 			if (entry->filter != filter)
-				bloompg_filter_free(entry->filter);
+				elog(ERROR, "bloompg runtime filter token was reused");
 			entry->snapshot_signature = bloompg_snapshot_signature(snapshot);
-			entry->filter = filter;
 			return entry;
 		}
 	}
@@ -194,9 +193,13 @@ bloompg_runtime_register_materialization(uint64 token,
 		entry = lfirst(cell);
 		if (entry->token == token)
 		{
+			if (entry->store != store ||
+				(entry->descriptor != NULL && descriptor != NULL &&
+				 entry->descriptor != descriptor))
+				elog(ERROR, "bloompg runtime materialization token was reused");
 			entry->snapshot_signature = bloompg_snapshot_signature(snapshot);
-			entry->store = store;
-			entry->descriptor = descriptor;
+			if (descriptor != NULL)
+				entry->descriptor = descriptor;
 			entry->rows = rows;
 			return entry;
 		}

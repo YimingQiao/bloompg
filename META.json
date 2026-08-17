@@ -2,15 +2,15 @@
   "name": "bloompg",
   "abstract": "Adaptive Bloom-filter transfer for PostgreSQL",
   "description": "BloomPG executes selected relation inputs during planning, propagates exact Bloom or bitmap filters through an equality-join graph, and gives reduced relations back to PostgreSQL for a second planning pass.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "maintainer": [
     "Yiming Qiao"
   ],
   "license": "mit",
   "provides": {
     "bloompg": {
-      "file": "sql/bloompg--0.1.1.sql",
-      "version": "0.1.1",
+      "file": "sql/bloompg--0.1.2.sql",
+      "version": "0.1.2",
       "abstract": "Adaptive Bloom-filter transfer for PostgreSQL"
     }
   },

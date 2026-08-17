@@ -37,20 +37,13 @@
 
 /* Physical scan execution, row-to-column materialization, and worker waves. */
 
-/*
- * Optimizer execution runs inside an internal subtransaction, but accepted
- * materializations are consumed by the executor after that subtransaction
- * commits.  A tuplestore remembers CurrentResourceOwner at creation time and
- * uses that owner if it later spills, so merely allocating the state in
- * TopTransactionContext is not sufficient.  Capture the planner's parent
- * owner here and restore both globals even if initialization throws.
- */
+/* Accepted materializations outlive the optimizer's internal subtransaction,
+ * so both the store and its shared budget live in TopTransactionContext. */
 BloomPGColumnStore *
-bloompg_begin_runtime_store(ResourceOwner runtime_owner)
+bloompg_begin_runtime_store(BloomPGMemoryBudget *memory_budget)
 {
-	Assert(runtime_owner != NULL);
-	return bloompg_column_store_create(TopTransactionContext, runtime_owner,
-		mul_size((Size) bloompg_materialization_memory_kb, (Size) 1024));
+	Assert(memory_budget != NULL);
+	return bloompg_column_store_create(TopTransactionContext, memory_budget);
 }
 
 bool
@@ -81,14 +74,12 @@ bloompg_integral_value(Datum datum, Oid type_oid, int64 *result)
 /* Bias the sign bit so ordinary unsigned ordering is also signed int64
  * ordering, then retain word-aligned ranges.  Growing by whole words keeps
  * expansion a memcpy instead of a bit shift. */
-static void
-bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
+static bool
+bloompg_pending_bitmap_add_slow(BloomPGPendingTransfer *pending,
+	uint64 biased, uint64 wanted_word)
 {
-	const uint64 sign_bit = UINT64CONST(0x8000000000000000);
 	const uint64 maximum_word = UINT64_MAX >> 6;
 	const uint64 initial_words = 64;
-	uint64 biased = ((uint64) value) ^ sign_bit;
-	uint64 wanted_word = biased >> 6;
 	uint64 max_words = ((uint64) bloompg_max_filter_bytes *
 		BITS_PER_BYTE) / 64;
 	uint64 lower_word;
@@ -96,8 +87,7 @@ bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
 	uint64 word_count;
 	uint64 *words;
 
-	if (!pending->build_filter || pending->bitmap_candidate_abandoned)
-		return;
+	Assert(pending->build_filter && !pending->bitmap_candidate_abandoned);
 	if (pending->bitmap_candidate_words == NULL)
 	{
 		word_count = Min(initial_words, max_words);
@@ -134,7 +124,7 @@ bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
 			pfree(pending->bitmap_candidate_words);
 			pending->bitmap_candidate_words = NULL;
 			pending->bitmap_candidate_abandoned = true;
-			return;
+			return false;
 		}
 		if (wanted_word < pending->bitmap_candidate_lower_word)
 		{
@@ -156,7 +146,7 @@ bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
 			pfree(pending->bitmap_candidate_words);
 			pending->bitmap_candidate_words = NULL;
 			pending->bitmap_candidate_abandoned = true;
-			return;
+			return false;
 		}
 		words = MemoryContextAllocZero(pending->filter->memory_context,
 			mul_size((Size) word_count, sizeof(uint64)));
@@ -172,86 +162,212 @@ bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
 	pending->bitmap_candidate_words[wanted_word -
 		pending->bitmap_candidate_lower_word] |=
 		UINT64CONST(1) << (biased & 63);
-	pending->bitmap_candidate_inserted++;
-}
-
-bool
-bloompg_process_pending_slot(List *pending_transfers, TupleTableSlot *slot)
-{
-	ListCell *cell;
-
-	foreach(cell, pending_transfers)
-	{
-		BloomPGPendingTransfer *pending = lfirst(cell);
-
-		if (!pending->build_filter)
-			continue;
-		if (!pending->integral_key)
-			bloompg_filter_insert_slot(pending->filter, slot,
-									 pending->spec.build_attributes);
-		if (pending->integral_key)
-		{
-			bool is_null;
-			Datum value = slot_getattr(slot, pending->spec.build_attributes[0],
-									 &is_null);
-			int64 integral;
-
-			if (!is_null && bloompg_integral_value(value,
-												 pending->filter->keys[0].build_type,
-												 &integral))
-			{
-				if (!pending->has_range)
-					pending->minimum = pending->maximum = integral;
-				else
-				{
-					pending->minimum = Min(pending->minimum, integral);
-					pending->maximum = Max(pending->maximum, integral);
-				}
-				pending->has_range = true;
-				bloompg_pending_bitmap_add(pending, integral);
-			}
-		}
-	}
 	return true;
 }
 
+/* Once the candidate range has settled, bitmap construction is just one
+ * bounds check and one word update.  Keep allocation/range growth out of the
+ * per-value path: dense integer join keys can otherwise spend more time
+ * entering the general helper than setting bits. */
+static inline bool
+bloompg_pending_bitmap_set(BloomPGPendingTransfer *pending, int64 value)
+{
+	const uint64 sign_bit = UINT64CONST(0x8000000000000000);
+	uint64 biased;
+	uint64 wanted_word;
+
+	if (!pending->build_filter || pending->bitmap_candidate_abandoned)
+		return false;
+	biased = ((uint64) value) ^ sign_bit;
+	wanted_word = biased >> 6;
+	if (likely(pending->bitmap_candidate_words != NULL &&
+		wanted_word >= pending->bitmap_candidate_lower_word &&
+		wanted_word <= pending->bitmap_candidate_upper_word))
+	{
+		pending->bitmap_candidate_words[wanted_word -
+			pending->bitmap_candidate_lower_word] |=
+			UINT64CONST(1) << (biased & 63);
+		return true;
+	}
+	return bloompg_pending_bitmap_add_slow(pending, biased, wanted_word);
+}
+
+static inline void
+bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
+{
+	if (bloompg_pending_bitmap_set(pending, value))
+		pending->bitmap_candidate_inserted++;
+}
+
+typedef struct BloomPGIntegralAccumulator
+{
+	bool		has_range;
+	int64		minimum;
+	int64		maximum;
+	uint64		bitmap_inserted;
+} BloomPGIntegralAccumulator;
+
+static inline void
+bloompg_pending_accumulate_integral(BloomPGPendingTransfer *pending,
+	BloomPGIntegralAccumulator *accumulator, int64 value)
+{
+	if (!accumulator->has_range)
+		accumulator->minimum = accumulator->maximum = value;
+	else
+	{
+		accumulator->minimum = Min(accumulator->minimum, value);
+		accumulator->maximum = Max(accumulator->maximum, value);
+	}
+	accumulator->has_range = true;
+	if (bloompg_pending_bitmap_set(pending, value))
+		accumulator->bitmap_inserted++;
+}
+
+static inline bool
+bloompg_vector_row_valid(const BloomPGColumnVector *vector, uint32 row)
+{
+	return (vector->validity[row / BLOOMPG_VALIDITY_BITS] &
+		(UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS))) != 0;
+}
+
+static void
+bloompg_process_pending_integral_chunk(BloomPGPendingTransfer *pending,
+	const BloomPGColumnStoreChunkView *view, const uint16 *selection,
+	uint32 selected_count)
+{
+	AttrNumber attribute = pending->spec.build_attributes[0];
+	const BloomPGColumnVector *vector;
+	BloomPGIntegralAccumulator accumulator;
+	uint32 selected;
+
+	if (!AttributeNumberIsValid(attribute) ||
+		(uint32) attribute > view->vector_count)
+		elog(ERROR, "invalid bloompg column-store range attribute");
+	vector = &view->vectors[attribute - 1];
+	accumulator.has_range = pending->has_range;
+	accumulator.minimum = pending->minimum;
+	accumulator.maximum = pending->maximum;
+	accumulator.bitmap_inserted = 0;
+	switch (pending->filter->keys[0].build_type)
+	{
+		case INT2OID:
+			if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_2)
+				elog(ERROR, "invalid bloompg int2 vector representation");
+			for (selected = 0; selected < selected_count; selected++)
+			{
+				uint32 row = selection[selected];
+
+				if (row >= view->count)
+					elog(ERROR, "invalid bloompg vector selection");
+				if (bloompg_vector_row_valid(vector, row))
+					bloompg_pending_accumulate_integral(pending, &accumulator,
+						(int64) (int16) ((const uint16 *) vector->data)[row]);
+			}
+			break;
+		case INT4OID:
+		case DATEOID:
+			if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_4)
+				elog(ERROR, "invalid bloompg int4 vector representation");
+			for (selected = 0; selected < selected_count; selected++)
+			{
+				uint32 row = selection[selected];
+
+				if (row >= view->count)
+					elog(ERROR, "invalid bloompg vector selection");
+				if (bloompg_vector_row_valid(vector, row))
+					bloompg_pending_accumulate_integral(pending, &accumulator,
+						(int64) (int32) ((const uint32 *) vector->data)[row]);
+			}
+			break;
+		case INT8OID:
+			if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_8)
+				elog(ERROR, "invalid bloompg int8 vector representation");
+			for (selected = 0; selected < selected_count; selected++)
+			{
+				uint32 row = selection[selected];
+
+				if (row >= view->count)
+					elog(ERROR, "invalid bloompg vector selection");
+				if (bloompg_vector_row_valid(vector, row))
+					bloompg_pending_accumulate_integral(pending, &accumulator,
+						(int64) ((const uint64 *) vector->data)[row]);
+			}
+			break;
+		case OIDOID:
+			if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_4)
+				elog(ERROR, "invalid bloompg oid vector representation");
+			for (selected = 0; selected < selected_count; selected++)
+			{
+				uint32 row = selection[selected];
+
+				if (row >= view->count)
+					elog(ERROR, "invalid bloompg vector selection");
+				if (bloompg_vector_row_valid(vector, row))
+					bloompg_pending_accumulate_integral(pending, &accumulator,
+						(int64) ((const uint32 *) vector->data)[row]);
+			}
+			break;
+		default:
+			elog(ERROR, "invalid bloompg integral vector type %u",
+				pending->filter->keys[0].build_type);
+	}
+	pending->has_range = accumulator.has_range;
+	pending->minimum = accumulator.minimum;
+	pending->maximum = accumulator.maximum;
+	pending->bitmap_candidate_inserted += accumulator.bitmap_inserted;
+}
+
+/* Process a completed vector chunk filter-by-filter.  This hoists the PG
+ * List walk, attribute lookup, and physical-type dispatch out of the row
+ * loop while retaining one pass over each requested outgoing key. */
 void
-bloompg_process_pending_columns(List *pending_transfers,
-	const BloomPGColumnStoreChunkView *view, uint32 row)
+bloompg_process_pending_chunk(List *pending_transfers,
+	const BloomPGColumnStoreChunkView *view, const uint16 *selection,
+	uint32 selected_count)
 {
 	ListCell *cell;
 
 	foreach(cell, pending_transfers)
 	{
 		BloomPGPendingTransfer *pending = lfirst(cell);
-		AttrNumber attribute = pending->spec.build_attributes[0];
-		Datum value;
-		int64 integral;
+		uint32 selected;
 
 		if (!pending->build_filter)
 			continue;
-		if (!pending->integral_key)
-			bloompg_filter_insert_vector(pending->filter, view, row,
-				pending->spec.build_attributes);
-		if (!pending->integral_key)
-			continue;
-		if (!AttributeNumberIsValid(attribute))
-			elog(ERROR, "invalid bloompg column-store range attribute");
-		if (bloompg_column_chunk_get_datum(view, attribute, row, &value) &&
-			bloompg_integral_value(value,
-			pending->filter->keys[0].build_type, &integral))
+		if (pending->integral_key)
+			bloompg_process_pending_integral_chunk(pending, view, selection,
+				selected_count);
+		else
 		{
-			if (!pending->has_range)
-				pending->minimum = pending->maximum = integral;
-			else
-			{
-				pending->minimum = Min(pending->minimum, integral);
-				pending->maximum = Max(pending->maximum, integral);
-			}
-			pending->has_range = true;
-			bloompg_pending_bitmap_add(pending, integral);
+			for (selected = 0; selected < selected_count; selected++)
+				bloompg_filter_insert_vector(pending->filter, view,
+					selection[selected], pending->spec.build_attributes);
 		}
 	}
+}
+
+/* Worker packets are already dense vectors.  Build outgoing filters while
+ * those vectors are hot in the leader's cache instead of first copying them
+ * into the materialization and then scanning the store a second time. */
+void
+bloompg_process_pending_dense_chunk(List *pending_transfers,
+	const BloomPGColumnVector *vectors, uint32 vector_count, uint32 count)
+{
+	BloomPGColumnStoreChunkView view;
+	uint16 selection[BLOOMPG_VECTOR_SIZE];
+	uint32 row;
+
+	if (count > BLOOMPG_VECTOR_SIZE)
+		elog(ERROR, "invalid bloompg dense filter-build chunk");
+	for (row = 0; row < count; row++)
+		selection[row] = (uint16) row;
+	MemSet(&view, 0, sizeof(view));
+	view.count = count;
+	view.selected_count = count;
+	view.vector_count = vector_count;
+	view.selection = selection;
+	view.vectors = vectors;
+	bloompg_process_pending_chunk(pending_transfers, &view, selection, count);
 }
 
 bool
@@ -289,45 +405,24 @@ bloompg_insert_materialized_filter(BloomPGFilter *filter,
 
 
 /* PostgreSQL slots end at the materialization boundary.  Build every
- * outgoing filter from the completed flat vectors so the hot loop remains
- * column-oriented; spilled stores retain the equivalent slot fallback. */
-bool
+ * outgoing filter from the completed vectors so the hot loop stays
+ * column-oriented. */
+void
 bloompg_build_pending_from_materialization(List *pending,
 	BloomPGColumnStore *store, TupleDesc descriptor)
 {
-	if (!bloompg_column_store_spilled(store))
+	uint32 chunk_count = bloompg_column_store_chunk_count(store);
+	uint32 chunk_index;
+
+	(void) descriptor;
+	for (chunk_index = 0; chunk_index < chunk_count; chunk_index++)
 	{
-		uint32 chunk_count = bloompg_column_store_chunk_count(store);
-		uint32 chunk_index;
+		BloomPGColumnStoreChunkView view;
 
-		for (chunk_index = 0; chunk_index < chunk_count; chunk_index++)
-		{
-			BloomPGColumnStoreChunkView view;
-			uint32 selected;
-
-			if (!bloompg_column_store_chunk_view(store, chunk_index, &view))
-				elog(ERROR, "bloompg lost filter-build vector chunk");
-			for (selected = 0; selected < view.selected_count; selected++)
-				bloompg_process_pending_columns(pending, &view,
-					view.selection[selected]);
-		}
-		return true;
-	}
-	else
-	{
-		BloomPGColumnStoreScan scan;
-		TupleTableSlot *slot = MakeSingleTupleTableSlot(descriptor,
-			&TTSOpsVirtual);
-
-		bloompg_column_store_begin_scan(store, &scan, EXEC_FLAG_REWIND);
-		while (bloompg_column_store_next(store, &scan, true, slot, NULL))
-		{
-			bloompg_process_pending_slot(pending, slot);
-			ExecClearTuple(slot);
-		}
-		ExecDropSingleTupleTableSlot(slot);
-		bloompg_column_store_end_scan(&scan);
-		return false;
+		if (!bloompg_column_store_chunk_view(store, chunk_index, &view))
+			elog(ERROR, "bloompg lost filter-build vector chunk");
+		bloompg_process_pending_chunk(pending, &view, view.selection,
+			view.selected_count);
 	}
 }
 

@@ -124,7 +124,7 @@ bloompg_begin_filter(CustomScanState *custom_state, EState *estate, int eflags)
 	}
 }
 
-static Size
+Size
 bloompg_parallel_filter_header_size(int nfilters)
 {
 	if (nfilters < 0 ||
@@ -132,6 +132,19 @@ bloompg_parallel_filter_header_size(int nfilters)
 		elog(ERROR, "bloompg has too many parallel direct filters");
 	return MAXALIGN(add_size(offsetof(BloomPGParallelFilterStore, entries),
 		mul_size((Size) nfilters, sizeof(BloomPGParallelFilterEntry))));
+}
+
+Size
+bloompg_parallel_filter_add_size(Size size, const BloomPGFilter *filter)
+{
+	if (filter == NULL || !filter->valid)
+		return size;
+	size = MAXALIGN(size);
+	size = add_size(size,
+		mul_size((Size) filter->nkeys, sizeof(BloomPGParallelFilterKey)));
+	size = MAXALIGN(size);
+	return add_size(size,
+		mul_size((Size) (filter->nbits / 64), sizeof(uint64)));
 }
 
 static Size
@@ -148,14 +161,7 @@ bloompg_estimate_filter_dsm(CustomScanState *custom_state,
 		BloomPGExecFilter *exec_filter = lfirst(cell);
 		BloomPGFilter *filter = exec_filter->filter;
 
-		if (filter == NULL || !filter->valid)
-			continue;
-		size = MAXALIGN(size);
-		size = add_size(size,
-			mul_size((Size) filter->nkeys, sizeof(BloomPGParallelFilterKey)));
-		size = MAXALIGN(size);
-		size = add_size(size,
-			mul_size((Size) (filter->nbits / 64), sizeof(uint64)));
+		size = bloompg_parallel_filter_add_size(size, filter);
 	}
 	state->parallel_size = size;
 	return size;
@@ -240,6 +246,7 @@ bloompg_initialize_filter_worker(CustomScanState *custom_state,
 	BloomPGFilterState *state = (BloomPGFilterState *) custom_state;
 	BloomPGParallelFilterStore *store = coordinate;
 	ListCell *cell;
+	Size expected;
 	int index = 0;
 
 	(void) toc;
@@ -247,6 +254,7 @@ bloompg_initialize_filter_worker(CustomScanState *custom_state,
 		store->nfilters != list_length(state->filters) ||
 		store->total_size < bloompg_parallel_filter_header_size(store->nfilters))
 		return;
+	expected = bloompg_parallel_filter_header_size(store->nfilters);
 	foreach(cell, state->filters)
 	{
 		BloomPGExecFilter *exec_filter = lfirst(cell);
@@ -258,20 +266,61 @@ bloompg_initialize_filter_worker(CustomScanState *custom_state,
 		int key;
 
 		if (!entry->active)
+		{
+			if (entry->nkeys != 0 || entry->hash_functions != 0 ||
+				entry->nbits != 0 || entry->bit_mask != 0 ||
+				entry->inserted != 0 || entry->bitmap_lower != 0 ||
+				entry->bitmap_upper != 0 || entry->keys_offset != 0 ||
+				entry->words_offset != 0)
+				elog(ERROR, "invalid inactive bloompg parallel filter");
 			continue;
+		}
 		if (entry->nkeys != exec_filter->nkeys || entry->nkeys <= 0 ||
 			(entry->kind != BLOOMPG_FILTER_BLOOM &&
 			 entry->kind != BLOOMPG_FILTER_BITMAP) ||
 			entry->nbits < 64 || entry->nbits % 64 != 0)
 			elog(ERROR, "invalid bloompg parallel direct-filter metadata");
+		if (entry->kind == BLOOMPG_FILTER_BLOOM)
+		{
+			if ((entry->nbits & (entry->nbits - 1)) != 0 ||
+				entry->bit_mask != entry->nbits - 1 ||
+				entry->hash_functions < 1 ||
+				entry->hash_functions > BLOOMPG_MAX_HASH_FUNCTIONS)
+				elog(ERROR, "invalid bloompg parallel Bloom filter");
+		}
+		else
+		{
+			uint64 width;
+			uint64 expected_bits;
+
+			if (entry->nkeys != 1 || entry->hash_functions != 0 ||
+				entry->bit_mask != 0 ||
+				entry->bitmap_upper < entry->bitmap_lower)
+				elog(ERROR, "invalid bloompg parallel bitmap filter");
+			width = (uint64) entry->bitmap_upper -
+				(uint64) entry->bitmap_lower + 1;
+			if (width == 0 || width > UINT64_MAX - 63)
+				elog(ERROR, "invalid bloompg parallel bitmap range");
+			expected_bits = ((width + 63) / 64) * 64;
+			if (entry->nbits != expected_bits)
+				elog(ERROR, "invalid bloompg parallel bitmap size");
+		}
 		keys_size = mul_size((Size) entry->nkeys,
 			sizeof(BloomPGParallelFilterKey));
 		words_size = mul_size((Size) (entry->nbits / 64), sizeof(uint64));
-		if (entry->keys_offset > store->total_size ||
+		expected = MAXALIGN(expected);
+		if (entry->keys_offset != expected ||
+			entry->keys_offset > store->total_size ||
 			keys_size > store->total_size - entry->keys_offset ||
+			add_size(entry->keys_offset, keys_size) > store->total_size)
+			elog(ERROR, "invalid bloompg parallel direct-filter key offsets");
+		expected = add_size(expected, keys_size);
+		expected = MAXALIGN(expected);
+		if (entry->words_offset != expected ||
 			entry->words_offset > store->total_size ||
 			words_size > store->total_size - entry->words_offset)
-			elog(ERROR, "invalid bloompg parallel direct-filter offsets");
+			elog(ERROR, "invalid bloompg parallel direct-filter word offsets");
+		expected = add_size(expected, words_size);
 		serialized_keys = (BloomPGParallelFilterKey *)
 			((char *) store + entry->keys_offset);
 		filter = palloc0(sizeof(BloomPGFilter));
@@ -281,8 +330,8 @@ bloompg_initialize_filter_worker(CustomScanState *custom_state,
 		filter->keys = palloc0_array(BloomPGFilterKey, entry->nkeys);
 		filter->valid = true;
 		filter->nbits = entry->nbits;
-			filter->bit_mask = entry->bit_mask;
-			filter->inserted = entry->inserted;
+		filter->bit_mask = entry->bit_mask;
+		filter->inserted = entry->inserted;
 		filter->words = (uint64 *) ((char *) store + entry->words_offset);
 		filter->hash_functions = entry->hash_functions;
 		filter->bitmap_lower = entry->bitmap_lower;
@@ -293,12 +342,17 @@ bloompg_initialize_filter_worker(CustomScanState *custom_state,
 			filter->keys[key].collation = serialized_keys[key].collation;
 			filter->keys[key].probe_hash_proc =
 				serialized_keys[key].probe_hash_proc;
+			if (entry->kind == BLOOMPG_FILTER_BLOOM &&
+				!OidIsValid(filter->keys[key].probe_hash_proc))
+				elog(ERROR, "invalid bloompg parallel filter hash procedure");
 			if (OidIsValid(filter->keys[key].probe_hash_proc))
 				fmgr_info(filter->keys[key].probe_hash_proc,
 					&filter->keys[key].probe_hash);
 		}
 		exec_filter->filter = filter;
 	}
+	if (expected != store->total_size)
+		elog(ERROR, "invalid bloompg parallel direct-filter length");
 	state->parallel_store = store;
 	state->parallel_active = true;
 }

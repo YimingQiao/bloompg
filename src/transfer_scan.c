@@ -42,7 +42,11 @@ typedef struct BloomPGFilterReceiver
 	DestReceiver receiver;
 	BloomPGColumnStore *store;
 	TupleDesc	descriptor;
+	List	   *pending;
 	uint64		rows_seen;
+	double		inline_filter_ms;
+	bool		packed;
+	bool		owns_descriptor;
 } BloomPGFilterReceiver;
 typedef struct BloomPGPrefilterContext
 {
@@ -54,13 +58,42 @@ typedef struct BloomPGPrefilterContext
 	bool		local_first;
 } BloomPGPrefilterContext;
 
+static void
+bloompg_receive_pending_vectors(const BloomPGColumnVector *vectors,
+	uint32 vector_count, uint32 count, void *opaque)
+{
+	BloomPGFilterReceiver *receiver = opaque;
+	instr_time started;
+
+	INSTR_TIME_SET_CURRENT(started);
+	bloompg_process_pending_dense_chunk(receiver->pending, vectors,
+		vector_count, count);
+	receiver->inline_filter_ms += bloompg_transfer_elapsed_ms(started);
+}
+
 static bool
 bloompg_receive_filter_slot(TupleTableSlot *slot, DestReceiver *receiver)
 {
 	BloomPGFilterReceiver *filter_receiver = (BloomPGFilterReceiver *) receiver;
 
-	filter_receiver->rows_seen++;
-	bloompg_column_store_append_slot(filter_receiver->store, slot);
+	if (filter_receiver->packed)
+	{
+		bool is_null;
+		Datum packet = slot_getattr(slot, 1, &is_null);
+
+		if (is_null)
+			elog(ERROR, "bloompg parallel transfer returned a NULL packet");
+		filter_receiver->rows_seen += bloompg_receive_packed_chunk(packet,
+			filter_receiver->store, filter_receiver->descriptor,
+			filter_receiver->pending != NIL ?
+				bloompg_receive_pending_vectors : NULL,
+			filter_receiver);
+	}
+	else
+	{
+		filter_receiver->rows_seen++;
+		bloompg_column_store_append_slot(filter_receiver->store, slot);
+	}
 	return true;
 }
 
@@ -71,8 +104,16 @@ bloompg_receiver_startup(DestReceiver *receiver, int operation, TupleDesc descri
 	MemoryContext old_context;
 
 	(void) operation;
+	if (filter_receiver->packed)
+	{
+		if (descriptor->natts != 1 ||
+			TupleDescAttr(descriptor, 0)->atttypid != BYTEAOID)
+			elog(ERROR, "invalid bloompg parallel packet descriptor");
+		return;
+	}
 	old_context = MemoryContextSwitchTo(TopTransactionContext);
 	filter_receiver->descriptor = CreateTupleDescCopy(descriptor);
+	filter_receiver->owns_descriptor = true;
 	MemoryContextSwitchTo(old_context);
 	bloompg_column_store_set_descriptor(filter_receiver->store,
 		filter_receiver->descriptor);
@@ -87,11 +128,17 @@ bloompg_receiver_shutdown(DestReceiver *receiver)
 static void
 bloompg_receiver_destroy(DestReceiver *receiver)
 {
+	BloomPGFilterReceiver *filter_receiver = (BloomPGFilterReceiver *) receiver;
+
+	if (filter_receiver->owns_descriptor &&
+		filter_receiver->descriptor != NULL)
+		FreeTupleDesc(filter_receiver->descriptor);
 	pfree(receiver);
 }
 
 static BloomPGFilterReceiver *
-bloompg_create_filter_receiver(List *pending, BloomPGColumnStore *store)
+bloompg_create_filter_receiver(List *pending, BloomPGColumnStore *store,
+	TupleDesc packed_descriptor)
 {
 	BloomPGFilterReceiver *receiver = palloc0(sizeof(BloomPGFilterReceiver));
 
@@ -103,6 +150,14 @@ bloompg_create_filter_receiver(List *pending, BloomPGColumnStore *store)
 	receiver->receiver.rDestroy = bloompg_receiver_destroy;
 	receiver->receiver.mydest = DestNone;
 	receiver->store = store;
+	receiver->pending = pending;
+	receiver->packed = packed_descriptor != NULL;
+	if (receiver->packed)
+	{
+		receiver->descriptor = packed_descriptor;
+		receiver->owns_descriptor = true;
+		bloompg_column_store_set_descriptor(store, packed_descriptor);
+	}
 	return receiver;
 }
 
@@ -110,13 +165,15 @@ static uint64
 bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 	BloomPGColumnStore *store, TupleDesc *descriptor,
 	const char *query_string, ParamListInfo bound_params,
-	int parallel_workers, int *parallel_workers_launched)
+	int parallel_workers, int *parallel_workers_launched,
+	TupleDesc packed_descriptor, double *inline_filter_ms)
 {
 	BloomPGFilterReceiver *receiver;
 	QueryDesc *query_desc = NULL;
 	uint64 rows_seen;
 
-	receiver = bloompg_create_filter_receiver(pending, store);
+	receiver = bloompg_create_filter_receiver(pending, store,
+		packed_descriptor);
 
 	PG_TRY();
 	{
@@ -134,7 +191,9 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 		FreeQueryDesc(query_desc);
 		query_desc = NULL;
 		rows_seen = receiver->rows_seen;
+		*inline_filter_ms = receiver->inline_filter_ms;
 		*descriptor = receiver->descriptor;
+		receiver->owns_descriptor = false;
 		receiver->receiver.rDestroy((DestReceiver *) receiver);
 	}
 	PG_CATCH();
@@ -161,16 +220,26 @@ bloompg_execute_source(BloomPGRelationState *state,
 					   TupleDesc *descriptor,
 					   const char *query_string,
 					   ParamListInfo bound_params,
-					   int parallel_workers,
-					   int *next_plan_node_id,
-					   int *parallel_workers_launched)
+								   int parallel_workers,
+								   int *next_plan_node_id,
+								   int *parallel_workers_launched,
+								   double *inline_filter_ms)
 {
 	PlannedStmt *detached = copyObject(candidate);
 	Plan *build_plan;
+	TupleDesc packed_descriptor = NULL;
 
 	if (parallel_workers > 0)
+	{
+		MemoryContext old_context;
+
 		build_plan = bloompg_make_parallel_source(state, parallel_workers,
 			next_plan_node_id);
+		old_context = MemoryContextSwitchTo(TopTransactionContext);
+		packed_descriptor = ExecCleanTypeFromTL(
+			state->fallback_plan->targetlist);
+		MemoryContextSwitchTo(old_context);
+	}
 	else
 	{
 		build_plan = copyObject(source_plan);
@@ -184,13 +253,83 @@ bloompg_execute_source(BloomPGRelationState *state,
 	detached->jitFlags = 0;
 	return bloompg_run_source_statement(detached, pending, store, descriptor,
 		query_string, bound_params, parallel_workers,
-		parallel_workers_launched);
+		parallel_workers_launched, packed_descriptor, inline_filter_ms);
+}
+
+/* An exact index remains the fast path only while its physical input is small
+ * relative to one worker's heap share.  Cardinality and a bounded page probe
+ * make that decision without comparing PostgreSQL cost units. */
+static bool
+bloompg_parallel_beats_index(BloomPGRelationState *state, int workers,
+	bool access_planned)
+{
+	double fraction;
+	double estimated_rows;
+	uint64 ignored_keys;
+
+	if (workers < 4)
+		return false;
+	foreach_ptr(BloomPGSampleFilter, filter, state->filters)
+	{
+		if (filter->filter != NULL && filter->filter->valid &&
+			filter->filter->inserted == 0)
+			return false;
+	}
+	/* Compare expected index work with one worker's heap share.  A plain index
+	 * loses locality sooner than a bitmap, while selective residual quals can
+	 * hide physical input behind a tiny output estimate; the latter cases get
+	 * a bounded exact-key page-footprint probe.  The final exception is a
+	 * near-limit search array on a very large heap, where thousands of scalar
+	 * B-tree probes form a serial cliff. */
+	if (access_planned)
+	{
+		double bitmap_page_fraction;
+		bool local_quals_may_hide_work =
+			state->local_rows <= state->base_rows *
+				bloompg_index_transfer_max_fraction &&
+			(state->access_plan_bitmap_heap_scans > 0 ||
+			 state->access_plan_exact_keys <=
+				state->access_plan_exact_filters);
+		double worker_share_divisor = local_quals_may_hide_work ? 16.0 :
+			(state->access_plan_bitmap_heap_scans > 0 ? 4.0 : 8.0);
+		bool plan_is_broad = state->access_plan_rows * (double) workers >=
+			state->base_rows / worker_share_divisor;
+
+		/* A genuinely selective covering index avoids both heap I/O and tuple
+		 * fetches.  Do not replace that fast path with a full parallel heap scan
+		 * merely because a machine exposes many workers. */
+		if (state->access_plan_index_only_scans > 0 &&
+			state->access_plan_rows <= state->base_rows *
+				bloompg_index_transfer_max_fraction)
+			return false;
+		if (plan_is_broad)
+			return true;
+		if (local_quals_may_hide_work)
+		{
+			if (bloompg_index_prefilter_page_fraction(state,
+					&bitmap_page_fraction))
+				return bitmap_page_fraction >
+					bloompg_index_transfer_max_fraction;
+		}
+		return state->base_rows >=
+			100.0 * (double) bloompg_transfer_parallel_min_rows &&
+			state->access_plan_exact_filters <= 2 &&
+			state->access_plan_exact_keys >=
+				(uint64) Max(bloompg_index_transfer_planner_max_keys / 2, 1);
+	}
+	if (!bloompg_index_prefilter_estimate(state, &fraction, &ignored_keys,
+			NULL))
+		return true;
+	estimated_rows = state->base_rows * Min(Max(fraction, 0.0), 1.0);
+	return estimated_rows * (double) workers >=
+		4.0 * (double) bloompg_transfer_parallel_min_rows;
 }
 
 /*
  * Core SeqScan evaluates its local quals before an Apply wrapper can inspect
- * the tuple.  That is particularly costly for JOB predicates such as a text
- * IN-list when an incoming join-key filter rejects almost every heap row.
+ * the tuple.  That is particularly costly for expensive local predicates,
+ * such as text membership tests, when an incoming join-key filter rejects
+ * almost every heap row.
  * For a plain base SeqScan, drive the initialized scan directly.  Candidate
  * slots may come from an exact-key B-tree probe or the heap scan; either way,
  * probe every formal transfer filter using base attribute numbers first, then
@@ -299,7 +438,7 @@ bloompg_execute_prefiltered_base_scan(BloomPGRelationState *state,
 	detached->rowMarks = NIL;
 	detached->resultRelations = NIL;
 	detached->jitFlags = 0;
-	receiver = bloompg_create_filter_receiver(pending, store);
+	receiver = bloompg_create_filter_receiver(pending, store, NULL);
 	filter_array = filter_count > 0 ?
 		palloc_array(BloomPGSampleFilter *, filter_count) : NULL;
 	filter_index = 0;
@@ -320,8 +459,8 @@ bloompg_execute_prefiltered_base_scan(BloomPGRelationState *state,
 			Min(Max(state->local_rows / state->base_rows, 0.0), 1.0) : 1.0;
 		/* The sample separately measures local and filter-only selectivity.  A
 		 * very selective local qual is not enough reason to run it first when the
-		 * incoming filters also reject many rows; this distinction is crucial for
-		 * expensive JOB LIKE quals. */
+		 * incoming filters also reject many rows; this distinction matters most for
+		 * expensive local expressions such as pattern matches. */
 		transfer_fraction = Min(Max(state->filter_sample_fraction, 0.0), 1.0);
 		costed = bloompg_sample_workspace_order_costs(state->sample_workspace,
 			&local_sample_ms, &filter_sample_ms);
@@ -393,6 +532,7 @@ scan_complete:
 		query_desc = NULL;
 		rows_seen = receiver->rows_seen;
 		*descriptor = receiver->descriptor;
+		receiver->owns_descriptor = false;
 		receiver->receiver.rDestroy((DestReceiver *) receiver);
 	}
 	PG_CATCH();
@@ -443,32 +583,56 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	uint64 rows;
 	double scan_ms;
 	double filter_ms;
+	double inline_filter_ms = 0.0;
 	int parallel_workers = 0;
 	int parallel_workers_launched = 0;
-	PlannedStmt *access_statement = NULL;
-	bool access_planned;
+	PlannedStmt *access_statement = state->preplanned_access;
+	bool access_planned = access_statement != NULL;
+	bool used_parallel_source = false;
+	bool use_parallel_source = false;
+	Size parallel_memory = 0;
 
 	state->materialization_used_filters |= state->filters != NIL;
 	INSTR_TIME_SET_CURRENT(started);
-	access_planned = state->filters != NIL &&
-		bloompg_plan_transfer_access(state, query_string, bound_params,
-			&access_statement);
-	if (access_planned)
+	state->preplanned_access = NULL;
+	if (!access_planned)
+		access_planned = state->filters != NIL &&
+			bloompg_plan_transfer_access(state, query_string, bound_params,
+				&access_statement);
+	parallel_workers = bloompg_transfer_worker_count(state,
+		query_parallel_safe || state->access_plan_parallel_safe);
+	if (parallel_workers > 0 &&
+		bloompg_parallel_beats_index(state, parallel_workers, access_planned))
+	{
+		parallel_memory = bloompg_parallel_pack_memory(parallel_workers);
+		use_parallel_source = bloompg_memory_budget_reserve(
+			state->memory_budget, parallel_memory);
+	}
+	if (use_parallel_source)
+	{
+		used_parallel_source = true;
+		state->materialization_access_path = "parallel-p0";
+		PG_TRY();
+		{
+			rows = bloompg_execute_source(state, candidate, source_plan, pending,
+				store, descriptor, query_string, bound_params, parallel_workers,
+				next_plan_node_id, &parallel_workers_launched, &inline_filter_ms);
+		}
+		PG_FINALLY();
+		{
+			bloompg_memory_budget_release_reservation(state->memory_budget,
+				parallel_memory);
+		}
+		PG_END_TRY();
+	}
+	else if (access_planned)
 	{
 		access_statement->rowMarks = NIL;
 		access_statement->resultRelations = NIL;
 		access_statement->jitFlags = 0;
 		rows = bloompg_run_source_statement(access_statement, pending, store,
 			descriptor, query_string, bound_params, 0,
-			&parallel_workers_launched);
-	}
-	else if ((parallel_workers = bloompg_transfer_worker_count(state,
-			 query_parallel_safe)) > 0)
-	{
-		state->materialization_access_path = "parallel-p0";
-		rows = bloompg_execute_source(state, candidate, source_plan, pending,
-			store, descriptor, query_string, bound_params, parallel_workers,
-			next_plan_node_id, &parallel_workers_launched);
+			&parallel_workers_launched, NULL, &inline_filter_ms);
 	}
 	else if (state->table->rte_kind == RTE_RELATION &&
 		state->filters != NIL &&
@@ -482,24 +646,29 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 		state->materialization_access_path = "native-p0";
 		rows = bloompg_execute_source(state, candidate, source_plan, pending,
 			store, descriptor, query_string, bound_params, 0,
-			next_plan_node_id, &parallel_workers_launched);
+			next_plan_node_id, &parallel_workers_launched, &inline_filter_ms);
 	}
 	INSTR_TIME_SET_CURRENT(elapsed);
 	INSTR_TIME_SUBTRACT(elapsed, started);
 	scan_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 	INSTR_TIME_SET_CURRENT(filter_started);
-	if (bloompg_build_pending_from_materialization(pending, store, *descriptor))
+	if (used_parallel_source)
 		state->vector_filter_builds++;
 	else
-		state->slot_filter_builds++;
-	filter_ms = bloompg_transfer_elapsed_ms(filter_started);
+	{
+		bloompg_build_pending_from_materialization(pending, store, *descriptor);
+		state->vector_filter_builds++;
+	}
+	filter_ms = inline_filter_ms +
+		bloompg_transfer_elapsed_ms(filter_started);
+	scan_ms = Max(scan_ms - inline_filter_ms, 0.0);
 	state->filter_prepare_ms += filter_ms;
 	state->filter_build_ms += filter_ms;
 	state->exact_scans++;
 	state->exact_scan_ms += scan_ms + filter_ms;
 	state->base_materializations++;
 	state->base_materialize_ms += scan_ms;
-	if (parallel_workers > 0)
+	if (used_parallel_source)
 	{
 		state->parallel_scans++;
 		state->parallel_workers_requested += parallel_workers;

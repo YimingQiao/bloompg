@@ -8,6 +8,10 @@
 #include "nodes/plannodes.h"
 #include "optimizer/planner.h"
 
+#define BLOOMPG_VERSION "0.1.2"
+#define BLOOMPG_VERSION_STRING \
+	"bloompg " BLOOMPG_VERSION " (PostgreSQL 18)"
+
 typedef enum BloomPGTransferProgressMetric
 {
 	BLOOMPG_TRANSFER_PROGRESS_ROWS,

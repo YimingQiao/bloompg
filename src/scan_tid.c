@@ -82,10 +82,11 @@ bloompg_begin_tid(CustomScanState *custom_state, EState *estate, int eflags)
 	state->planned_rows = strtoull(strVal(list_nth(metadata, 1)), NULL, 10);
 	state->entry = bloompg_runtime_find_materialization(state->token,
 		estate->es_snapshot);
-	if (state->entry != NULL && state->entry->store != NULL)
+	if (state->entry != NULL && state->entry->store != NULL &&
+		state->entry->descriptor != NULL)
 	{
 		bloompg_column_store_begin_scan(state->entry->store,
-			&state->store_scan, eflags);
+			&state->store_scan);
 		state->tid_slot = MakeSingleTupleTableSlot(state->entry->descriptor,
 			&TTSOpsVirtual);
 		state->heap_slot = table_slot_create(custom_state->ss.ss_currentRelation,
@@ -93,6 +94,7 @@ bloompg_begin_tid(CustomScanState *custom_state, EState *estate, int eflags)
 	}
 	else
 	{
+		state->entry = NULL;
 		state->fallback_state = ExecInitNode((Plan *) linitial(scan->custom_plans),
 			estate, eflags);
 		state->css.custom_ps = list_make1(state->fallback_state);
@@ -110,32 +112,13 @@ bloompg_exec_tid(CustomScanState *custom_state)
 	{
 		for (;;)
 		{
-			TupleTableSlot *source_slot;
 			bool is_null;
 			Datum datum;
 
-			if (state->parallel_store->format == BLOOMPG_PARALLEL_STORE_COLUMNS)
-			{
-				if (!bloompg_parallel_next_column(state->parallel_store,
-					&state->parallel_cursor, state->tid_slot))
-					return NULL;
-				source_slot = state->tid_slot;
-			}
-			else
-			{
-				MinimalTuple tuple =
-					bloompg_parallel_next_tuple(state->parallel_store);
-
-				if (tuple == NULL)
-					return NULL;
-				if (state->parallel_slot == NULL)
-					state->parallel_slot = MakeSingleTupleTableSlot(
-						state->tid_slot->tts_tupleDescriptor, &TTSOpsMinimalTuple);
-				ExecClearTuple(state->parallel_slot);
-				ExecStoreMinimalTuple(tuple, state->parallel_slot, false);
-				source_slot = state->parallel_slot;
-			}
-			datum = slot_getattr(source_slot, 1, &is_null);
+			if (!bloompg_parallel_next_column(state->parallel_store,
+				&state->parallel_cursor, state->tid_slot))
+				return NULL;
+			datum = slot_getattr(state->tid_slot, 1, &is_null);
 			if (is_null)
 				elog(ERROR, "bloompg TID materialization contains NULL");
 			ExecClearTuple(state->heap_slot);
@@ -147,13 +130,13 @@ bloompg_exec_tid(CustomScanState *custom_state)
 
 				ExecCopySlot(scan_state->ss_ScanTupleSlot, state->heap_slot);
 				expression_context->ecxt_scantuple = scan_state->ss_ScanTupleSlot;
-				ExecClearTuple(source_slot);
+				ExecClearTuple(state->tid_slot);
 				if (scan_state->ps.ps_ProjInfo != NULL)
 					return ExecProject(scan_state->ps.ps_ProjInfo);
 				return ExecCopySlot(scan_state->ps.ps_ResultTupleSlot,
 					scan_state->ss_ScanTupleSlot);
 			}
-			ExecClearTuple(source_slot);
+			ExecClearTuple(state->tid_slot);
 		}
 	}
 	if (state->entry == NULL)
@@ -278,10 +261,6 @@ bloompg_initialize_tid_worker(CustomScanState *custom_state,
 		state->tid_slot = MakeSingleTupleTableSlot(descriptor,
 			&TTSOpsVirtual);
 	}
-	if (parallel_store->format == BLOOMPG_PARALLEL_STORE_TUPLES &&
-		state->parallel_slot == NULL)
-		state->parallel_slot = MakeSingleTupleTableSlot(
-			state->tid_slot->tts_tupleDescriptor, &TTSOpsMinimalTuple);
 	if (state->heap_slot == NULL)
 		state->heap_slot = table_slot_create(custom_state->ss.ss_currentRelation,
 			&custom_state->ss.ps.state->es_tupleTable);
@@ -296,10 +275,6 @@ bloompg_end_tid(CustomScanState *custom_state)
 		ExecEndNode(state->fallback_state);
 	if (state->tid_slot != NULL)
 		ExecDropSingleTupleTableSlot(state->tid_slot);
-	if (state->parallel_slot != NULL)
-		ExecDropSingleTupleTableSlot(state->parallel_slot);
-	if (state->entry != NULL && state->entry->store != NULL)
-		bloompg_column_store_end_scan(&state->store_scan);
 	if (state->entry != NULL)
 	{
 		bloompg_runtime_release_materialization(state->token);
@@ -320,7 +295,7 @@ bloompg_rescan_tid(CustomScanState *custom_state)
 		state->parallel_cursor.chunk_valid = false;
 	}
 	else if (state->entry != NULL)
-		bloompg_column_store_rescan(state->entry->store, &state->store_scan);
+		bloompg_column_store_rescan(&state->store_scan);
 	else if (state->fallback_state != NULL)
 		ExecReScan(state->fallback_state);
 }

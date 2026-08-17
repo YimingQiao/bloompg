@@ -35,20 +35,21 @@ sides, and unsupported equality classes use this normal path in either mode.
 | `bloompg.sample_seed` | `2` | Deterministic prepared-reservoir seed. |
 | `bloompg.sample_rate` | `0.01` | Chunk fraction sampled from an already materialized relation. |
 | `bloompg.sample_cache_dir` | `auto` | Prepared cache directory; `auto` uses `$PGDATA/bloompg_samples`. Superuser-only. |
-| `bloompg.sample_memory_cache` | `on` | Retain prepared samples in backend memory. |
+| `bloompg.sample_memory_cache` | `on` | Retain prepared samples in backend memory; cached CTIDs and hydrated tuples share a limit of half `materialization_memory`. |
 | `bloompg.excitation_threshold` | `1.0` | Re-excite below this fraction of the preceding cardinality. |
 | `bloompg.local_first_fraction` | `0.001` | Candidate threshold for evaluating a selective local qual first. |
 | `bloompg.bits_per_key` | `24` | Bloom-filter bit budget per estimated key. |
 | `bloompg.max_filter_bytes` | `64MB` | Per-filter memory ceiling. |
 | `bloompg.transfer_progress_metric` | `ndv` | Equality-transfer convergence signal: `rows` or `ndv`. |
-| `bloompg.materialization_memory` | half physical RAM | Per-backend, per-table optimizer-time materialization ceiling. |
+| `bloompg.materialization_memory` | up to `512MB` | Total memory budget for one query's optimizer-time materializations and parallel DSM copies. The default is capped at one eighth of the detected host/cgroup memory. |
 | `bloompg.transfer_workers` | `4` | Maximum workers for one eligible transfer scan; `0` is serial. |
 | `bloompg.transfer_parallel_min_rows` | `100000` | Minimum estimated input rows for parallel transfer scanning. |
 | `bloompg.replan_after_transfer` | `on` | Run the second PostgreSQL planning pass. |
 
-The dynamic `materialization_memory` default suits a dedicated analytical
-machine. Override it when multiple analytical queries can materialize tables
-concurrently.
+When this budget cannot hold the next vector allocation, BloomPG abandons its
+optimizer work and executes the original PostgreSQL plan. It never silently
+turns the materialization into a disk spill. Use `bloompg_tune.py` to size the
+query-wide budget for dedicated analytical deployments and concurrency.
 
 ## Index-assisted materialization
 
@@ -76,7 +77,7 @@ native PostgreSQL preview plan. The structured profile reports
 | Setting | Default | Purpose |
 |---|---:|---|
 | `bloompg.p1_parallel_bias` | `on` | Let exact post-transfer cardinalities favor parallel P1 paths. |
-| `bloompg.p1_parallel_min_rows` | `100000` | Minimum exact rows before applying the parallel cost bias. |
+| `bloompg.p1_parallel_min_rows` | `10000` | Minimum exact rows before applying the parallel cost bias. |
 | `bloompg.p1_disable_nestloop` | `off` | Emergency guard that suppresses P1 nested loops. |
 | `bloompg.late_materialize` | `on` | Allow survivor-CTID materialization for wide relations. |
 | `bloompg.late_materialize_min_width` | `128B` | Projected-width threshold for TID mode. |

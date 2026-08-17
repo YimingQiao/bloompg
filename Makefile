@@ -29,6 +29,7 @@ OBJS = \
 	src/scan_plan.o \
 	src/scan_apply.o \
 	src/scan_parallel.o \
+	src/scan_pack.o \
 	src/scan_memory.o \
 	src/scan_tid.o \
 	src/scan_filter.o \
@@ -40,7 +41,9 @@ OBJS = \
 DATA = \
 	sql/bloompg--0.1.0.sql \
 	sql/bloompg--0.1.1.sql \
-	sql/bloompg--0.1.0--0.1.1.sql
+	sql/bloompg--0.1.2.sql \
+	sql/bloompg--0.1.0--0.1.1.sql \
+	sql/bloompg--0.1.1--0.1.2.sql
 REGRESS = bloompg
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

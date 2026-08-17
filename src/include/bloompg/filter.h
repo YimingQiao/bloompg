@@ -8,6 +8,8 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 
+#define BLOOMPG_MAX_HASH_FUNCTIONS 10
+
 typedef enum BloomPGFilterKind
 {
 	BLOOMPG_FILTER_BLOOM,
@@ -73,6 +75,9 @@ extern void bloompg_filter_insert_vector(BloomPGFilter *filter,
 extern bool bloompg_filter_contains_vector(BloomPGFilter *filter,
 	const BloomPGColumnStoreChunkView *view, uint32 row,
 	const AttrNumber *attributes);
+extern uint32 bloompg_filter_select_vector(BloomPGFilter *filter,
+	const BloomPGColumnStoreChunkView *view, const AttrNumber *attributes,
+	const uint16 *input, uint32 input_count, uint16 *output);
 
 static inline void
 bloompg_filter_insert_bitmap_value(BloomPGFilter *filter, Datum value,

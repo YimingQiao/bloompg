@@ -116,15 +116,19 @@ bloompg_begin_memory(CustomScanState *custom_state, EState *estate, int eflags)
 	state->token = strtoull(strVal(list_nth(metadata, 0)), NULL, 10);
 	state->planned_rows = strtoull(strVal(list_nth(metadata, 1)), NULL, 10);
 	state->entry = bloompg_runtime_find_materialization(state->token,
-											 estate->es_snapshot);
-	state->snapshot_reused = state->entry != NULL;
+										 estate->es_snapshot);
 	if (state->entry != NULL && state->entry->store != NULL)
+	{
+		state->snapshot_reused = true;
 		bloompg_column_store_begin_scan(state->entry->store,
-			&state->store_scan, eflags);
+			&state->store_scan);
+	}
 	else
 	{
+		state->entry = NULL;
+		state->snapshot_reused = false;
 		state->fallback_state = ExecInitNode((Plan *) linitial(scan->custom_plans),
-												 estate, eflags);
+											 estate, eflags);
 		state->css.custom_ps = list_make1(state->fallback_state);
 	}
 }
@@ -138,27 +142,9 @@ bloompg_exec_memory(CustomScanState *custom_state)
 
 	if (state->parallel_store != NULL && state->parallel_store->available)
 	{
-		if (state->parallel_store->format == BLOOMPG_PARALLEL_STORE_COLUMNS)
-		{
-			if (!bloompg_parallel_next_column(state->parallel_store,
-				&state->parallel_cursor, scan_slot))
-				return NULL;
-		}
-		else
-		{
-			MinimalTuple tuple =
-				bloompg_parallel_next_tuple(state->parallel_store);
-
-			if (tuple == NULL)
-				return NULL;
-			if (state->parallel_slot == NULL)
-				state->parallel_slot = MakeSingleTupleTableSlot(
-					custom_state->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
-					&TTSOpsMinimalTuple);
-			ExecClearTuple(state->parallel_slot);
-			ExecStoreMinimalTuple(tuple, state->parallel_slot, false);
-			ExecCopySlot(scan_slot, state->parallel_slot);
-		}
+		if (!bloompg_parallel_next_column(state->parallel_store,
+			&state->parallel_cursor, scan_slot))
+			return NULL;
 		if (custom_state->ss.ps.ps_ProjInfo != NULL)
 		{
 			ExprContext *expression_context = custom_state->ss.ps.ps_ExprContext;
@@ -280,13 +266,6 @@ bloompg_end_memory(CustomScanState *custom_state)
 
 	if (state->fallback_state != NULL)
 		ExecEndNode(state->fallback_state);
-	if (state->entry != NULL && state->entry->store != NULL)
-		bloompg_column_store_end_scan(&state->store_scan);
-	if (state->parallel_slot != NULL)
-	{
-		ExecDropSingleTupleTableSlot(state->parallel_slot);
-		state->parallel_slot = NULL;
-	}
 	if (state->entry != NULL)
 	{
 		bloompg_runtime_release_materialization(state->token);
@@ -307,7 +286,7 @@ bloompg_rescan_memory(CustomScanState *custom_state)
 		state->parallel_cursor.chunk_valid = false;
 	}
 	else if (state->entry != NULL)
-		bloompg_column_store_rescan(state->entry->store, &state->store_scan);
+		bloompg_column_store_rescan(&state->store_scan);
 	else if (state->fallback_state != NULL)
 		ExecReScan(state->fallback_state);
 }

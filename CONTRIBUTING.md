@@ -35,7 +35,7 @@ releases, so run the regression suite on every supported PG18 minor.
 - Filter-over-PathSet transformation: `path_transform.c`.
 - Executor-facing plan construction, leaves, rescans, and DSM transport:
   `scan_plan.c` and the focused `scan_*.c` modules.
-- Flat vectors, selection, and spill: `column_store.c`.
+- Flat vectors, selection, and query-local memory accounting: `column_store.c`.
 - Sampling is scheduling-only: `sampling.c`.
 
 Do not expose transfer-private state in `transfer.h`; add a narrow contract to

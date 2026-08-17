@@ -2,11 +2,12 @@
 
 #include "bloompg/column_store.h"
 
+#include "access/detoast.h"
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "utils/errcodes.h"
 #include "utils/memutils.h"
-#include "utils/tuplestore.h"
 
 typedef struct BloomPGColumnChunk
 {
@@ -17,11 +18,24 @@ typedef struct BloomPGColumnChunk
 	uint64		selected_base;
 } BloomPGColumnChunk;
 
+/* One transfer invocation can retain several materializations at once.  The
+ * budget is therefore shared by every store produced for that query, rather
+ * than being copied into each relation.  DSM reservations participate in the
+ * same counter because a parallel P1 path holds both representations. */
+struct BloomPGMemoryBudget
+{
+	MemoryContext memory_context;
+	Size		limit;
+	Size		used;
+	Size		dsm_reserved;
+	uint32		references;
+};
+
 struct BloomPGColumnStore
 {
 	MemoryContext memory_context;
 	MemoryContext column_context;
-	ResourceOwner runtime_owner;
+	BloomPGMemoryBudget *memory_budget;
 	TupleDesc	descriptor;
 	int			natts;
 	BloomPGColumnChunk **chunks;
@@ -32,15 +46,8 @@ struct BloomPGColumnStore
 	uint64		live_rows;
 	bool		selection_bases_dirty;
 
-	Size		memory_limit;
 	Size		memory_bytes;
 	Size		peak_memory_bytes;
-	uint64		spill_rows;
-	Tuplestorestate *spill;
-	uint64	  **spill_masks;
-	uint32		spill_mask_count;
-	uint32		spill_mask_capacity;
-	Size		spill_index_bytes;
 
 	uint64		varlen_values;
 	Size		varlen_bytes;
@@ -51,11 +58,204 @@ struct BloomPGColumnStore
 };
 
 static void
+bloompg_memory_budget_exceeded(const BloomPGMemoryBudget *budget, Size bytes)
+{
+	ereport(ERROR,
+		(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		 errmsg("bloompg query materialization memory budget was exhausted"),
+		 errdetail("The query has %zu bytes charged and requested %zu more bytes from a %zu-byte budget.",
+			budget->used, bytes, budget->limit),
+		 errhint("Increase bloompg.materialization_memory or let PostgreSQL use the native plan.")));
+}
+
+static void
+bloompg_memory_budget_account(BloomPGMemoryBudget *budget, Size bytes)
+{
+	if (bytes == 0)
+		return;
+	if (bytes > bloompg_memory_budget_remaining(budget))
+		bloompg_memory_budget_exceeded(budget, bytes);
+	budget->used += bytes;
+}
+
+static void
+bloompg_memory_budget_unaccount(BloomPGMemoryBudget *budget, Size bytes)
+{
+	if (bytes > budget->used)
+		elog(ERROR, "bloompg materialization memory accounting underflow");
+	budget->used -= bytes;
+}
+
+BloomPGMemoryBudget *
+bloompg_memory_budget_create(MemoryContext parent, Size memory_limit)
+{
+	BloomPGMemoryBudget *budget;
+	MemoryContext context;
+	MemoryContext old_context;
+
+	Assert(parent != NULL);
+	context = AllocSetContextCreate(parent, "BloomPG query memory budget",
+		ALLOCSET_SMALL_SIZES);
+	old_context = MemoryContextSwitchTo(context);
+	budget = palloc0(sizeof(BloomPGMemoryBudget));
+	budget->memory_context = context;
+	budget->limit = Max(memory_limit, (Size) 64 * 1024);
+	budget->references = 1;
+	MemoryContextSwitchTo(old_context);
+	return budget;
+}
+
+void
+bloompg_memory_budget_retain(BloomPGMemoryBudget *budget)
+{
+	Assert(budget != NULL && budget->references > 0);
+	if (budget->references == UINT32_MAX)
+		elog(ERROR, "too many bloompg materialization stores");
+	budget->references++;
+}
+
+void
+bloompg_memory_budget_release(BloomPGMemoryBudget *budget)
+{
+	MemoryContext context;
+
+	if (budget == NULL)
+		return;
+	Assert(budget->references > 0);
+	budget->references--;
+	if (budget->references != 0)
+		return;
+	/* DSM itself is owned by PostgreSQL's ParallelContext.  This counter is a
+	 * lifetime reservation, not an allocation in our MemoryContext, and the
+	 * last materialization disappears only after every such scan has ended. */
+	if (budget->dsm_reserved > 0)
+	{
+		bloompg_memory_budget_unaccount(budget, budget->dsm_reserved);
+		budget->dsm_reserved = 0;
+	}
+	if (budget->used != 0)
+		elog(ERROR, "bloompg query memory budget released with %zu bytes charged",
+			budget->used);
+	context = budget->memory_context;
+	MemoryContextDelete(context);
+}
+
+Size
+bloompg_memory_budget_limit(const BloomPGMemoryBudget *budget)
+{
+	return budget->limit;
+}
+
+Size
+bloompg_memory_budget_remaining(const BloomPGMemoryBudget *budget)
+{
+	return budget->used < budget->limit ? budget->limit - budget->used : 0;
+}
+
+bool
+bloompg_memory_budget_reserve(BloomPGMemoryBudget *budget, Size bytes)
+{
+	if (bytes > bloompg_memory_budget_remaining(budget))
+		return false;
+	bloompg_memory_budget_account(budget, bytes);
+	return true;
+}
+
+void
+bloompg_memory_budget_release_reservation(BloomPGMemoryBudget *budget,
+	Size bytes)
+{
+	bloompg_memory_budget_unaccount(budget, bytes);
+}
+
+bool
+bloompg_memory_budget_reserve_dsm(BloomPGMemoryBudget *budget, Size bytes)
+{
+	Size new_reserved;
+
+	if (bytes == 0)
+		return true;
+	if (bytes > bloompg_memory_budget_remaining(budget))
+		return false;
+	new_reserved = add_size(budget->dsm_reserved, bytes);
+	bloompg_memory_budget_account(budget, bytes);
+	budget->dsm_reserved = new_reserved;
+	return true;
+}
+
+static void
 bloompg_column_store_account(BloomPGColumnStore *store, Size bytes)
 {
-	store->memory_bytes = add_size(store->memory_bytes, bytes);
+	Size new_memory_bytes = add_size(store->memory_bytes, bytes);
+
+	bloompg_memory_budget_account(store->memory_budget, bytes);
+	store->memory_bytes = new_memory_bytes;
 	store->peak_memory_bytes = Max(store->peak_memory_bytes,
 		store->memory_bytes);
+}
+
+static void
+bloompg_column_store_unaccount(BloomPGColumnStore *store, Size bytes)
+{
+	if (bytes > store->memory_bytes)
+		elog(ERROR, "bloompg column-store memory accounting underflow");
+	store->memory_bytes -= bytes;
+	bloompg_memory_budget_unaccount(store->memory_budget, bytes);
+}
+
+/* Read the length of one packet/DSM datum without touching bytes outside its
+ * declared heap.  In particular, VARSIZE_ANY and strlen are unsafe until the
+ * corresponding header or terminator has been proven present. */
+bool
+bloompg_byref_datum_size(const char *heap, uint32 heap_used, int16 typlen,
+	uint32 offset, Size *size)
+{
+	Size remaining;
+	Size value_size;
+
+	if (heap == NULL || size == NULL || offset >= heap_used)
+		return false;
+	remaining = (Size) heap_used - offset;
+	if (typlen == -1)
+	{
+		const char *datum = heap + offset;
+
+		if (VARATT_IS_1B(datum))
+		{
+			if (VARATT_IS_1B_E(datum))
+				return false;
+			value_size = VARSIZE_1B(datum);
+			if (value_size < VARHDRSZ_SHORT)
+				return false;
+		}
+		else
+		{
+			uint32 header;
+
+			if (remaining < VARHDRSZ)
+				return false;
+			memcpy(&header, datum, sizeof(header));
+			value_size = VARSIZE_4B(&header);
+			if (value_size < VARHDRSZ)
+				return false;
+		}
+	}
+	else if (typlen == -2)
+	{
+		const char *terminator = memchr(heap + offset, '\0', remaining);
+
+		if (terminator == NULL)
+			return false;
+		value_size = (Size) (terminator - (heap + offset)) + 1;
+	}
+	else if (typlen > 0)
+		value_size = (Size) typlen;
+	else
+		return false;
+	if (value_size > remaining)
+		return false;
+	*size = value_size;
+	return true;
 }
 
 static Size
@@ -97,6 +297,171 @@ bloompg_column_vector_physical_type(Form_pg_attribute attribute)
 				 attribute->attlen);
 	}
 	pg_unreachable();
+}
+
+static uint32
+bloompg_column_vector_heap_capacity(uint32 old_capacity, Size required)
+{
+	uint32 new_capacity;
+	uint32 limit;
+
+	if (required <= old_capacity)
+		return old_capacity;
+	if (required > UINT32_MAX || required > MaxAllocSize)
+		elog(ERROR, "bloompg vector heap exceeds PostgreSQL allocation limits");
+	new_capacity = old_capacity == 0 ? 4096 : old_capacity;
+	limit = (uint32) Min((Size) UINT32_MAX, (Size) MaxAllocSize);
+	while ((Size) new_capacity < required)
+	{
+		if (new_capacity > limit / 2)
+		{
+			new_capacity = (uint32) required;
+			break;
+		}
+		new_capacity *= 2;
+	}
+	return new_capacity;
+}
+
+static void
+bloompg_column_store_require_growth(const BloomPGColumnStore *store,
+	Size additional)
+{
+	if (additional > bloompg_memory_budget_remaining(store->memory_budget))
+		bloompg_memory_budget_exceeded(store->memory_budget, additional);
+}
+
+static Size
+bloompg_column_store_new_chunk_bytes(const BloomPGColumnStore *store)
+{
+	Size bytes = sizeof(BloomPGColumnChunk);
+	Size validity_bytes = sizeof(uint64) * BLOOMPG_VALIDITY_WORDS;
+	int attribute;
+
+	if (store->nchunks == store->chunk_capacity)
+	{
+		uint32 old_capacity = store->chunk_capacity;
+		uint32 new_capacity = old_capacity == 0 ? 16 : old_capacity * 2;
+
+		if (new_capacity <= old_capacity ||
+			new_capacity > (uint32) (MaxAllocSize /
+				sizeof(BloomPGColumnChunk *)))
+			elog(ERROR, "bloompg materialization has too many vector chunks");
+		bytes = add_size(bytes,
+			mul_size(new_capacity - old_capacity,
+				sizeof(BloomPGColumnChunk *)));
+	}
+	bytes = add_size(bytes,
+		mul_size(sizeof(BloomPGColumnVector), store->natts));
+	bytes = add_size(bytes,
+		mul_size(sizeof(uint16), BLOOMPG_VECTOR_SIZE));
+	for (attribute = 0; attribute < store->natts; attribute++)
+	{
+		Form_pg_attribute form = TupleDescAttr(store->descriptor, attribute);
+		BloomPGVectorPhysicalType physical_type =
+			bloompg_column_vector_physical_type(form);
+
+		bytes = add_size(bytes, mul_size(
+			bloompg_column_vector_width(physical_type), BLOOMPG_VECTOR_SIZE));
+		bytes = add_size(bytes, validity_bytes);
+	}
+	return bytes;
+}
+
+static Size
+bloompg_column_store_slot_growth(BloomPGColumnStore *store,
+	TupleTableSlot *slot, bool new_chunk)
+{
+	BloomPGColumnChunk *chunk = new_chunk ? NULL :
+		store->chunks[store->nchunks - 1];
+	Size bytes = new_chunk ? bloompg_column_store_new_chunk_bytes(store) : 0;
+	int attribute;
+
+	for (attribute = 0; attribute < store->natts; attribute++)
+	{
+		Form_pg_attribute form = TupleDescAttr(store->descriptor, attribute);
+		BloomPGColumnVector *vector;
+		Size value_bytes;
+		Size required;
+		uint32 old_capacity;
+		uint32 new_capacity;
+		uint32 heap_used;
+
+		if (slot->tts_isnull[attribute] || form->attbyval)
+			continue;
+		vector = chunk == NULL ? NULL : &chunk->vectors[attribute];
+		heap_used = vector == NULL ? 0 : vector->heap_used;
+		old_capacity = vector == NULL ? 0 : vector->heap_capacity;
+		if (form->attlen == -1)
+			value_bytes = toast_raw_datum_size(slot->tts_values[attribute]);
+		else if (form->attlen == -2)
+			value_bytes = strlen(DatumGetCString(slot->tts_values[attribute])) + 1;
+		else
+		{
+			if (form->attlen <= 0)
+				elog(ERROR, "invalid bloompg by-reference width %d", form->attlen);
+			value_bytes = (Size) form->attlen;
+		}
+		required = add_size(MAXALIGN(heap_used), value_bytes);
+		new_capacity = bloompg_column_vector_heap_capacity(old_capacity,
+			required);
+		bytes = add_size(bytes, (Size) new_capacity - old_capacity);
+	}
+	return bytes;
+}
+
+static Size
+bloompg_column_store_dense_growth(BloomPGColumnStore *store,
+	const BloomPGColumnVector *vectors, uint32 source_row, uint32 count,
+	bool new_chunk)
+{
+	BloomPGColumnChunk *chunk = new_chunk ? NULL :
+		store->chunks[store->nchunks - 1];
+	Size bytes = new_chunk ? bloompg_column_store_new_chunk_bytes(store) : 0;
+	int attribute;
+
+	for (attribute = 0; attribute < store->natts; attribute++)
+	{
+		const BloomPGColumnVector *source = &vectors[attribute];
+		BloomPGColumnVector *destination = chunk == NULL ? NULL :
+			&chunk->vectors[attribute];
+		uint32 heap_used;
+		uint32 old_capacity;
+		uint32 new_capacity;
+		Size required;
+		uint32 first_offset = UINT32_MAX;
+		uint32 last_end = 0;
+		uint32 row;
+
+		if (source->physical_type != BLOOMPG_VECTOR_BYREF ||
+			source->heap_used == 0)
+			continue;
+		for (row = 0; row < count; row++)
+		{
+			uint32 input_row = source_row + row;
+			uint32 offset;
+			Size value_size;
+
+			if (!bloompg_column_vector_is_valid(source, input_row))
+				continue;
+			offset = ((const uint32 *) source->data)[input_row];
+			if (!bloompg_byref_datum_size(source->heap, source->heap_used,
+					source->typlen, offset, &value_size))
+				elog(ERROR, "invalid bloompg dense vector value");
+			first_offset = Min(first_offset, offset);
+			last_end = Max(last_end, offset + (uint32) value_size);
+		}
+		if (first_offset == UINT32_MAX)
+			continue;
+		heap_used = destination == NULL ? 0 : destination->heap_used;
+		old_capacity = destination == NULL ? 0 : destination->heap_capacity;
+		required = add_size(MAXALIGN(heap_used),
+			(Size) last_end - first_offset);
+		new_capacity = bloompg_column_vector_heap_capacity(old_capacity,
+			required);
+		bytes = add_size(bytes, (Size) new_capacity - old_capacity);
+	}
+	return bytes;
 }
 
 static void
@@ -182,21 +547,7 @@ bloompg_column_vector_reserve_heap(BloomPGColumnStore *store,
 
 	if (required <= old_capacity)
 		return;
-	if (required > UINT32_MAX || required > MaxAllocSize)
-		elog(ERROR, "bloompg vector heap exceeds PostgreSQL allocation limits");
-	new_capacity = old_capacity == 0 ? 4096 : old_capacity;
-	while ((Size) new_capacity < required)
-	{
-		uint32 limit = (uint32) Min((Size) UINT32_MAX,
-			(Size) MaxAllocSize);
-
-		if (new_capacity > limit / 2)
-		{
-			new_capacity = (uint32) required;
-			break;
-		}
-		new_capacity *= 2;
-	}
+	new_capacity = bloompg_column_vector_heap_capacity(old_capacity, required);
 	if (vector->heap == NULL)
 		vector->heap = palloc(new_capacity);
 	else
@@ -267,6 +618,124 @@ bloompg_column_vector_append(BloomPGColumnStore *store,
 	}
 }
 
+/* Copy an appended validity range a machine word at a time.  Dense packets
+ * and destination chunks are normally both vector-aligned, making this one
+ * memcpy; the shifted path handles final packets from interleaved workers. */
+static void
+bloompg_column_vector_copy_validity(BloomPGColumnVector *destination,
+	uint32 destination_row, const BloomPGColumnVector *source,
+	uint32 source_row, uint32 count)
+{
+	if ((destination_row % BLOOMPG_VALIDITY_BITS) == 0 &&
+		(source_row % BLOOMPG_VALIDITY_BITS) == 0)
+	{
+		uint32 words = count / BLOOMPG_VALIDITY_BITS;
+		uint32 tail = count % BLOOMPG_VALIDITY_BITS;
+
+		if (words > 0)
+			memcpy(destination->validity +
+				(destination_row / BLOOMPG_VALIDITY_BITS),
+				source->validity + (source_row / BLOOMPG_VALIDITY_BITS),
+				mul_size(words, sizeof(uint64)));
+		if (tail > 0)
+		{
+			uint64 mask = (UINT64CONST(1) << tail) - 1;
+
+			destination->validity[
+				(destination_row / BLOOMPG_VALIDITY_BITS) + words] |=
+				source->validity[
+					(source_row / BLOOMPG_VALIDITY_BITS) + words] & mask;
+		}
+		return;
+	}
+	while (count > 0)
+	{
+		uint32 destination_bit = destination_row % BLOOMPG_VALIDITY_BITS;
+		uint32 source_bit = source_row % BLOOMPG_VALIDITY_BITS;
+		uint32 take = Min(count, BLOOMPG_VALIDITY_BITS - destination_bit);
+		uint64 bits = source->validity[source_row / BLOOMPG_VALIDITY_BITS] >>
+			source_bit;
+		uint64 mask;
+
+		if (source_bit + take > BLOOMPG_VALIDITY_BITS)
+			bits |= source->validity[
+				(source_row / BLOOMPG_VALIDITY_BITS) + 1] <<
+				(BLOOMPG_VALIDITY_BITS - source_bit);
+		mask = take == BLOOMPG_VALIDITY_BITS ? UINT64_MAX :
+			(UINT64CONST(1) << take) - 1;
+		destination->validity[
+			destination_row / BLOOMPG_VALIDITY_BITS] |=
+			(bits & mask) << destination_bit;
+		destination_row += take;
+		source_row += take;
+		count -= take;
+	}
+}
+
+/* A packed worker vector already owns one aligned, row-ordered heap.  Import
+ * a slice as one byte range and relocate its 32-bit offsets, avoiding a
+ * detoast check and memcpy for every individual value in the leader. */
+static void
+bloompg_column_vector_append_dense_byref(BloomPGColumnStore *store,
+	BloomPGColumnVector *destination, uint32 destination_row,
+	const BloomPGColumnVector *source, uint32 source_row, uint32 count)
+{
+	uint32 first_offset = UINT32_MAX;
+	uint32 last_end = 0;
+	uint32 values = 0;
+	Size value_bytes = 0;
+	uint32 row;
+
+	Assert(destination->physical_type == BLOOMPG_VECTOR_BYREF);
+	Assert(source->physical_type == BLOOMPG_VECTOR_BYREF);
+	for (row = 0; row < count; row++)
+	{
+		uint32 input_row = source_row + row;
+		uint32 offset;
+		Size size;
+
+		if (!bloompg_column_vector_is_valid(source, input_row))
+			continue;
+		offset = ((const uint32 *) source->data)[input_row];
+		if (offset >= source->heap_used)
+			elog(ERROR, "invalid bloompg packed vector offset");
+		if (!bloompg_byref_datum_size(source->heap, source->heap_used,
+			source->typlen, offset, &size))
+			elog(ERROR, "invalid bloompg packed vector value");
+		first_offset = Min(first_offset, offset);
+		last_end = Max(last_end, offset + (uint32) size);
+		value_bytes = add_size(value_bytes, size);
+		values++;
+	}
+	if (values > 0)
+	{
+		Size destination_offset = MAXALIGN(destination->heap_used);
+		Size copy_bytes = (Size) last_end - first_offset;
+		Size required = add_size(destination_offset, copy_bytes);
+
+		bloompg_column_vector_reserve_heap(store, destination, required);
+		memcpy(destination->heap + destination_offset,
+			source->heap + first_offset, copy_bytes);
+		memcpy((uint32 *) destination->data + destination_row,
+			(const uint32 *) source->data + source_row,
+			mul_size(count, sizeof(uint32)));
+		for (row = 0; row < count; row++)
+		{
+			uint32 input_row = source_row + row;
+
+			if (bloompg_column_vector_is_valid(source, input_row))
+				((uint32 *) destination->data)[destination_row + row] =
+					(uint32) destination_offset +
+					((const uint32 *) source->data)[input_row] - first_offset;
+		}
+		destination->heap_used = (uint32) required;
+		store->varlen_values += values;
+		store->varlen_bytes = add_size(store->varlen_bytes, value_bytes);
+	}
+	bloompg_column_vector_copy_validity(destination, destination_row,
+		source, source_row, count);
+}
+
 static void
 bloompg_column_store_fill_memory_slot(BloomPGColumnStore *store,
 	uint32 chunk_index, uint32 row, TupleTableSlot *slot)
@@ -295,156 +764,12 @@ bloompg_column_store_fill_memory_slot(BloomPGColumnStore *store,
 }
 
 static void
-bloompg_column_store_ensure_spill_mask(BloomPGColumnStore *store,
-	uint32 chunk_index)
-{
-	if (chunk_index >= store->spill_mask_capacity)
-	{
-		uint32 old_capacity = store->spill_mask_capacity;
-		uint32 new_capacity = old_capacity == 0 ? 16 : old_capacity;
-		Size old_bytes;
-		Size new_bytes;
-
-		while (new_capacity <= chunk_index)
-		{
-			if (new_capacity > (uint32) (MaxAllocSize /
-					(2 * sizeof(uint64 *))))
-				elog(ERROR, "bloompg spill index has too many chunks");
-			new_capacity *= 2;
-		}
-		old_bytes = (Size) old_capacity * sizeof(uint64 *);
-		new_bytes = (Size) new_capacity * sizeof(uint64 *);
-		if (store->spill_masks == NULL)
-			store->spill_masks = MemoryContextAllocZero(store->memory_context,
-				new_bytes);
-		else
-		{
-			store->spill_masks = repalloc(store->spill_masks, new_bytes);
-			MemSet(store->spill_masks + old_capacity, 0,
-				new_bytes - old_bytes);
-		}
-		store->spill_mask_capacity = new_capacity;
-		store->spill_index_bytes = add_size(store->spill_index_bytes,
-			new_bytes - old_bytes);
-	}
-	while (store->spill_mask_count <= chunk_index)
-	{
-		store->spill_masks[store->spill_mask_count] =
-			MemoryContextAllocZero(store->memory_context,
-				sizeof(uint64) * BLOOMPG_VALIDITY_WORDS);
-		store->spill_mask_count++;
-		store->spill_index_bytes = add_size(store->spill_index_bytes,
-			sizeof(uint64) * BLOOMPG_VALIDITY_WORDS);
-	}
-}
-
-static void
-bloompg_column_store_spill_set_active(BloomPGColumnStore *store,
-	uint64 row_index)
-{
-	uint64		chunk64 = row_index / BLOOMPG_VECTOR_SIZE;
-	uint32		row = (uint32) (row_index % BLOOMPG_VECTOR_SIZE);
-	uint32		chunk_index;
-
-	if (chunk64 > UINT32_MAX)
-		elog(ERROR, "bloompg spill index exceeds its chunk address space");
-	chunk_index = (uint32) chunk64;
-	bloompg_column_store_ensure_spill_mask(store, chunk_index);
-	store->spill_masks[chunk_index][row / BLOOMPG_VALIDITY_BITS] |=
-		UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS);
-}
-
-static bool
-bloompg_column_store_spill_is_active(const BloomPGColumnStore *store,
-	uint64 row_index)
-{
-	uint64		chunk64 = row_index / BLOOMPG_VECTOR_SIZE;
-	uint32		row = (uint32) (row_index % BLOOMPG_VECTOR_SIZE);
-
-	if (chunk64 >= store->spill_mask_count)
-		return false;
-	return (store->spill_masks[chunk64][row / BLOOMPG_VALIDITY_BITS] &
-		(UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS))) != 0;
-}
-
-static Tuplestorestate *
-bloompg_column_store_begin_spill(BloomPGColumnStore *store)
-{
-	MemoryContext old_context = CurrentMemoryContext;
-	ResourceOwner old_owner = CurrentResourceOwner;
-	Tuplestorestate *volatile result = NULL;
-
-	PG_TRY();
-	{
-		MemoryContextSwitchTo(store->memory_context);
-		CurrentResourceOwner = store->runtime_owner;
-		result = tuplestore_begin_heap(true, false, work_mem);
-	}
-	PG_FINALLY();
-	{
-		MemoryContextSwitchTo(old_context);
-		CurrentResourceOwner = old_owner;
-	}
-	PG_END_TRY();
-	return (Tuplestorestate *) result;
-}
-
-static void
-bloompg_column_store_migrate_to_spill(BloomPGColumnStore *store)
-{
-	TupleTableSlot *slot;
-	uint32		chunk_index;
-
-	Assert(store->spill == NULL);
-	Assert(store->descriptor != NULL);
-	store->spill_rows = store->rows;
-	store->spill = bloompg_column_store_begin_spill(store);
-	for (chunk_index = 0; chunk_index < store->nchunks; chunk_index++)
-	{
-		BloomPGColumnChunk *chunk = store->chunks[chunk_index];
-		uint32		selected;
-
-		bloompg_column_store_ensure_spill_mask(store, chunk_index);
-		for (selected = 0; selected < chunk->selected_count; selected++)
-		{
-			uint32 row = chunk->selection[selected];
-
-			store->spill_masks[chunk_index][row / BLOOMPG_VALIDITY_BITS] |=
-				UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS);
-		}
-	}
-	slot = MakeSingleTupleTableSlot(store->descriptor, &TTSOpsVirtual);
-	for (chunk_index = 0; chunk_index < store->nchunks; chunk_index++)
-	{
-		BloomPGColumnChunk *chunk = store->chunks[chunk_index];
-		uint32		row;
-
-		for (row = 0; row < chunk->count; row++)
-		{
-			bloompg_column_store_fill_memory_slot(store, chunk_index, row, slot);
-			tuplestore_puttupleslot(store->spill, slot);
-		}
-	}
-	ExecDropSingleTupleTableSlot(slot);
-	MemoryContextReset(store->column_context);
-	if (store->chunks != NULL)
-	{
-		pfree(store->chunks);
-		store->chunks = NULL;
-	}
-	store->nchunks = 0;
-	store->chunk_capacity = 0;
-	store->memory_bytes = store->spill_index_bytes;
-	store->selection_bases_dirty = false;
-}
-
-static void
 bloompg_column_store_rebuild_selected_bases(BloomPGColumnStore *store)
 {
 	uint64		base = 0;
 	uint32		chunk_index;
 
-	if (!store->selection_bases_dirty || store->spill != NULL)
+	if (!store->selection_bases_dirty)
 		return;
 	for (chunk_index = 0; chunk_index < store->nchunks; chunk_index++)
 	{
@@ -504,14 +829,14 @@ bloompg_column_store_find_selected(BloomPGColumnStore *store,
 
 BloomPGColumnStore *
 bloompg_column_store_create(MemoryContext parent,
-	ResourceOwner runtime_owner, Size memory_limit)
+	BloomPGMemoryBudget *memory_budget)
 {
 	BloomPGColumnStore *store;
 	MemoryContext context;
 	MemoryContext old_context;
 
 	Assert(parent != NULL);
-	Assert(runtime_owner != NULL);
+	Assert(memory_budget != NULL);
 	context = AllocSetContextCreate(parent, "BloomPG vector materialization",
 		ALLOCSET_DEFAULT_SIZES);
 	old_context = MemoryContextSwitchTo(context);
@@ -519,10 +844,16 @@ bloompg_column_store_create(MemoryContext parent,
 	store->memory_context = context;
 	store->column_context = AllocSetContextCreate(context,
 		"BloomPG vector chunks", ALLOCSET_DEFAULT_SIZES);
-	store->runtime_owner = runtime_owner;
-	store->memory_limit = Max(memory_limit, (Size) 64 * 1024);
+	store->memory_budget = memory_budget;
+	bloompg_memory_budget_retain(memory_budget);
 	MemoryContextSwitchTo(old_context);
 	return store;
+}
+
+BloomPGMemoryBudget *
+bloompg_column_store_memory_budget(const BloomPGColumnStore *store)
+{
+	return store->memory_budget;
 }
 
 void
@@ -554,13 +885,13 @@ bloompg_column_store_append_slot(BloomPGColumnStore *store,
 
 	Assert(store != NULL);
 	Assert(store->descriptor != NULL);
-	if (store->spill != NULL)
+	slot_getallattrs(slot);
 	{
-		tuplestore_puttupleslot(store->spill, slot);
-		bloompg_column_store_spill_set_active(store, store->rows);
-		store->rows++;
-		store->live_rows++;
-		return;
+		bool new_chunk = store->nchunks == 0 ||
+			store->chunks[store->nchunks - 1]->count == BLOOMPG_VECTOR_SIZE;
+		Size growth = bloompg_column_store_slot_growth(store, slot, new_chunk);
+
+		bloompg_column_store_require_growth(store, growth);
 	}
 	if (store->nchunks == 0 ||
 		store->chunks[store->nchunks - 1]->count == BLOOMPG_VECTOR_SIZE)
@@ -568,7 +899,6 @@ bloompg_column_store_append_slot(BloomPGColumnStore *store,
 	else
 		chunk = store->chunks[store->nchunks - 1];
 	row = chunk->count;
-	slot_getallattrs(slot);
 	old_context = MemoryContextSwitchTo(store->column_context);
 	for (attribute = 0; attribute < store->natts; attribute++)
 		bloompg_column_vector_append(store, &chunk->vectors[attribute], row,
@@ -579,41 +909,106 @@ bloompg_column_store_append_slot(BloomPGColumnStore *store,
 	store->rows++;
 	store->live_rows++;
 	store->selection_bases_dirty = true;
-	if (store->memory_bytes > store->memory_limit)
-		bloompg_column_store_migrate_to_spill(store);
+}
+
+/* Import one dense vector packet.  Parallel transfer workers have already
+ * deformed and columnized these rows, so the leader can copy fixed-width
+ * columns in bulk instead of reconstructing one MinimalTuple at a time. */
+void
+bloompg_column_store_append_dense(BloomPGColumnStore *store,
+	const BloomPGColumnVector *vectors, uint32 vector_count, uint32 count)
+{
+	uint32 source_row = 0;
+
+	Assert(store != NULL && store->descriptor != NULL);
+	if (vector_count != (uint32) store->natts || count == 0 ||
+		count > BLOOMPG_VECTOR_SIZE)
+		elog(ERROR, "invalid bloompg dense vector packet");
+	while (source_row < count)
+	{
+		BloomPGColumnChunk *chunk;
+		uint32 destination_row;
+		uint32 take;
+		uint32 row;
+		int attribute;
+
+		{
+			bool new_chunk;
+			Size growth;
+
+			new_chunk = store->nchunks == 0 ||
+				store->chunks[store->nchunks - 1]->count == BLOOMPG_VECTOR_SIZE;
+			destination_row = new_chunk ? 0 :
+				store->chunks[store->nchunks - 1]->count;
+			take = Min(count - source_row,
+				BLOOMPG_VECTOR_SIZE - destination_row);
+			growth = bloompg_column_store_dense_growth(store, vectors,
+				source_row, take, new_chunk);
+
+			bloompg_column_store_require_growth(store, growth);
+		}
+		if (store->nchunks == 0 ||
+			store->chunks[store->nchunks - 1]->count == BLOOMPG_VECTOR_SIZE)
+			chunk = bloompg_column_store_new_chunk(store);
+		else
+			chunk = store->chunks[store->nchunks - 1];
+		Assert(destination_row == chunk->count);
+		for (attribute = 0; attribute < store->natts; attribute++)
+		{
+			BloomPGColumnVector *destination = &chunk->vectors[attribute];
+			const BloomPGColumnVector *source = &vectors[attribute];
+			Form_pg_attribute form = TupleDescAttr(store->descriptor, attribute);
+
+			if (source->type_oid != form->atttypid ||
+				source->typlen != form->attlen ||
+				source->physical_type != destination->physical_type)
+				elog(ERROR, "bloompg dense vector descriptor changed");
+			if (destination->physical_type != BLOOMPG_VECTOR_BYREF)
+			{
+				Size width = bloompg_column_vector_width(
+					destination->physical_type);
+
+				memcpy((char *) destination->data +
+					mul_size(destination_row, width),
+					(const char *) source->data + mul_size(source_row, width),
+					mul_size(take, width));
+				bloompg_column_vector_copy_validity(destination,
+					destination_row, source, source_row, take);
+			}
+			else
+			{
+				MemoryContext old_context = MemoryContextSwitchTo(
+					store->column_context);
+
+				bloompg_column_vector_append_dense_byref(store, destination,
+					destination_row, source, source_row, take);
+				MemoryContextSwitchTo(old_context);
+			}
+		}
+		for (row = 0; row < take; row++)
+			chunk->selection[chunk->selected_count++] =
+				(uint16) (destination_row + row);
+		chunk->count += (uint16) take;
+		store->rows += take;
+		store->live_rows += take;
+		store->selection_bases_dirty = true;
+		source_row += take;
+	}
 }
 
 void
 bloompg_column_store_begin_scan(BloomPGColumnStore *store,
-	BloomPGColumnStoreScan *scan, int eflags)
+	BloomPGColumnStoreScan *scan)
 {
 	MemSet(scan, 0, sizeof(*scan));
-	scan->read_pointer = -1;
-	if (store->spill != NULL)
-	{
-		scan->read_pointer = tuplestore_alloc_read_pointer(store->spill,
-			EXEC_FLAG_REWIND |
-			(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
-		scan->spill_slot = MakeSingleTupleTableSlot(store->descriptor,
-			&TTSOpsMinimalTuple);
-		tuplestore_select_read_pointer(store->spill, scan->read_pointer);
-		tuplestore_rescan(store->spill);
-	}
-	else
-		bloompg_column_store_rebuild_selected_bases(store);
+	bloompg_column_store_rebuild_selected_bases(store);
 }
 
 void
-bloompg_column_store_rescan(BloomPGColumnStore *store,
-	BloomPGColumnStoreScan *scan)
+bloompg_column_store_rescan(BloomPGColumnStoreScan *scan)
 {
 	scan->position = 0;
 	scan->memory_chunk_valid = false;
-	if (store->spill != NULL)
-	{
-		tuplestore_select_read_pointer(store->spill, scan->read_pointer);
-		tuplestore_rescan(store->spill);
-	}
 }
 
 bool
@@ -621,70 +1016,35 @@ bloompg_column_store_next(BloomPGColumnStore *store,
 	BloomPGColumnStoreScan *scan, bool forward, TupleTableSlot *slot,
 	uint64 *row_index)
 {
-	if (store->spill == NULL)
-	{
-		uint64		logical_row;
-		uint32		chunk_index;
-		uint32		physical_row;
+	uint64		logical_row;
+	uint32		chunk_index;
+	uint32		physical_row;
 
-		if (forward)
-		{
-			if (scan->position >= store->live_rows)
-				return false;
-			logical_row = scan->position++;
-		}
-		else
-		{
-			if (scan->position == 0)
-				return false;
-			logical_row = --scan->position;
-		}
-		(void) bloompg_column_store_find_selected(store, scan, logical_row,
-			&chunk_index, &physical_row);
-		bloompg_column_store_fill_memory_slot(store, chunk_index, physical_row,
-			slot);
-		if (row_index != NULL)
-			*row_index = (uint64) chunk_index * BLOOMPG_VECTOR_SIZE +
-				physical_row;
-		return true;
-	}
-	for (;;)
+	if (forward)
 	{
-		uint64		index;
-
-		if (forward)
-		{
-			if (scan->position >= store->rows)
-				return false;
-			index = scan->position++;
-		}
-		else
-		{
-			if (scan->position == 0)
-				return false;
-			index = --scan->position;
-		}
-		tuplestore_select_read_pointer(store->spill, scan->read_pointer);
-		if (!tuplestore_gettupleslot(store->spill, forward, false,
-			scan->spill_slot))
+		if (scan->position >= store->live_rows)
 			return false;
-		if (!bloompg_column_store_spill_is_active(store, index))
-		{
-			ExecClearTuple(scan->spill_slot);
-			continue;
-		}
-		ExecCopySlot(slot, scan->spill_slot);
-		ExecClearTuple(scan->spill_slot);
-		if (row_index != NULL)
-			*row_index = index;
-		return true;
+		logical_row = scan->position++;
 	}
+	else
+	{
+		if (scan->position == 0)
+			return false;
+		logical_row = --scan->position;
+	}
+	(void) bloompg_column_store_find_selected(store, scan, logical_row,
+		&chunk_index, &physical_row);
+	bloompg_column_store_fill_memory_slot(store, chunk_index, physical_row,
+		slot);
+	if (row_index != NULL)
+		*row_index = (uint64) chunk_index * BLOOMPG_VECTOR_SIZE + physical_row;
+	return true;
 }
 
 uint32
 bloompg_column_store_chunk_count(const BloomPGColumnStore *store)
 {
-	return store->spill == NULL ? store->nchunks : 0;
+	return store->nchunks;
 }
 
 bool
@@ -695,7 +1055,7 @@ bloompg_column_store_chunk_view(const BloomPGColumnStore *store,
 
 	Assert(store != NULL);
 	Assert(view != NULL);
-	if (store->spill != NULL || chunk_index >= store->nchunks)
+	if (chunk_index >= store->nchunks)
 		return false;
 	chunk = store->chunks[chunk_index];
 	view->row_base = (uint64) chunk_index * BLOOMPG_VECTOR_SIZE;
@@ -715,7 +1075,7 @@ bloompg_column_store_set_chunk_selection(BloomPGColumnStore *store,
 	uint32		old_count;
 	uint32		index;
 
-	if (store->spill != NULL || chunk_index >= store->nchunks)
+	if (chunk_index >= store->nchunks)
 		elog(ERROR, "invalid bloompg vector selection target");
 	chunk = store->chunks[chunk_index];
 	old_count = chunk->selected_count;
@@ -739,39 +1099,10 @@ bloompg_column_store_set_chunk_selection(BloomPGColumnStore *store,
 }
 
 void
-bloompg_column_store_end_scan(BloomPGColumnStoreScan *scan)
-{
-	if (scan->spill_slot != NULL)
-	{
-		ExecDropSingleTupleTableSlot(scan->spill_slot);
-		scan->spill_slot = NULL;
-	}
-}
-
-void
 bloompg_column_store_deactivate(BloomPGColumnStore *store, uint64 row_index)
 {
 	if (row_index >= store->rows)
 		elog(ERROR, "bloompg materialization row index is out of range");
-	if (store->spill != NULL)
-	{
-		uint64 chunk_index = row_index / BLOOMPG_VECTOR_SIZE;
-		uint32 row = (uint32) (row_index % BLOOMPG_VECTOR_SIZE);
-		uint64 mask = UINT64CONST(1) << (row % BLOOMPG_VALIDITY_BITS);
-		uint64 *word;
-
-		if (chunk_index >= store->spill_mask_count)
-			return;
-		word = &store->spill_masks[chunk_index]
-			[row / BLOOMPG_VALIDITY_BITS];
-		if ((*word & mask) != 0)
-		{
-			*word &= ~mask;
-			store->live_rows--;
-			store->selection_rows_rejected++;
-		}
-		return;
-	}
 	{
 		uint64 chunk64 = row_index / BLOOMPG_VECTOR_SIZE;
 		uint16 row = (uint16) (row_index % BLOOMPG_VECTOR_SIZE);
@@ -802,23 +1133,11 @@ bloompg_column_store_deactivate(BloomPGColumnStore *store, uint64 row_index)
 void
 bloompg_column_store_deactivate_all(BloomPGColumnStore *store)
 {
-	if (store->spill != NULL)
-	{
-		uint32 chunk_index;
+	uint32 chunk_index;
 
-		for (chunk_index = 0; chunk_index < store->spill_mask_count;
-			 chunk_index++)
-			MemSet(store->spill_masks[chunk_index], 0,
-				sizeof(uint64) * BLOOMPG_VALIDITY_WORDS);
-	}
-	else
-	{
-		uint32 chunk_index;
-
-		for (chunk_index = 0; chunk_index < store->nchunks; chunk_index++)
-			store->chunks[chunk_index]->selected_count = 0;
-		store->selection_bases_dirty = true;
-	}
+	for (chunk_index = 0; chunk_index < store->nchunks; chunk_index++)
+		store->chunks[chunk_index]->selected_count = 0;
+	store->selection_bases_dirty = true;
 	store->selection_rewrites++;
 	store->selection_rows_examined += store->live_rows;
 	store->selection_rows_rejected += store->live_rows;
@@ -837,12 +1156,6 @@ bloompg_column_store_live_rows(const BloomPGColumnStore *store)
 	return store->live_rows;
 }
 
-bool
-bloompg_column_store_spilled(const BloomPGColumnStore *store)
-{
-	return store->spill != NULL;
-}
-
 Size
 bloompg_column_store_memory_bytes(const BloomPGColumnStore *store)
 {
@@ -858,13 +1171,7 @@ bloompg_column_store_peak_memory_bytes(const BloomPGColumnStore *store)
 Size
 bloompg_column_store_memory_limit(const BloomPGColumnStore *store)
 {
-	return store->memory_limit;
-}
-
-uint64
-bloompg_column_store_spill_rows(const BloomPGColumnStore *store)
-{
-	return store->spill_rows;
+	return bloompg_memory_budget_limit(store->memory_budget);
 }
 
 uint32
@@ -913,14 +1220,14 @@ void
 bloompg_column_store_destroy(BloomPGColumnStore *store)
 {
 	MemoryContext context;
+	BloomPGMemoryBudget *memory_budget;
 
 	if (store == NULL)
 		return;
 	context = store->memory_context;
-	if (store->spill != NULL)
-	{
-		tuplestore_end(store->spill);
-		store->spill = NULL;
-	}
+	memory_budget = store->memory_budget;
+	if (store->memory_bytes > 0)
+		bloompg_column_store_unaccount(store, store->memory_bytes);
 	MemoryContextDelete(context);
+	bloompg_memory_budget_release(memory_budget);
 }

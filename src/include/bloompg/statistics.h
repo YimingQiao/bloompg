@@ -39,7 +39,6 @@ typedef struct BloomPGMaterializedStatistics
 	uint64		values_examined;
 	int32		average_width;
 	double		finalize_ms;
-	bool		vectorized;
 	bool		width_estimated;
 	int		precomputed_key_sets;
 	int		scanned_key_sets;

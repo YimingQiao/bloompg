@@ -341,7 +341,8 @@ bloompg_transform_filter_pathset(RelOptInfo *rel, Index rti,
 		return false;
 	}
 	parallel_safe = bloompg_filters_parallel_safe(replacement->filters);
-	if (rel->partial_pathlist != NIL && parallel_safe)
+	if (rel->partial_pathlist != NIL && parallel_safe &&
+		replacement->parallel_dsm_allowed)
 	{
 		partial_candidates = bloompg_collect_filter_candidates(
 			rel->partial_pathlist, rti, replacement->filters, true,

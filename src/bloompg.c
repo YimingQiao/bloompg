@@ -12,6 +12,8 @@
 #include <unistd.h>
 #endif
 
+#include <errno.h>
+
 PG_MODULE_MAGIC;
 
 bool bloompg_enabled = true;
@@ -21,7 +23,7 @@ bool bloompg_profile_log = true;
 bool bloompg_replan_after_transfer = true;
 bool bloompg_p1_disable_nestloop = false;
 bool bloompg_p1_parallel_bias = true;
-int bloompg_p1_parallel_min_rows = 100000;
+int bloompg_p1_parallel_min_rows = 10000;
 bool bloompg_late_materialize = true;
 int bloompg_late_materialize_min_width = 128;
 int bloompg_transfer_workers = 4;
@@ -72,15 +74,49 @@ bloompg_check_sample_mode(char **new_value, void **extra, GucSource source)
 	return true;
 }
 
-/*
- * Optimizer-time materialization is owned by one backend and is allocated on
- * demand.  A large default avoids accidental spill on dedicated analytical
- * machines; the spill path remains the correctness-preserving backstop.  The
- * setting is per backend, so concurrent installations should override it.
- */
+static bool
+bloompg_read_memory_limit(const char *path, uint64 *result)
+{
+	FILE *file;
+	char buffer[64];
+	char *end;
+	unsigned long long parsed;
+
+	file = fopen(path, "r");
+	if (file == NULL)
+		return false;
+	if (fgets(buffer, sizeof(buffer), file) == NULL)
+	{
+		fclose(file);
+		return false;
+	}
+	fclose(file);
+	end = buffer + strlen(buffer);
+	while (end > buffer && isspace((unsigned char) end[-1]))
+		*--end = '\0';
+	if (strcmp(buffer, "max") == 0)
+		return false;
+	errno = 0;
+	parsed = strtoull(buffer, &end, 10);
+	while (isspace((unsigned char) *end))
+		end++;
+	if (errno != 0 || end == buffer || *end != '\0' || parsed == 0)
+		return false;
+	*result = (uint64) parsed;
+	return true;
+}
+
+/* Materialization is optional optimizer work, so the built-in default is
+ * intentionally conservative.  Dedicated analytical deployments can raise
+ * it with bloompg_tune.py; container limits must still win over host RAM. */
 static int
 bloompg_default_materialization_memory_kb(void)
 {
+	uint64 usable_bytes = UINT64CONST(512) * 1024 * 1024;
+	uint64 cgroup_bytes;
+	uint64 default_bytes;
+	bool physical_known = false;
+
 #ifdef _SC_PHYS_PAGES
 	long		pages = sysconf(_SC_PHYS_PAGES);
 	long		page_size = sysconf(_SC_PAGESIZE);
@@ -88,14 +124,25 @@ bloompg_default_materialization_memory_kb(void)
 	if (pages > 0 && page_size > 0 &&
 		(uint64) pages <= UINT64_MAX / (uint64) page_size)
 	{
-		uint64 physical_kb =
-			((uint64) pages * (uint64) page_size) / 1024;
-		uint64 half_kb = physical_kb / 2;
-
-		return (int) Min(half_kb, (uint64) INT_MAX);
+		usable_bytes = (uint64) pages * (uint64) page_size;
+		physical_known = true;
 	}
 #endif
-	return 512 * 1024;
+	if (bloompg_read_memory_limit("/sys/fs/cgroup/memory.max",
+			&cgroup_bytes) ||
+		bloompg_read_memory_limit(
+			"/sys/fs/cgroup/memory/memory.limit_in_bytes", &cgroup_bytes))
+	{
+		/* cgroup v1 can use a near-UINT64 sentinel for "unlimited". */
+		if (cgroup_bytes < (UINT64CONST(1) << 60) &&
+			(!physical_known || cgroup_bytes < usable_bytes))
+			usable_bytes = cgroup_bytes;
+	}
+	default_bytes = Min(UINT64CONST(512) * 1024 * 1024,
+		usable_bytes / 8);
+	/* Never let a convenience floor override a small container limit. */
+	default_bytes = Max(default_bytes, UINT64CONST(64) * 1024);
+	return (int) Min(default_bytes / 1024, (uint64) INT_MAX);
 }
 
 void
@@ -181,7 +228,7 @@ _PG_init(void)
 							"Minimum exact materialized rows before Bloom biases only the P1 optimizer toward parallel execution.",
 							NULL,
 							&bloompg_p1_parallel_min_rows,
-							100000,
+							10000,
 							0,
 							INT_MAX,
 							PGC_USERSET,
@@ -421,7 +468,7 @@ _PG_init(void)
 								NULL,
 								NULL);
 	DefineCustomIntVariable("bloompg.materialization_memory",
-								"Per-backend, per-table memory budget for optimizer-time columnar materialization.",
+								"Total memory budget for one query's optimizer-time columnar materializations and parallel DSM copies.",
 								NULL,
 								&bloompg_materialization_memory_kb,
 								materialization_default_kb,
@@ -465,7 +512,7 @@ Datum
 bloompg_version(PG_FUNCTION_ARGS)
 {
 	(void) fcinfo;
-	PG_RETURN_TEXT_P(cstring_to_text("bloompg 0.1.1 (PostgreSQL 18)"));
+	PG_RETURN_TEXT_P(cstring_to_text(BLOOMPG_VERSION_STRING));
 }
 
 Datum

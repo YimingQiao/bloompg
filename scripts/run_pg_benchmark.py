@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--p1-parallel-min-rows",
         type=int,
-        default=100_000,
+        default=10_000,
     )
     parser.add_argument(
         "--work-mem",
@@ -282,6 +282,14 @@ def profile_is_terminal(profile: dict) -> bool:
     return profile.get("status") in {"complete", "empty"}
 
 
+def terminate_sql(query_sql: str) -> str:
+    """Return one psql-ready statement, accepting corpora without semicolons."""
+    statement = query_sql.rstrip()
+    if not statement.endswith(";"):
+        statement += "\n;"
+    return statement + "\n"
+
+
 def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
     repetitions = args.timed_runs + 1
     profile_suffix = ""
@@ -295,7 +303,7 @@ def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
         f"SET statement_timeout = {args.statement_timeout_ms};\n"
         "\\pset pager off\n"
         "\\timing on\n"
-        + (query_sql.rstrip() + "\n") * repetitions
+        + terminate_sql(query_sql) * repetitions
         + profile_suffix
     )
     mode = "bloom" if enabled else "base"

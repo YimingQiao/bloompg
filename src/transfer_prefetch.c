@@ -149,6 +149,9 @@ bloompg_select_prefetch_peer(BloomPGRelationState *source,
 			candidate->materialized || candidate->prefetched ||
 			bloompg_transfer_worker_count(candidate, query_parallel_safe) <= 0)
 			continue;
+		if (candidate->join_index_sources != NULL &&
+			candidate->base_rows > (double) bloompg_index_guard_min_rows)
+			continue;
 		/* A shared heap wave is irreversible: it materializes the peer before
 		 * the source can publish its exact keys.  Do not trade away a B-tree
 		 * access opportunity merely to overlap two scans. */
@@ -192,7 +195,7 @@ bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	BloomPGRelationState **states, int relation_count,
 	const BloomPGJoinGraph *graph, PlannedStmt *candidate,
 	const char *query_string, ParamListInfo bound_params,
-	ResourceOwner runtime_owner, bool query_parallel_safe,
+	bool query_parallel_safe,
 	int *next_plan_node_id, uint64 *next_parallel_wave_id)
 {
 	BloomPGRelationState *peer;
@@ -217,11 +220,14 @@ bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	bool shared_batch = false;
 	int shared_workers = 0;
 	int shared_launched = 0;
+	Size parallel_memory = 0;
 	double shared_ms = 0.0;
 	const char *shared_layout = "unknown";
 	uint64 wave_id;
 
-	if (source->materialized || source->prefetched)
+	if (source->materialized || source->prefetched ||
+		(source->join_index_sources != NULL &&
+		 source->base_rows > (double) bloompg_index_guard_min_rows))
 		return false;
 	source_requested = bloompg_transfer_worker_count(source,
 		query_parallel_safe);
@@ -272,19 +278,26 @@ bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	if (source_requested <= 0 || peer_requested <= 0)
 		return false;
 
+	shared_workers = Min(available_workers,
+		source_requested + peer_requested);
 	source_token = bloompg_runtime_next_token();
 	peer_token = bloompg_runtime_next_token();
-	source_store = bloompg_begin_runtime_store(runtime_owner);
-	peer_store = bloompg_begin_runtime_store(runtime_owner);
+	source_store = bloompg_begin_runtime_store(source->memory_budget);
+	peer_store = bloompg_begin_runtime_store(peer->memory_budget);
 	bloompg_runtime_register_materialization(source_token, GetActiveSnapshot(),
 		source_store, NULL, 0);
 	bloompg_runtime_register_materialization(peer_token, GetActiveSnapshot(),
 		peer_store, NULL, 0);
+	parallel_memory = bloompg_parallel_pack_memory(shared_workers);
+	if (!bloompg_memory_budget_reserve(source->memory_budget, parallel_memory))
+	{
+		bloompg_runtime_release_materialization(source_token);
+		bloompg_runtime_release_materialization(peer_token);
+		return false;
+	}
 
 	PG_TRY();
 	{
-		shared_workers = Min(available_workers,
-			source_requested + peer_requested);
 		shared_batch = bloompg_execute_parallel_batch(source, peer, candidate,
 			source_store, peer_store, query_string, bound_params,
 			shared_workers, next_plan_node_id, &source_rows, &peer_rows,
@@ -293,11 +306,15 @@ bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	}
 	PG_CATCH();
 	{
+		bloompg_memory_budget_release_reservation(source->memory_budget,
+			parallel_memory);
 		bloompg_runtime_release_materialization(source_token);
 		bloompg_runtime_release_materialization(peer_token);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	bloompg_memory_budget_release_reservation(source->memory_budget,
+		parallel_memory);
 	if (!shared_batch)
 	{
 		bloompg_runtime_release_materialization(source_token);

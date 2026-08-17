@@ -42,7 +42,6 @@ typedef struct BloomPGIntermediateSamplingProfile
 	uint64		rows_passed;
 	double		probe_ms;
 	double		last_fraction;
-	bool		vectorized;
 } BloomPGIntermediateSamplingProfile;
 
 extern double bloompg_sample_relation(PlannedStmt *candidate,

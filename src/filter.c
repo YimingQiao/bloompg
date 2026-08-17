@@ -12,7 +12,6 @@
 #include <math.h>
 
 #define BLOOMPG_MIN_BLOOM_BITS UINT64CONST(512)
-#define BLOOMPG_MAX_HASH_FUNCTIONS 10
 
 static uint64
 bloompg_ceil_power_of_two(uint64 value)
@@ -417,6 +416,102 @@ bloompg_filter_contains_vector(BloomPGFilter *filter,
 	if (!result)
 		filter->rejected++;
 	return result;
+}
+
+/* Apply one filter to a whole selection vector.  Bitmap filters use their
+ * native fixed-width column directly; composite and hashed filters retain the
+ * general row helper.  Input and output may alias. */
+uint32
+bloompg_filter_select_vector(BloomPGFilter *filter,
+	const BloomPGColumnStoreChunkView *view, const AttrNumber *attributes,
+	const uint16 *input, uint32 input_count, uint16 *output)
+{
+	AttrNumber attribute;
+	const BloomPGColumnVector *vector;
+	Oid type_oid;
+	uint32 input_index;
+	uint32 output_count = 0;
+
+	Assert(filter != NULL);
+	if (filter->kind != BLOOMPG_FILTER_BITMAP || filter->nkeys != 1)
+	{
+		for (input_index = 0; input_index < input_count; input_index++)
+		{
+			uint32 row = input[input_index];
+
+			if (bloompg_filter_contains_vector(filter, view, row, attributes))
+				output[output_count++] = (uint16) row;
+		}
+		return output_count;
+	}
+	filter->lookups += input_count;
+	if (!filter->valid)
+	{
+		if (input != output && input_count > 0)
+			memcpy(output, input, mul_size(input_count, sizeof(uint16)));
+		return input_count;
+	}
+	attribute = attributes[0];
+	if (!AttributeNumberIsValid(attribute) ||
+		(uint32) attribute > view->vector_count)
+		elog(ERROR, "invalid bloompg bitmap vector attribute");
+	vector = &view->vectors[attribute - 1];
+	type_oid = filter->keys[0].probe_type;
+	for (input_index = 0; input_index < input_count; input_index++)
+	{
+		uint32 row = input[input_index];
+		int64 integral;
+		uint64 offset;
+		bool accepted = false;
+
+		if (row >= view->count)
+			elog(ERROR, "invalid bloompg vector selection");
+		if (!bloompg_column_vector_is_valid(vector, row))
+			goto rejected;
+		switch (type_oid)
+		{
+			case INT2OID:
+				if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_2)
+					elog(ERROR, "invalid bloompg int2 probe vector");
+				integral = (int64) (int16)
+					((const uint16 *) vector->data)[row];
+				break;
+			case INT4OID:
+			case DATEOID:
+				if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_4)
+					elog(ERROR, "invalid bloompg int4 probe vector");
+				integral = (int64) (int32)
+					((const uint32 *) vector->data)[row];
+				break;
+			case INT8OID:
+				if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_8)
+					elog(ERROR, "invalid bloompg int8 probe vector");
+				integral = (int64) ((const uint64 *) vector->data)[row];
+				break;
+			case OIDOID:
+				if (vector->physical_type != BLOOMPG_VECTOR_BYVAL_4)
+					elog(ERROR, "invalid bloompg oid probe vector");
+				integral = (int64) ((const uint32 *) vector->data)[row];
+				break;
+			default:
+				elog(ERROR, "invalid bloompg bitmap probe type %u", type_oid);
+		}
+		if (integral >= filter->bitmap_lower &&
+			integral <= filter->bitmap_upper)
+		{
+			offset = (uint64) integral - (uint64) filter->bitmap_lower;
+			accepted = (filter->words[offset >> 6] &
+				(UINT64CONST(1) << (offset & 63))) != 0;
+		}
+		if (accepted)
+		{
+			output[output_count++] = (uint16) row;
+			continue;
+		}
+rejected:
+		filter->rejected++;
+	}
+	return output_count;
 }
 
 void

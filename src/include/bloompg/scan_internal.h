@@ -17,7 +17,6 @@
 typedef enum BloomPGParallelStoreFormat
 {
 	BLOOMPG_PARALLEL_STORE_NONE,
-	BLOOMPG_PARALLEL_STORE_TUPLES,
 	BLOOMPG_PARALLEL_STORE_COLUMNS
 } BloomPGParallelStoreFormat;
 
@@ -80,7 +79,6 @@ typedef struct BloomPGMemoryState
 	uint64		token;
 	uint64		planned_rows;
 	BloomPGColumnStoreScan store_scan;
-	TupleTableSlot *parallel_slot;
 	BloomPGParallelStore *parallel_store;
 	BloomPGParallelCursor parallel_cursor;
 	Size		parallel_size;
@@ -98,7 +96,6 @@ typedef struct BloomPGTidState
 	uint64		token;
 	uint64		planned_rows;
 	BloomPGColumnStoreScan store_scan;
-	TupleTableSlot *parallel_slot;
 	BloomPGParallelStore *parallel_store;
 	BloomPGParallelCursor parallel_cursor;
 	Size		parallel_size;
@@ -157,12 +154,17 @@ typedef struct BloomPGFilterState
 	bool		prefilter;
 } BloomPGFilterState;
 
+extern Size bloompg_parallel_filter_header_size(int nfilters);
+extern Size bloompg_parallel_filter_add_size(Size size,
+	const BloomPGFilter *filter);
+
 extern const CustomScanMethods bloompg_apply_scan_methods;
 extern const CustomScanMethods bloompg_memory_scan_methods;
 extern const CustomScanMethods bloompg_empty_scan_methods;
 extern const CustomScanMethods bloompg_tid_scan_methods;
 extern const CustomScanMethods bloompg_filter_scan_methods;
 extern const CustomScanMethods bloompg_prefilter_scan_methods;
+extern const CustomScanMethods bloompg_pack_scan_methods;
 
 extern Oid *bloompg_list_to_oid_array(List *values, int expected);
 extern AttrNumber *bloompg_list_to_attr_array(List *values, int expected);
@@ -172,8 +174,6 @@ extern Size bloompg_estimate_parallel_store(
 extern void bloompg_fill_parallel_store(
 	BloomPGRuntimeMaterializationEntry *entry,
 	BloomPGParallelStore *parallel_store, Size allocated);
-extern MinimalTuple bloompg_parallel_next_tuple(
-	BloomPGParallelStore *parallel_store);
 extern bool bloompg_parallel_next_column(BloomPGParallelStore *store,
 	BloomPGParallelCursor *cursor, TupleTableSlot *slot);
 

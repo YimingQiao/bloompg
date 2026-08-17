@@ -45,15 +45,6 @@ def parse_args() -> argparse.Namespace:
         help="Conservative sort/hash operators per active query (default: 8)",
     )
     parser.add_argument(
-        "--materialized-tables-per-query",
-        type=int,
-        default=1,
-        help=(
-            "Maximum simultaneously resident Bloom materializations per query "
-            "(default: 1 for a dedicated benchmark)"
-        ),
-    )
-    parser.add_argument(
         "--storage",
         choices=("ssd", "hdd"),
         default="ssd",
@@ -119,7 +110,9 @@ def detected_cpus() -> int:
 
 
 def floor_to(value: int, quantum: int) -> int:
-    return max((value // quantum) * quantum, quantum)
+    """Round down without letting the quantum exceed a small target."""
+    rounded = (value // quantum) * quantum
+    return rounded if rounded > 0 else value
 
 
 def clamp(value: int, lower: int, upper: int) -> int:
@@ -139,7 +132,6 @@ def recommend(
     cpus: int,
     concurrency: int,
     active_operators: int,
-    materialized_tables: int,
     storage: str,
 ) -> dict:
     shared_buffers = floor_to(memory // 8, GIB)
@@ -156,10 +148,9 @@ def recommend(
         clamp(memory // 16, 512 * MIB, 4 * GIB), 256 * MIB
     )
 
-    # Bloom materialization is private per backend and per table.  A single
-    # analytical query may use half the machine, while concurrent backends
-    # share that same 50% pool rather than each assuming ownership of it.
-    materialization_budget = memory // 2 // concurrency // materialized_tables
+    # BloomPG enforces this once across every materialization and parallel DSM
+    # copy owned by a query.  Concurrent analytical backends share a 50% pool.
+    materialization_budget = memory // 2 // concurrency
     materialization_quantum = GIB if materialization_budget >= GIB else 256 * MIB
     materialization_memory = floor_to(materialization_budget, materialization_quantum)
 
@@ -201,7 +192,7 @@ def recommend(
         "bloompg.transfer_workers": str(transfer_workers),
         "bloompg.transfer_parallel_min_rows": "100000",
         "bloompg.p1_parallel_bias": "on",
-        "bloompg.p1_parallel_min_rows": "100000",
+        "bloompg.p1_parallel_min_rows": "10000",
         "bloompg.sample_rate": "0.01",
         "bloompg.profile": "off",
         "bloompg.profile_log": "off",
@@ -213,15 +204,14 @@ def recommend(
             "cpus": cpus,
             "analytical_concurrency": concurrency,
             "active_memory_operators": active_operators,
-            "materialized_tables_per_query": materialized_tables,
             "storage": storage,
         },
         "postgresql": postgres,
         "bloompg": bloompg,
         "notes": [
             "work_mem is per sort/hash node and can be multiplied by workers.",
-            "Bloom materialization memory is a per-backend, per-table ceiling.",
-            "Its recommendation divides a 50% private-memory pool by query concurrency and resident materialized tables.",
+            "Bloom materialization memory is one total budget per query, including parallel DSM copies.",
+            "Its recommendation divides a 50% private-memory pool by analytical query concurrency.",
             "Bloom transfer workers use PostgreSQL processes; the recommendation reserves one worker group per concurrent analytical query.",
             "bloompg.transfer_workers is a ceiling: scans scale down near 100k estimated input rows per worker and compatible same-wave relations share one Parallel Append group.",
             "Merge shared_preload_libraries with existing entries; do not overwrite them.",
@@ -253,7 +243,6 @@ def render_text(result: dict, source: str) -> str:
         f"  CPUs: {detected['cpus']}",
         f"  analytical concurrency: {detected['analytical_concurrency']}",
         f"  assumed memory operators/query: {detected['active_memory_operators']}",
-        f"  resident materialized tables/query: {detected['materialized_tables_per_query']}",
         f"  storage: {detected['storage']}",
         "",
         "PostgreSQL:",
@@ -278,8 +267,6 @@ def main() -> int:
         raise SystemExit("--analytical-concurrency must be positive")
     if args.active_memory_operators <= 0:
         raise SystemExit("--active-memory-operators must be positive")
-    if args.materialized_tables_per_query <= 0:
-        raise SystemExit("--materialized-tables-per-query must be positive")
 
     if args.memory_gib is None:
         memory, source = detected_memory_bytes()
@@ -292,7 +279,6 @@ def main() -> int:
         cpus,
         args.analytical_concurrency,
         args.active_memory_operators,
-        args.materialized_tables_per_query,
         args.storage,
     )
 

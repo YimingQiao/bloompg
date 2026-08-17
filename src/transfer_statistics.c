@@ -200,9 +200,9 @@ bloompg_find_statistics_peer(BloomPGMaterializedStatistics *statistics,
 
 /*
  * Seal one materialization's post-transfer statistics before P1 starts.  The
- * scan stays on selected column vectors; spilled stores retain the equivalent
- * slot fallback.  Equality columns shared with one peer are collected as one
- * composite key, preserving their correlation for join cardinality.
+ * scan stays on selected column vectors. Equality columns shared with one peer
+ * are collected as one composite key, preserving their correlation for join
+ * cardinality.
  */
 BloomPGMaterializedStatistics *
 bloompg_finalize_state_statistics(BloomPGRelationState *state,

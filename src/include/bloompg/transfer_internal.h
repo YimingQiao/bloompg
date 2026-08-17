@@ -17,7 +17,6 @@
 #include "nodes/plannodes.h"
 #include "portability/instr_time.h"
 #include "utils/relcache.h"
-#include "utils/resowner.h"
 #include "utils/snapshot.h"
 
 #define BLOOMPG_MAX_INDEX_BITMAP_SOURCES 3
@@ -35,10 +34,37 @@ typedef struct BloomPGIndexBitmapInputProfile
 	uint64		index_tuples;
 } BloomPGIndexBitmapInputProfile;
 
+/* A relation has one scheduling disposition at a time.  Index readiness is
+ * orthogonal: a ready relation can still wait for a smaller indexed producer,
+ * while a wait-break relation may or may not have an exact path available. */
+typedef enum BloomPGSelectionDisposition
+{
+	BLOOMPG_SELECTION_UNCONSIDERED,
+	BLOOMPG_SELECTION_ELIGIBLE,
+	BLOOMPG_SELECTION_WAITING,
+	BLOOMPG_SELECTION_WAIT_BREAK,
+	BLOOMPG_SELECTION_NATIVE_FALLBACK
+} BloomPGSelectionDisposition;
+
+typedef struct BloomPGSelectionState
+{
+	BloomPGSelectionDisposition disposition;
+	bool		index_ready;
+} BloomPGSelectionState;
+
+static inline bool
+bloompg_selection_is_guarded(BloomPGSelectionState selection)
+{
+	return selection.disposition == BLOOMPG_SELECTION_WAITING ||
+		selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ||
+		selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK;
+}
+
 typedef struct BloomPGRelationState
 {
 	Index		rti;
 	Index		replacement_rti;
+	BloomPGMemoryBudget *memory_budget;
 	BloomPGTable *table;
 	Query	   *analysis_query;
 	int			cursor_options;
@@ -64,6 +90,7 @@ typedef struct BloomPGRelationState
 	bool		prefetched;
 	bool		changed;
 	bool		materialization_used_filters;
+	PlannedStmt *preplanned_access;
 	uint64		materialization_token;
 	uint64		prefetch_token;
 	uint64		prefetch_rows;
@@ -140,18 +167,14 @@ typedef struct BloomPGRelationState
 	uint64		access_plan_bitmap_heap_scans;
 	uint64		access_plan_bitmap_index_scans;
 	uint64		access_plan_gathers;
+	bool		access_plan_parallel_safe;
 	const char *access_plan_kind;
 	const char *access_plan_rejection;
 	/* Static join-key index opportunities and the last guard decision. */
 	Bitmapset  *join_index_sources;
-	bool		selection_index_ready;
-	bool		selection_guarded;
-	bool		selection_guard_fallback;
-	bool		selection_native_fallback;
+	BloomPGSelectionState selection;
 	uint64		column_compactions;
-	uint64		slot_compactions;
 	uint64		vector_filter_builds;
-	uint64		slot_filter_builds;
 	double		filter_prepare_ms;
 	double		filter_finalize_ms;
 	double		filter_build_ms;
@@ -202,19 +225,20 @@ bloompg_transfer_elapsed_ms(instr_time started)
 
 /* Physical scan/materialization helpers (transfer_materialize.c). */
 extern BloomPGColumnStore *bloompg_begin_runtime_store(
-	ResourceOwner runtime_owner);
+	BloomPGMemoryBudget *memory_budget);
 extern bool bloompg_integral_value(Datum datum, Oid type_oid, int64 *result);
-extern bool bloompg_process_pending_slot(List *pending_transfers,
-	TupleTableSlot *slot);
-extern void bloompg_process_pending_columns(List *pending_transfers,
-	const BloomPGColumnStoreChunkView *view, uint32 row);
+extern void bloompg_process_pending_chunk(List *pending_transfers,
+	const BloomPGColumnStoreChunkView *view, const uint16 *selection,
+	uint32 selected_count);
+extern void bloompg_process_pending_dense_chunk(List *pending_transfers,
+	const BloomPGColumnVector *vectors, uint32 vector_count, uint32 count);
 extern bool bloompg_contains_materialized_filter(BloomPGFilter *filter,
 	const BloomPGColumnStoreChunkView *view, uint32 row,
 	const AttrNumber *attributes);
 extern void bloompg_insert_materialized_filter(BloomPGFilter *filter,
 	const BloomPGColumnStoreChunkView *view, uint32 row,
 	const AttrNumber *attributes);
-extern bool bloompg_build_pending_from_materialization(List *pending,
+extern void bloompg_build_pending_from_materialization(List *pending,
 	BloomPGColumnStore *store, TupleDesc descriptor);
 extern void bloompg_discard_pending_filters(List *pending_transfers);
 extern uint64 bloompg_compact_materialization(BloomPGRelationState *state,
@@ -224,7 +248,7 @@ extern uint64 bloompg_finalize_pending_filters(List *pending_transfers,
 	uint64 *one_pass_bitmap_builds);
 extern uint64 bloompg_create_tid_materialization(
 	BloomPGRuntimeMaterializationEntry *source, AttrNumber ctid_attribute,
-	uint64 expected_rows, ResourceOwner runtime_owner);
+	uint64 expected_rows);
 extern uint64 bloompg_execute_state_source(BloomPGRelationState *state,
 	PlannedStmt *candidate, Plan *source_plan, List *pending,
 	BloomPGColumnStore *store, TupleDesc *descriptor,
@@ -268,7 +292,7 @@ extern bool bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	BloomPGRelationState **states, int relation_count,
 	const BloomPGJoinGraph *graph, PlannedStmt *candidate,
 	const char *query_string,
-	ParamListInfo bound_params, ResourceOwner runtime_owner,
+	ParamListInfo bound_params,
 	bool query_parallel_safe, int *next_plan_node_id,
 	uint64 *next_parallel_wave_id);
 
@@ -282,7 +306,7 @@ extern BloomPGMaterializedStatistics *bloompg_finalize_state_statistics(
 extern void bloompg_finalize_replacements(PlannedStmt *candidate,
 	BloomPGJoinGraph *graph, BloomPGRelationState **states,
 	int relation_count, const char *query_string,
-	ParamListInfo bound_params, ResourceOwner runtime_owner,
+	ParamListInfo bound_params,
 	bool query_parallel_safe, int *next_plan_node_id,
 	BloomPGTransferOutcome *outcome, StringInfoData *detail);
 extern void bloompg_transfer_profile_append_step(StringInfo json, int step,
@@ -298,6 +322,8 @@ typedef bool (*BloomPGIndexTupleCallback)(TupleTableSlot *slot, void *context);
 extern bool bloompg_index_prefilter_available(BloomPGRelationState *state);
 extern bool bloompg_index_prefilter_estimate(BloomPGRelationState *state,
 	double *fraction, uint64 *keys, Oid *index_oid);
+extern bool bloompg_index_prefilter_page_fraction(
+	BloomPGRelationState *state, double *fraction);
 extern bool bloompg_relation_has_transfer_index(BloomPGRelationState *state,
 	AttrNumber attribute, Oid equality_operator, Oid collation);
 extern bool bloompg_index_prefilter_scan(BloomPGRelationState *state,

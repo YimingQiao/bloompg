@@ -37,6 +37,25 @@
 
 /* Transfer trace and structured profiling serialization. */
 
+static const char *
+bloompg_selection_name(BloomPGSelectionState selection)
+{
+	switch (selection.disposition)
+	{
+		case BLOOMPG_SELECTION_UNCONSIDERED:
+			return "unconsidered";
+		case BLOOMPG_SELECTION_ELIGIBLE:
+			return selection.index_ready ? "index-ready" : "eligible";
+		case BLOOMPG_SELECTION_WAITING:
+			return "waiting";
+		case BLOOMPG_SELECTION_WAIT_BREAK:
+			return "wait-break";
+		case BLOOMPG_SELECTION_NATIVE_FALLBACK:
+			return "native-fallback";
+	}
+	return "unknown";
+}
+
 void
 bloompg_transfer_profile_append_step(StringInfo json, int step,
 	BloomPGRelationState *source, BloomPGPendingTransfer *pending,
@@ -52,14 +71,18 @@ bloompg_transfer_profile_append_step(StringInfo json, int step,
 	escape_json(json, source->table->alias != NULL ? source->table->alias : "?");
 	appendStringInfo(json,
 		",\"selection_join_index_sources\":%d,"
+		"\"selection_state\":\"%s\","
 		"\"selection_index_ready\":%s,\"selection_guarded\":%s,"
 		"\"selection_guard_fallback\":%s,"
 		"\"selection_native_fallback\":%s",
 		bms_num_members(source->join_index_sources),
-		source->selection_index_ready ? "true" : "false",
-		source->selection_guarded ? "true" : "false",
-		source->selection_guard_fallback ? "true" : "false",
-		source->selection_native_fallback ? "true" : "false");
+		bloompg_selection_name(source->selection),
+		source->selection.index_ready ? "true" : "false",
+		bloompg_selection_is_guarded(source->selection) ? "true" : "false",
+		source->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
+			"true" : "false",
+		source->selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK ?
+			"true" : "false");
 	appendStringInfo(json, ",\"destination_rti\":%u,\"destination\":",
 		pending->destination->rti);
 	escape_json(json, pending->destination->table->alias != NULL ?
@@ -160,8 +183,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				appendStringInfo(&detail,
 					" exact=%u:" UINT64_FORMAT ":%.3fms"
 					" base=" UINT64_FORMAT ":%.3fms compact=" UINT64_FORMAT
-					":%.3fms kernel=%s filter_build=" UINT64_FORMAT "/"
-					UINT64_FORMAT
+					":%.3fms kernel=column filter_build=" UINT64_FORMAT
 					":%.3fms prepare=%.3fms finalize=%.3fms"
 					" bitmap_onepass=" UINT64_FORMAT " finalize_rescan="
 					UINT64_FORMAT ":" UINT64_FORMAT
@@ -170,8 +192,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->exact_scan_ms, state->base_materializations,
 				state->base_materialize_ms, state->compactions,
 				state->compact_ms,
-				state->slot_compactions > 0 ? "slot" : "column",
-					state->vector_filter_builds, state->slot_filter_builds,
+					state->vector_filter_builds,
 					state->filter_build_ms,
 					state->filter_prepare_ms, state->filter_finalize_ms,
 					state->one_pass_bitmap_builds,
@@ -276,18 +297,16 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 						state->parallel_wave_ms);
 			if (entry != NULL && entry->store != NULL)
 				appendStringInfo(&detail,
-					" store=%s:" UINT64_FORMAT "/" UINT64_FORMAT
-					":%zuB peak=%zuB limit=%zuB spill_at=" UINT64_FORMAT
+					" store=vector:" UINT64_FORMAT "/" UINT64_FORMAT
+					":%zuB peak=%zuB limit=%zuB"
 					" chunks=%u varlen=" UINT64_FORMAT ":%zuB"
 					" selection=" UINT64_FORMAT "/" UINT64_FORMAT "/"
 					UINT64_FORMAT " slots=" UINT64_FORMAT,
-					bloompg_column_store_spilled(entry->store) ? "spill" : "vector",
 					bloompg_column_store_live_rows(entry->store),
 					bloompg_column_store_rows(entry->store),
 					bloompg_column_store_memory_bytes(entry->store),
 					bloompg_column_store_peak_memory_bytes(entry->store),
 					bloompg_column_store_memory_limit(entry->store),
-					bloompg_column_store_spill_rows(entry->store),
 					bloompg_column_store_vector_chunks(entry->store),
 					bloompg_column_store_varlen_values(entry->store),
 					bloompg_column_store_varlen_bytes(entry->store),
@@ -338,8 +357,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->intermediate_sampling_profile.last_fraction,
 				state->intermediate_sampling_profile.calls,
 				state->intermediate_sampling_profile.probe_ms,
-				state->intermediate_sampling_profile.vectorized ?
-					"vector" : "spill");
+				"vector");
 		if (collect_profile)
 		{
 			profile_one_pass_bitmap_builds +=
@@ -433,16 +451,16 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				",\"last_fraction\":%.6f,\"probe_ms\":%.3f},",
 				state->intermediate_sampling_profile.calls,
 				state->intermediate_sampling_profile.calls == 0 ? "none" :
-					(state->intermediate_sampling_profile.vectorized ?
-						"vector" : "spill"),
+					"vector",
 				state->intermediate_sampling_profile.rows_examined,
 				state->intermediate_sampling_profile.rows_passed,
 				state->intermediate_sampling_profile.last_fraction,
 				state->intermediate_sampling_profile.probe_ms);
 			appendStringInfo(&profile_relations,
-					"\"materialization\":{\"access_path\":\"%s\","
-				"\"selection\":{\"policy\":\"index-wait-guard-v1\","
-				"\"join_index_sources\":%d,\"index_ready\":%s,"
+				"\"materialization\":{\"access_path\":\"%s\","
+				"\"selection\":{\"policy\":\"index-wait-guard-v2\","
+				"\"state\":\"%s\",\"join_index_sources\":%d,"
+				"\"index_ready\":%s,"
 				"\"guarded\":%s,\"fallback\":%s,"
 				"\"native_fallback\":%s},"
 				"\"access_plan\":{\"attempts\":" UINT64_FORMAT
@@ -460,9 +478,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				",\"exact_ms\":%.3f,\"base_scans\":" UINT64_FORMAT
 				",\"base_ms\":%.3f,\"compact_scans\":" UINT64_FORMAT
 				",\"compact_ms\":%.3f,\"column_compactions\":" UINT64_FORMAT
-				",\"slot_compactions\":" UINT64_FORMAT
 					",\"vector_filter_builds\":" UINT64_FORMAT
-					",\"slot_filter_builds\":" UINT64_FORMAT
 					",\"filter_prepare_ms\":%.3f,\"filter_finalize_ms\":%.3f,"
 					"\"filter_build_ms\":%.3f,\"one_pass_bitmap_builds\":"
 					UINT64_FORMAT ",\"filter_finalize_rescans\":" UINT64_FORMAT
@@ -481,19 +497,23 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 					",\"bitmap_exact_pages\":" UINT64_FORMAT
 					",\"bitmap_lossy_pages\":" UINT64_FORMAT
 					",\"dominated_candidates\":" UINT64_FORMAT
-						"},\"parallel\":{"
+					"},\"parallel\":{"
 				"\"scans\":" UINT64_FORMAT
 				",\"workers_requested\":" UINT64_FORMAT
 				",\"workers_launched\":" UINT64_FORMAT
-					",\"rows\":" UINT64_FORMAT ",\"scan_ms\":%.3f},"
-					"\"wave\":",
+				",\"rows\":" UINT64_FORMAT ",\"scan_ms\":%.3f},"
+				"\"wave\":",
 				state->materialization_access_path != NULL ?
 					state->materialization_access_path : "none",
+				bloompg_selection_name(state->selection),
 				bms_num_members(state->join_index_sources),
-				state->selection_index_ready ? "true" : "false",
-				state->selection_guarded ? "true" : "false",
-				state->selection_guard_fallback ? "true" : "false",
-				state->selection_native_fallback ? "true" : "false",
+				state->selection.index_ready ? "true" : "false",
+				bloompg_selection_is_guarded(state->selection) ?
+					"true" : "false",
+				state->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
+					"true" : "false",
+				state->selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK ?
+					"true" : "false",
 				state->access_plan_attempts, state->access_plan_ms,
 				state->access_plan_kind != NULL ?
 					state->access_plan_kind : "none",
@@ -513,8 +533,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->exact_scans, state->exact_scan_ms,
 				state->base_materializations, state->base_materialize_ms,
 				state->compactions, state->compact_ms,
-					state->column_compactions, state->slot_compactions,
-					state->vector_filter_builds, state->slot_filter_builds,
+					state->column_compactions, state->vector_filter_builds,
 					state->filter_prepare_ms, state->filter_finalize_ms,
 					state->filter_build_ms, state->one_pass_bitmap_builds,
 					state->filter_finalize_rescans,
@@ -579,23 +598,20 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 			appendStringInfoChar(&profile_relations, ']');
 			if (entry != NULL && entry->store != NULL)
 				appendStringInfo(&profile_relations,
-					",\"store\":{\"format\":\"%s\",\"live_rows\":"
+					",\"store\":{\"format\":\"vector\",\"live_rows\":"
 					UINT64_FORMAT ",\"rows\":" UINT64_FORMAT
 					",\"memory_bytes\":%zu,\"peak_memory_bytes\":%zu,"
-					"\"memory_limit_bytes\":%zu,\"spill_at_rows\":"
-					UINT64_FORMAT ",\"vector_size\":%u,\"chunks\":%u,"
+					"\"memory_limit_bytes\":%zu,\"vector_size\":%u,\"chunks\":%u,"
 					"\"varlen_values\":" UINT64_FORMAT
 					",\"varlen_bytes\":%zu,\"selection_rewrites\":"
 					UINT64_FORMAT ",\"selection_rows_examined\":" UINT64_FORMAT
 					",\"selection_rows_rejected\":" UINT64_FORMAT
 					",\"slot_reconstructions\":" UINT64_FORMAT "}",
-					bloompg_column_store_spilled(entry->store) ? "spill" : "vector",
 					bloompg_column_store_live_rows(entry->store),
 					bloompg_column_store_rows(entry->store),
 					bloompg_column_store_memory_bytes(entry->store),
 					bloompg_column_store_peak_memory_bytes(entry->store),
 					bloompg_column_store_memory_limit(entry->store),
-					bloompg_column_store_spill_rows(entry->store),
 					BLOOMPG_VECTOR_SIZE,
 					bloompg_column_store_vector_chunks(entry->store),
 					bloompg_column_store_varlen_values(entry->store),
@@ -640,8 +656,7 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 					"\"join_keys\":[",
 					state->statistics->finalize_ms,
 					state->statistics->scanned_key_sets == 0 ?
-						"filter" : (state->statistics->vectorized ?
-							"vector" : "spill"),
+						"filter" : "vector",
 					state->statistics->rows,
 					state->statistics->rows_examined,
 					state->statistics->values_examined,

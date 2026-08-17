@@ -1,5 +1,5 @@
 comment = 'Bloom filter transfer for PostgreSQL'
-default_version = '0.1.1'
+default_version = '0.1.2'
 module_pathname = '$libdir/bloompg'
 relocatable = true
 superuser = true

@@ -3,7 +3,16 @@
 
 #include "postgres.h"
 
+#include "bloompg/column_store.h"
+
+#include "access/tupdesc.h"
 #include "nodes/plannodes.h"
+
+typedef void (*BloomPGPackedChunkVisitor)(
+	const BloomPGColumnVector *vectors,
+	uint32 vector_count,
+	uint32 count,
+	void *context);
 
 typedef struct BloomPGApplySpec
 {
@@ -47,6 +56,12 @@ extern Plan *bloompg_make_filter_scan(Plan *fallback_plan,
 								  int plan_node_id,
 								  bool parallel_aware,
 								  bool prefilter);
+extern Plan *bloompg_make_pack_scan(Plan *fallback_plan,
+	int plan_node_id, int parallel_workers);
+extern Size bloompg_parallel_pack_memory(int parallel_workers);
+extern uint32 bloompg_receive_packed_chunk(Datum datum,
+	BloomPGColumnStore *store, TupleDesc descriptor,
+	BloomPGPackedChunkVisitor visitor, void *visitor_context);
 extern bool bloompg_filter_scan_uses_token(Plan *plan, uint64 token);
 extern Plan *bloompg_make_empty_scan_path(List *targetlist,
 								   List *scan_targetlist,

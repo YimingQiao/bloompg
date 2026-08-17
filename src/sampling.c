@@ -6,6 +6,7 @@
 
 #include "catalog/pg_type_d.h"
 #include "catalog/pg_class.h"
+#include "access/detoast.h"
 #include "access/heaptoast.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -60,6 +61,8 @@ typedef struct BloomPGTidSample
 	TupleDesc	tuple_descriptor;
 	MinimalTuple *tuples;
 	uint64		tuple_count;
+	Size		tid_memory_bytes;
+	Size		tuple_memory_bytes;
 } BloomPGTidSample;
 
 /*
@@ -110,8 +113,22 @@ typedef struct BloomPGTidReceiver
 
 static List *prepared_samples = NIL;
 static List *prepared_tid_samples = NIL;
+static Size prepared_tid_cache_bytes = 0;
+static Size prepared_tuple_cache_bytes = 0;
 static Oid system_sample_handler = InvalidOid;
 static Oid bernoulli_sample_handler = InvalidOid;
+
+#define BLOOMPG_MAX_PREPARED_SAMPLE_ENTRIES 256
+#define BLOOMPG_MAX_PREPARED_TID_SAMPLES 128
+
+static Size
+bloompg_sample_memory_cache_limit(void)
+{
+	Size materialization_bytes = mul_size(
+		(Size) bloompg_materialization_memory_kb, (Size) 1024);
+
+	return materialization_bytes / 2;
+}
 
 static double
 bloompg_elapsed_ms(instr_time started)
@@ -188,7 +205,12 @@ bloompg_store_prepared_sample(Oid relation_oid, Oid relfilenode,
 							  double estimated_rows)
 {
 	BloomPGPreparedSample *sample;
-	MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+	MemoryContext old_context;
+
+	if (list_length(prepared_samples) >=
+		BLOOMPG_MAX_PREPARED_SAMPLE_ENTRIES)
+		return;
+	old_context = MemoryContextSwitchTo(TopMemoryContext);
 
 	sample = palloc0(sizeof(BloomPGPreparedSample));
 	sample->relation_oid = relation_oid;
@@ -297,6 +319,8 @@ bloompg_copy_tid_sample(BloomPGTidSample *source, MemoryContext context)
 	copy->tuple_descriptor = NULL;
 	copy->tuples = NULL;
 	copy->tuple_count = 0;
+	copy->tid_memory_bytes = 0;
+	copy->tuple_memory_bytes = 0;
 	if (source->count > 0)
 	{
 		copy->tids = palloc_array(ItemPointerData, source->count);
@@ -310,6 +334,12 @@ bloompg_copy_tid_sample(BloomPGTidSample *source, MemoryContext context)
 static void
 bloompg_reset_tid_tuple_cache(BloomPGTidSample *sample)
 {
+	if (sample->tuple_memory_bytes > 0)
+	{
+		Assert(sample->tuple_memory_bytes <= prepared_tuple_cache_bytes);
+		prepared_tuple_cache_bytes -= Min(sample->tuple_memory_bytes,
+			prepared_tuple_cache_bytes);
+	}
 	if (sample->tuple_context != NULL)
 		MemoryContextDelete(sample->tuple_context);
 	sample->tuples_ready = false;
@@ -317,6 +347,7 @@ bloompg_reset_tid_tuple_cache(BloomPGTidSample *sample)
 	sample->tuple_descriptor = NULL;
 	sample->tuples = NULL;
 	sample->tuple_count = 0;
+	sample->tuple_memory_bytes = 0;
 }
 
 static void
@@ -325,6 +356,12 @@ bloompg_free_tid_sample(BloomPGTidSample *sample)
 	if (sample == NULL)
 		return;
 	bloompg_reset_tid_tuple_cache(sample);
+	if (sample->tid_memory_bytes > 0)
+	{
+		Assert(sample->tid_memory_bytes <= prepared_tid_cache_bytes);
+		prepared_tid_cache_bytes -= Min(sample->tid_memory_bytes,
+			prepared_tid_cache_bytes);
+	}
 	if (sample->tids != NULL)
 		pfree(sample->tids);
 	pfree(sample);
@@ -336,6 +373,9 @@ bloompg_remember_tid_sample(BloomPGTidSample *source)
 	BloomPGTidSample *copy;
 	BloomPGTidSample *stale;
 	MemoryContext old_context;
+	Size cache_bytes;
+	Size cache_limit;
+	Size cache_used;
 
 	if (!bloompg_sample_memory_cache)
 		return source;
@@ -364,8 +404,28 @@ bloompg_remember_tid_sample(BloomPGTidSample *source)
 		prepared_tid_samples = list_delete_ptr(prepared_tid_samples, stale);
 		bloompg_free_tid_sample(stale);
 	}
+	if (list_length(prepared_tid_samples) >=
+		BLOOMPG_MAX_PREPARED_TID_SAMPLES)
+	{
+		MemoryContextSwitchTo(old_context);
+		return source;
+	}
+	cache_bytes = add_size(sizeof(BloomPGTidSample),
+		mul_size(source->count, sizeof(ItemPointerData)));
+	cache_bytes = add_size(cache_bytes, sizeof(ListCell));
+	cache_limit = bloompg_sample_memory_cache_limit();
+	cache_used = add_size(prepared_tid_cache_bytes,
+		prepared_tuple_cache_bytes);
+	if (cache_bytes > cache_limit || cache_used > cache_limit - cache_bytes)
+	{
+		MemoryContextSwitchTo(old_context);
+		return source;
+	}
 	copy = bloompg_copy_tid_sample(source, TopMemoryContext);
 	prepared_tid_samples = lappend(prepared_tid_samples, copy);
+	copy->tid_memory_bytes = cache_bytes;
+	prepared_tid_cache_bytes = add_size(prepared_tid_cache_bytes,
+		cache_bytes);
 	MemoryContextSwitchTo(old_context);
 	return copy;
 }
@@ -735,6 +795,36 @@ bloompg_sampling_safe_quals(List *quals)
 	return result;
 }
 
+static Size
+bloompg_sample_slot_flattened_size(TupleTableSlot *slot)
+{
+	TupleDesc descriptor = slot->tts_tupleDescriptor;
+	Size bytes = MAXALIGN(sizeof(MinimalTupleData));
+	int attribute;
+
+	slot_getallattrs(slot);
+	for (attribute = 0; attribute < descriptor->natts; attribute++)
+	{
+		Form_pg_attribute form = TupleDescAttr(descriptor, attribute);
+
+		if (form->attisdropped || slot->tts_isnull[attribute])
+			continue;
+		if (form->attbyval)
+			bytes = add_size(bytes, (Size) form->attlen);
+		else if (form->attlen == -1)
+			bytes = add_size(bytes,
+				toast_raw_datum_size(slot->tts_values[attribute]));
+		else if (form->attlen == -2)
+			bytes = add_size(bytes,
+				strlen(DatumGetCString(slot->tts_values[attribute])) + 1);
+		else if (form->attlen > 0)
+			bytes = add_size(bytes, (Size) form->attlen);
+		else
+			elog(ERROR, "invalid sample attribute width %d", form->attlen);
+	}
+	return bytes;
+}
+
 static BloomPGSampleWorkspace *
 bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 								   Oid relfilenode,
@@ -755,6 +845,8 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 	instr_time elapsed;
 	uint64 i;
 	bool use_tuple_cache;
+	Size cache_limit;
+	Size cache_used;
 
 	workspace_context = AllocSetContextCreate(parent_context,
 		"BloomPG query-local sample", ALLOCSET_DEFAULT_SIZES);
@@ -767,16 +859,22 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 	INSTR_TIME_SET_CURRENT(started);
 
 	relation = table_open(sample->relation_oid, AccessShareLock);
-	use_tuple_cache = sample->memory_owned;
-	if (use_tuple_cache && sample->tuples_ready &&
+	if (sample->memory_owned && sample->tuples_ready &&
 		!equalTupleDescs(sample->tuple_descriptor, RelationGetDescr(relation)))
 		bloompg_reset_tid_tuple_cache(sample);
+	cache_limit = bloompg_sample_memory_cache_limit();
+	cache_used = add_size(prepared_tid_cache_bytes,
+		prepared_tuple_cache_bytes);
+	use_tuple_cache = sample->memory_owned &&
+		(sample->tuples_ready || cache_used < cache_limit);
 	if (use_tuple_cache && !sample->tuples_ready)
 	{
 		MemoryContext cache_context;
 		MemoryContext prior_context;
 		TupleTableSlot *fetch_slot;
 		instr_time hydrate_started;
+		Size cache_remaining = cache_limit - cache_used;
+		bool cache_abandoned = false;
 
 		INSTR_TIME_SET_CURRENT(hydrate_started);
 		cache_context = AllocSetContextCreate(TopMemoryContext,
@@ -799,11 +897,20 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 			{
 				HeapTuple heap_tuple;
 				HeapTuple flattened_tuple;
+				Size tuple_bytes;
 
 				ExecClearTuple(fetch_slot);
 				if (!table_tuple_fetch_row_version(relation, &sample->tids[i],
 						GetActiveSnapshot(), fetch_slot))
 					continue;
+				tuple_bytes = bloompg_sample_slot_flattened_size(fetch_slot);
+				if (tuple_bytes > cache_remaining ||
+					MemoryContextMemAllocated(cache_context, false) >
+						cache_remaining - tuple_bytes)
+				{
+					cache_abandoned = true;
+					break;
+				}
 				heap_tuple = ExecCopySlotHeapTuple(fetch_slot);
 				if (HeapTupleHasExternal(heap_tuple))
 				{
@@ -818,11 +925,32 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 					minimal_tuple_from_heap_tuple(flattened_tuple, 0);
 				MemoryContextSwitchTo(prior_context);
 				heap_freetuple(flattened_tuple);
+				if (MemoryContextMemAllocated(cache_context, false) >
+					cache_remaining)
+				{
+					cache_abandoned = true;
+					break;
+				}
 			}
 			ExecClearTuple(fetch_slot);
 			ExecDropSingleTupleTableSlot(fetch_slot);
 			fetch_slot = NULL;
-			sample->tuples_ready = true;
+			if (!cache_abandoned)
+			{
+				Size tuple_memory_bytes =
+					MemoryContextMemAllocated(cache_context, false);
+				Size new_cache_bytes = add_size(prepared_tuple_cache_bytes,
+					tuple_memory_bytes);
+
+				sample->tuple_memory_bytes = tuple_memory_bytes;
+				prepared_tuple_cache_bytes = new_cache_bytes;
+				sample->tuples_ready = true;
+			}
+			else
+			{
+				bloompg_reset_tid_tuple_cache(sample);
+				use_tuple_cache = false;
+			}
 		}
 		PG_CATCH();
 		{
@@ -1132,7 +1260,6 @@ bloompg_sample_materialized_relation(BloomPGColumnStore *store,
 	exact_rows = bloompg_column_store_live_rows(store);
 	INSTR_TIME_SET_CURRENT(started);
 	if (profile != NULL)
-		profile->vectorized = !bloompg_column_store_spilled(store);
 
 	foreach(cell, filters)
 	{
@@ -1153,7 +1280,6 @@ bloompg_sample_materialized_relation(BloomPGColumnStore *store,
 		goto finished;
 	}
 
-	if (!bloompg_column_store_spilled(store))
 	{
 		uint32		chunk_count = bloompg_column_store_chunk_count(store);
 		uint32		nonempty_count = 0;
@@ -1230,42 +1356,6 @@ bloompg_sample_materialized_relation(BloomPGColumnStore *store,
 			CHECK_FOR_INTERRUPTS();
 		}
 		pfree(nonempty_chunks);
-	}
-	else
-	{
-		BloomPGColumnStoreScan scan;
-		TupleTableSlot *slot;
-		uint64		row_index;
-		uint64		target_rows = Min(exact_rows,
-			(uint64) bloompg_sample_size);
-
-		/* A spill has no random-access vector directory.  Keep planning work
-		 * bounded while still sampling from the current survivor set. */
-		bloompg_column_store_begin_scan(store, &scan, EXEC_FLAG_REWIND);
-		slot = MakeSingleTupleTableSlot(descriptor, &TTSOpsVirtual);
-		while (examined < target_rows &&
-			bloompg_column_store_next(store, &scan, true, slot, &row_index))
-		{
-			bool accepted = true;
-
-			foreach(cell, filters)
-			{
-				BloomPGSampleFilter *sample_filter = lfirst(cell);
-
-				if (!bloompg_filter_contains_slot(sample_filter->filter, slot,
-						sample_filter->materialized_attributes))
-				{
-					accepted = false;
-					break;
-				}
-			}
-			examined++;
-			if (accepted)
-				passed++;
-			ExecClearTuple(slot);
-		}
-		ExecDropSingleTupleTableSlot(slot);
-		bloompg_column_store_end_scan(&scan);
 	}
 
 	fraction = examined > 0 ? (double) passed / (double) examined : 0.0;
@@ -1717,6 +1807,8 @@ bloompg_sampling_init(void)
 {
 	prepared_samples = NIL;
 	prepared_tid_samples = NIL;
+	prepared_tid_cache_bytes = 0;
+	prepared_tuple_cache_bytes = 0;
 }
 
 void
@@ -1732,6 +1824,8 @@ bloompg_sampling_fini(void)
 	list_free(prepared_tid_samples);
 	prepared_samples = NIL;
 	prepared_tid_samples = NIL;
+	prepared_tid_cache_bytes = 0;
+	prepared_tuple_cache_bytes = 0;
 	system_sample_handler = InvalidOid;
 	bernoulli_sample_handler = InvalidOid;
 }

@@ -95,7 +95,8 @@ bloompg_p1_has_parallel_work(List *replacements)
 	{
 		BloomPGReplacement *replacement = lfirst(cell);
 
-		if (replacement->kind != BLOOMPG_REPLACEMENT_EMPTY &&
+		if (replacement->parallel_dsm_allowed &&
+			replacement->kind != BLOOMPG_REPLACEMENT_EMPTY &&
 			replacement->rows >= (double) bloompg_p1_parallel_min_rows)
 			return true;
 	}
@@ -327,7 +328,6 @@ bloompg_planner(Query *parse,
 			{
 				transfer = bloompg_apply_transfers(result, analysis_query, graph,
 											 query_string, cursor_options, bound_params,
-											 planner_owner,
 											 query_parallel_safe,
 											 native_parameterized_indexes);
 				ReleaseCurrentSubTransaction();

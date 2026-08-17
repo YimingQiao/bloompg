@@ -17,9 +17,33 @@
 typedef struct BloomPGStatisticsWork
 {
 	BloomPGJoinKeyStatistics *output;
+	List	   *equivalent_outputs;
 	FmgrInfo   *hash_functions;
 	uint8	   *registers;
 } BloomPGStatisticsWork;
+
+/* Several join edges can ask for the same physical equality key.  Its NDV is
+ * a property of the materialized column set, not of the peer relation, so one
+ * HLL is sufficient for every byte-identical key specification. */
+static bool
+bloompg_statistics_keys_equivalent(const BloomPGJoinKeyStatistics *left,
+	const BloomPGJoinKeyStatistics *right)
+{
+	int key;
+
+	if (left->nkeys != right->nkeys)
+		return false;
+	for (key = 0; key < left->nkeys; key++)
+	{
+		if (left->materialized_attributes[key] !=
+			right->materialized_attributes[key] ||
+			left->operators[key] != right->operators[key] ||
+			left->collations[key] != right->collations[key] ||
+			left->hash_procs[key] != right->hash_procs[key])
+			return false;
+	}
+	return true;
+}
 
 static double
 bloompg_statistics_elapsed_ms(instr_time started)
@@ -84,19 +108,6 @@ bloompg_hll_estimate(const uint8 *registers)
 	return estimate;
 }
 
-static inline Size
-bloompg_statistics_datum_width(int16 typlen, Datum value)
-{
-	if (typlen > 0)
-		return (Size) typlen;
-	if (typlen == -1)
-		return (Size) VARSIZE_ANY(DatumGetPointer(value));
-	if (typlen == -2)
-		return strlen(DatumGetCString(value)) + 1;
-	elog(ERROR, "invalid bloompg statistics datum width %d", typlen);
-	pg_unreachable();
-}
-
 static inline void
 bloompg_statistics_add_key(BloomPGStatisticsWork *work,
 	const BloomPGColumnStoreChunkView *view, uint32 row,
@@ -129,38 +140,6 @@ bloompg_statistics_add_key(BloomPGStatisticsWork *work,
 	bloompg_hll_add(work->registers, murmurhash64(combined));
 }
 
-static inline void
-bloompg_statistics_add_slot_key(BloomPGStatisticsWork *work,
-	TupleTableSlot *slot, uint64 *values_examined)
-{
-	BloomPGJoinKeyStatistics *output = work->output;
-	uint64 combined = 0;
-	int key;
-
-	for (key = 0; key < output->nkeys; key++)
-	{
-		bool is_null;
-		Datum value = slot_getattr(slot,
-			output->materialized_attributes[key], &is_null);
-		uint32 hash;
-
-		(*values_examined)++;
-		if (is_null)
-		{
-			output->null_rows++;
-			return;
-		}
-		hash = DatumGetUInt32(FunctionCall1Coll(&work->hash_functions[key],
-			output->collations[key], value));
-		if (key == 0)
-			combined = murmurhash64((uint64) hash);
-		else
-			combined = hash_combine64(combined, (uint64) hash);
-	}
-	output->nonnull_rows++;
-	bloompg_hll_add(work->registers, murmurhash64(combined));
-}
-
 static BloomPGStatisticsWork *
 bloompg_statistics_begin_work(BloomPGMaterializedStatistics *statistics,
 	int *work_count)
@@ -169,17 +148,36 @@ bloompg_statistics_begin_work(BloomPGMaterializedStatistics *statistics,
 	ListCell *cell;
 	int index = 0;
 	int maximum_work = 0;
+	int nonprecomputed = 0;
 
 	foreach(cell, statistics->join_keys)
 	{
 		BloomPGJoinKeyStatistics *output = lfirst(cell);
+		ListCell *prior_cell;
+		bool duplicate = false;
 
-		if (!output->precomputed)
+		if (output->precomputed)
+			continue;
+		nonprecomputed++;
+		foreach(prior_cell, statistics->join_keys)
+		{
+			BloomPGJoinKeyStatistics *prior = lfirst(prior_cell);
+
+			if (prior == output)
+				break;
+			if (!prior->precomputed &&
+				bloompg_statistics_keys_equivalent(prior, output))
+			{
+				duplicate = true;
+				break;
+			}
+		}
+		if (!duplicate)
 			maximum_work++;
 	}
 	*work_count = maximum_work;
 	statistics->precomputed_key_sets =
-		list_length(statistics->join_keys) - maximum_work;
+		list_length(statistics->join_keys) - nonprecomputed;
 	statistics->scanned_key_sets = maximum_work;
 	if (maximum_work == 0)
 		return NULL;
@@ -187,10 +185,25 @@ bloompg_statistics_begin_work(BloomPGMaterializedStatistics *statistics,
 	foreach(cell, statistics->join_keys)
 	{
 		BloomPGJoinKeyStatistics *output = lfirst(cell);
+		int equivalent = -1;
 		int key;
 
 		if (output->precomputed)
 			continue;
+		for (key = 0; key < index; key++)
+		{
+			if (bloompg_statistics_keys_equivalent(work[key].output, output))
+			{
+				equivalent = key;
+				break;
+			}
+		}
+		if (equivalent >= 0)
+		{
+			work[equivalent].equivalent_outputs = lappend(
+				work[equivalent].equivalent_outputs, output);
+			continue;
+		}
 		work[index].output = output;
 		work[index].hash_functions = palloc0_array(FmgrInfo, output->nkeys);
 		work[index].registers = palloc0_array(uint8, BLOOMPG_HLL_REGISTERS);
@@ -226,27 +239,6 @@ bloompg_statistics_estimate_vector_width(BloomPGColumnStore *store,
 	return (int32) Min(rint(width), (double) INT_MAX);
 }
 
-static int32
-bloompg_statistics_finish_width(TupleDesc descriptor, uint64 rows,
-	const uint64 *variable_width_bytes, const uint64 *variable_nonnull)
-{
-	double width = 0.0;
-	int attribute;
-
-	for (attribute = 0; attribute < descriptor->natts; attribute++)
-	{
-		Form_pg_attribute form = TupleDescAttr(descriptor, attribute);
-
-		if (form->attlen > 0)
-			width += form->attlen;
-		else if (variable_nonnull[attribute] > 0)
-			width += (double) variable_width_bytes[attribute] /
-				(double) variable_nonnull[attribute];
-	}
-	(void) rows;
-	return (int32) Min(rint(width), (double) INT_MAX);
-}
-
 static void
 bloompg_statistics_scan_vectors(BloomPGMaterializedStatistics *statistics,
 	BloomPGColumnStore *store, BloomPGStatisticsWork *work, int work_count)
@@ -275,44 +267,6 @@ bloompg_statistics_scan_vectors(BloomPGMaterializedStatistics *statistics,
 	}
 }
 
-static void
-bloompg_statistics_scan_spill(BloomPGMaterializedStatistics *statistics,
-	BloomPGColumnStore *store, TupleDesc descriptor,
-	BloomPGStatisticsWork *work, int work_count,
-	uint64 *variable_width_bytes, uint64 *variable_nonnull)
-{
-	BloomPGColumnStoreScan scan;
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(descriptor, &TTSOpsVirtual);
-
-	bloompg_column_store_begin_scan(store, &scan, 0);
-	while (bloompg_column_store_next(store, &scan, true, slot, NULL))
-	{
-		int index;
-		int attribute;
-
-		for (index = 0; index < work_count; index++)
-			bloompg_statistics_add_slot_key(&work[index], slot,
-				&statistics->values_examined);
-		slot_getallattrs(slot);
-		for (attribute = 0; attribute < descriptor->natts; attribute++)
-		{
-			Form_pg_attribute form = TupleDescAttr(descriptor, attribute);
-
-			if (form->attlen > 0 || slot->tts_isnull[attribute])
-				continue;
-			variable_width_bytes[attribute] += bloompg_statistics_datum_width(
-				form->attlen, slot->tts_values[attribute]);
-			variable_nonnull[attribute]++;
-		}
-		statistics->rows_examined++;
-		ExecClearTuple(slot);
-		if ((statistics->rows_examined & UINT64CONST(0xffff)) == 0)
-			CHECK_FOR_INTERRUPTS();
-	}
-	bloompg_column_store_end_scan(&scan);
-	ExecDropSingleTupleTableSlot(slot);
-}
-
 void
 bloompg_statistics_finalize(BloomPGMaterializedStatistics *statistics,
 	BloomPGColumnStore *store, TupleDesc descriptor)
@@ -320,8 +274,6 @@ bloompg_statistics_finalize(BloomPGMaterializedStatistics *statistics,
 	MemoryContext temporary;
 	MemoryContext old_context;
 	BloomPGStatisticsWork *work;
-	uint64 *variable_width_bytes = NULL;
-	uint64 *variable_nonnull = NULL;
 	instr_time started;
 	int work_count;
 	int index;
@@ -331,36 +283,31 @@ bloompg_statistics_finalize(BloomPGMaterializedStatistics *statistics,
 	Assert(descriptor != NULL);
 	INSTR_TIME_SET_CURRENT(started);
 	statistics->rows = bloompg_column_store_live_rows(store);
-	statistics->vectorized = !bloompg_column_store_spilled(store);
 	temporary = AllocSetContextCreate(CurrentMemoryContext,
 		"BloomPG statistics finalize", ALLOCSET_DEFAULT_SIZES);
 	old_context = MemoryContextSwitchTo(temporary);
 	work = bloompg_statistics_begin_work(statistics, &work_count);
-	if (statistics->vectorized)
-	{
-		statistics->average_width =
-			bloompg_statistics_estimate_vector_width(store, descriptor);
-		statistics->width_estimated = true;
-		if (work_count > 0)
-			bloompg_statistics_scan_vectors(statistics, store, work,
-				work_count);
-	}
-	else
-	{
-		variable_width_bytes = palloc0_array(uint64, descriptor->natts);
-		variable_nonnull = palloc0_array(uint64, descriptor->natts);
-		bloompg_statistics_scan_spill(statistics, store, descriptor, work,
-			work_count, variable_width_bytes, variable_nonnull);
-		statistics->average_width = bloompg_statistics_finish_width(descriptor,
-			statistics->rows, variable_width_bytes, variable_nonnull);
-	}
+	statistics->average_width =
+		bloompg_statistics_estimate_vector_width(store, descriptor);
+	statistics->width_estimated = true;
+	if (work_count > 0)
+		bloompg_statistics_scan_vectors(statistics, store, work, work_count);
 	for (index = 0; index < work_count; index++)
 	{
 		BloomPGJoinKeyStatistics *output = work[index].output;
+		ListCell *equivalent_cell;
 
 		output->ndistinct = output->nonnull_rows == 0 ? 0.0 :
 			Min(bloompg_hll_estimate(work[index].registers),
 				(double) output->nonnull_rows);
+		foreach(equivalent_cell, work[index].equivalent_outputs)
+		{
+			BloomPGJoinKeyStatistics *equivalent = lfirst(equivalent_cell);
+
+			equivalent->nonnull_rows = output->nonnull_rows;
+			equivalent->null_rows = output->null_rows;
+			equivalent->ndistinct = output->ndistinct;
+		}
 	}
 	MemoryContextSwitchTo(old_context);
 	MemoryContextDelete(temporary);

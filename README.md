@@ -1,7 +1,7 @@
 # BloomPG
 
 [![PostgreSQL 18](https://img.shields.io/badge/PostgreSQL-18-336791.svg)](https://www.postgresql.org/)
-[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-blue.svg)](CHANGELOG.md)
+[![Version 0.1.2](https://img.shields.io/badge/version-0.1.2-blue.svg)](CHANGELOG.md)
 [![CI](https://github.com/YimingQiao/bloompg/actions/workflows/ci.yml/badge.svg)](https://github.com/YimingQiao/bloompg/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -10,8 +10,8 @@ Bloom or exact bitmap filters across equality joins, materializes reduced
 inputs, and lets PostgreSQL plan and execute the smaller join problem.
 
 It is most useful when a selective table can eliminate a large fraction of one
-or more joined tables. Existing SQL does not need to change. Unsupported query
-shapes and unsafe optimizer-time paths retain PostgreSQL's native plan.
+or more joined tables. Existing SQL does not need to change, and unsupported
+queries continue to use PostgreSQL's native planner.
 
 ## Results
 
@@ -23,11 +23,6 @@ included, and complete result bags checked against native PostgreSQL:
 | JOB, 113 queries | `ndv` | 264.413 s | 62.654 s | **4.220x** | 113/113 |
 | JOB, 113 queries | `rows` | 264.413 s | 63.256 s | **4.180x** | 113/113 |
 | TPC-H SF10, 22 queries | `ndv` | 146.893 s | 140.728 s | **1.044x** | 22/22 |
-
-The Q21 optimizer-time fallback that previously took 18.015 s now retains the
-native plan and completes in 3.157 s, close to native PostgreSQL's 3.138 s.
-Short queries can still regress because sampling, transfer, and replanning are
-fixed overheads; benchmark your own workload before enabling BloomPG broadly.
 
 ## Install
 
@@ -51,10 +46,10 @@ CREATE EXTENSION bloompg;
 SELECT bloompg_version();
 ```
 
-To upgrade from 0.1.0 after installing the new files:
+To upgrade from 0.1.0 or 0.1.1 after installing the new files:
 
 ```sql
-ALTER EXTENSION bloompg UPDATE TO '0.1.1';
+ALTER EXTENSION bloompg UPDATE TO '0.1.2';
 ```
 
 ## Use
@@ -102,9 +97,11 @@ SELECT bloompg_last_trace();
 - Modifying statements, row locking, row-level security, volatile expressions,
   and unsupported scopes bypass BloomPG.
 
-BloomPG performs real scans during planning and can use substantial memory per
-analytical backend. It is intended for controlled analytical workloads, not as
-an unreviewed default for a multi-tenant OLTP cluster.
+BloomPG performs real scans during planning. Its query-wide materialization
+budget defaults to at most 512MB and falls back to the native plan when full;
+size it for expected analytical concurrency. BloomPG is intended for
+controlled analytical workloads, not as an unreviewed default for a
+multi-tenant OLTP cluster.
 
 ## Verify a build
 

@@ -59,11 +59,8 @@ bloompg_compact_materialization(BloomPGRelationState *state,
 	List *pending_transfers, TupleDesc *descriptor)
 {
 	BloomPGRuntimeMaterializationEntry *entry;
-	BloomPGColumnStoreScan scan;
-	TupleTableSlot *slot;
 	ListCell *cell;
 	uint64 rows = 0;
-	uint64 row_index;
 	bool exact_empty = false;
 	instr_time started;
 	instr_time elapsed;
@@ -88,7 +85,7 @@ bloompg_compact_materialization(BloomPGRelationState *state,
 	}
 	if (exact_empty)
 		bloompg_column_store_deactivate_all(entry->store);
-	else if (!bloompg_column_store_spilled(entry->store))
+	else
 	{
 		uint32 chunk_index;
 		uint32 chunk_count = bloompg_column_store_chunk_count(entry->store);
@@ -97,73 +94,32 @@ bloompg_compact_materialization(BloomPGRelationState *state,
 		for (chunk_index = 0; chunk_index < chunk_count; chunk_index++)
 		{
 			BloomPGColumnStoreChunkView view;
-			uint32 selected;
-			uint32 survivor_count = 0;
+			uint32 survivor_count;
 
 			if (!bloompg_column_store_chunk_view(entry->store, chunk_index,
 				&view))
 				elog(ERROR, "bloompg lost in-memory column chunk");
-			for (selected = 0; selected < view.selected_count; selected++)
-			{
-				uint32 row = view.selection[selected];
-				bool accepted = true;
-
-				foreach(cell, state->filters)
-				{
-					BloomPGSampleFilter *filter = lfirst(cell);
-
-					if (!bloompg_contains_materialized_filter(filter->filter,
-						&view, row, filter->materialized_attributes))
-					{
-						accepted = false;
-						break;
-					}
-				}
-				if (accepted)
-				{
-					survivors[survivor_count++] = (uint16) row;
-					bloompg_process_pending_columns(pending_transfers, &view,
-						row);
-					rows++;
-				}
-			}
-			bloompg_column_store_set_chunk_selection(entry->store, chunk_index,
-				survivors, survivor_count);
-		}
-		state->column_compactions++;
-	}
-	else
-	{
-		bloompg_column_store_begin_scan(entry->store, &scan, EXEC_FLAG_REWIND);
-		slot = MakeSingleTupleTableSlot(entry->descriptor, &TTSOpsVirtual);
-		while (bloompg_column_store_next(entry->store, &scan, true, slot,
-			&row_index))
-		{
-			bool accepted = true;
-
+			survivor_count = view.selected_count;
+			if (survivor_count > 0)
+				memcpy(survivors, view.selection,
+					mul_size(survivor_count, sizeof(uint16)));
 			foreach(cell, state->filters)
 			{
 				BloomPGSampleFilter *filter = lfirst(cell);
 
-				if (!bloompg_filter_contains_slot(filter->filter, slot,
-					filter->materialized_attributes))
-				{
-					accepted = false;
+				survivor_count = bloompg_filter_select_vector(filter->filter,
+					&view, filter->materialized_attributes, survivors,
+					survivor_count, survivors);
+				if (survivor_count == 0)
 					break;
-				}
 			}
-			if (!accepted)
-				bloompg_column_store_deactivate(entry->store, row_index);
-			else
-			{
-				bloompg_process_pending_slot(pending_transfers, slot);
-				rows++;
-			}
-			ExecClearTuple(slot);
+			bloompg_process_pending_chunk(pending_transfers, &view, survivors,
+				survivor_count);
+			rows += survivor_count;
+			bloompg_column_store_set_chunk_selection(entry->store, chunk_index,
+				survivors, survivor_count);
 		}
-		ExecDropSingleTupleTableSlot(slot);
-		bloompg_column_store_end_scan(&scan);
-		state->slot_compactions++;
+		state->column_compactions++;
 	}
 	if (exact_empty)
 		rows = 0;
@@ -267,6 +223,7 @@ bloompg_finalize_pending_filters(List *pending_transfers,
 	bool needs_insert = false;
 	uint64 rows_examined = 0;
 
+	(void) descriptor;
 	*one_pass_bitmap_builds = 0;
 
 	foreach(cell, pending_transfers)
@@ -284,7 +241,6 @@ bloompg_finalize_pending_filters(List *pending_transfers,
 	if (!needs_insert)
 		return 0;
 
-	if (!bloompg_column_store_spilled(store))
 	{
 		uint32 chunk_index;
 		uint32 chunk_count = bloompg_column_store_chunk_count(store);
@@ -314,51 +270,13 @@ bloompg_finalize_pending_filters(List *pending_transfers,
 			}
 		}
 	}
-	else
-	{
-		BloomPGColumnStoreScan scan;
-		TupleTableSlot *slot = MakeSingleTupleTableSlot(descriptor,
-			&TTSOpsVirtual);
-
-		bloompg_column_store_begin_scan(store, &scan, EXEC_FLAG_REWIND);
-		while (bloompg_column_store_next(store, &scan, true, slot, NULL))
-		{
-			rows_examined++;
-			foreach(cell, pending_transfers)
-			{
-				BloomPGPendingTransfer *pending = lfirst(cell);
-
-				if (pending->build_filter && pending->integral_key &&
-					pending->has_range)
-				{
-					if (pending->filter->kind == BLOOMPG_FILTER_BITMAP &&
-						pending->filter->nkeys == 1)
-					{
-						bool is_null;
-						Datum value = slot_getattr(slot,
-							pending->spec.build_attributes[0], &is_null);
-
-						bloompg_filter_insert_bitmap_value(pending->filter,
-							value, is_null);
-					}
-					else
-						bloompg_filter_insert_slot(pending->filter, slot,
-							pending->spec.build_attributes);
-				}
-			}
-			ExecClearTuple(slot);
-		}
-		ExecDropSingleTupleTableSlot(slot);
-		bloompg_column_store_end_scan(&scan);
-	}
 	return rows_examined;
 }
 
 uint64
 bloompg_create_tid_materialization(BloomPGRuntimeMaterializationEntry *source,
 									 AttrNumber ctid_attribute,
-									 uint64 expected_rows,
-									 ResourceOwner runtime_owner)
+									 uint64 expected_rows)
 {
 	MemoryContext old_context;
 	BloomPGColumnStore *store;
@@ -376,14 +294,15 @@ bloompg_create_tid_materialization(BloomPGRuntimeMaterializationEntry *source,
 	descriptor = CreateTemplateTupleDesc(1);
 	TupleDescInitEntry(descriptor, 1, "ctid", TIDOID, -1, 0);
 	MemoryContextSwitchTo(old_context);
-	store = bloompg_begin_runtime_store(runtime_owner);
+	store = bloompg_begin_runtime_store(
+		bloompg_column_store_memory_budget(source->store));
 	bloompg_column_store_set_descriptor(store, descriptor);
 	token = bloompg_runtime_next_token();
-	/* Register before copying: the outer error cleanup must own a store that
-	 * has already spilled even if tuple extraction subsequently fails. */
+	/* Register before copying so the outer error cleanup owns the store even if
+	 * tuple extraction subsequently fails. */
 	bloompg_runtime_register_materialization(token, GetActiveSnapshot(),
 		store, descriptor, 0);
-	bloompg_column_store_begin_scan(source->store, &scan, EXEC_FLAG_REWIND);
+	bloompg_column_store_begin_scan(source->store, &scan);
 	slot = MakeSingleTupleTableSlot(source->descriptor, &TTSOpsVirtual);
 	output_slot = MakeSingleTupleTableSlot(descriptor, &TTSOpsVirtual);
 	while (bloompg_column_store_next(source->store, &scan, true, slot, NULL))
@@ -407,7 +326,6 @@ bloompg_create_tid_materialization(BloomPGRuntimeMaterializationEntry *source,
 	}
 	ExecDropSingleTupleTableSlot(slot);
 	ExecDropSingleTupleTableSlot(output_slot);
-	bloompg_column_store_end_scan(&scan);
 	if (rows != expected_rows)
 		elog(ERROR, "bloompg late materialization row count changed");
 	bloompg_runtime_register_materialization(token, GetActiveSnapshot(),

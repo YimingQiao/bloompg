@@ -474,7 +474,7 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 	fallback = bloompg_fallback_path(root, rel, rte);
 	if (fallback == NULL)
 		return;
-	if (rel->consider_parallel &&
+	if (rel->consider_parallel && replacement->parallel_dsm_allowed &&
 		replacement->kind != BLOOMPG_REPLACEMENT_EMPTY)
 	{
 		foreach(cell, rel->partial_pathlist)

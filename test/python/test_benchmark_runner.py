@@ -55,6 +55,12 @@ class QueryDiscoveryTests(unittest.TestCase):
 
 
 class OutputParsingTests(unittest.TestCase):
+    def test_query_without_semicolon_is_terminated(self):
+        self.assertEqual(RUNNER.terminate_sql("SELECT 1\n"), "SELECT 1\n;\n")
+
+    def test_query_with_semicolon_is_not_changed(self):
+        self.assertEqual(RUNNER.terminate_sql("SELECT 1;\n"), "SELECT 1;\n")
+
     def test_timing_splits_result_batches(self):
         timings, results = RUNNER.parse_psql_output(
             "b\na\nTime: 10.500 ms\nc\nTime: 8.250 ms\n"

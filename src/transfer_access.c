@@ -491,6 +491,7 @@ bloompg_plan_transfer_access(BloomPGRelationState *state,
 	state->access_plan_bitmap_heap_scans += shape.bitmap_heap_scans;
 	state->access_plan_bitmap_index_scans += shape.bitmap_index_scans;
 	state->access_plan_gathers += shape.gathers;
+	state->access_plan_parallel_safe = statement->planTree->parallel_safe;
 	if (shape.bitmap_heap_scans > 0 || shape.bitmap_index_scans > 0)
 		state->access_plan_kind = "core-bitmap";
 	else if (shape.index_only_scans > 0)

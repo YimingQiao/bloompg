@@ -43,7 +43,7 @@ bloompg_required_attribute_walker(Node *node, void *context)
 		if ((Index) variable->varno == required->rti &&
 			variable->varlevelsup == required->sublevels_up)
 		{
-			if (!AttributeNumberIsValid(variable->varattno))
+			if (!AttrNumberIsForUserDefinedAttr(variable->varattno))
 			{
 				required->unsafe_reference = true;
 				return true;
@@ -69,10 +69,12 @@ bloompg_required_attribute_walker(Node *node, void *context)
 }
 
 static Bitmapset *
-bloompg_query_required_attributes(Query *query, Index rti)
+bloompg_query_required_attributes(Query *query, Index rti,
+	bool *unsafe_reference)
 {
 	BloomPGRequiredAttributeContext required;
 
+	*unsafe_reference = false;
 	if (query == NULL)
 		return NULL;
 	MemSet(&required, 0, sizeof(required));
@@ -83,27 +85,28 @@ bloompg_query_required_attributes(Query *query, Index rti)
 	/* A whole-row or system-column reference needs the scan's original tuple
 	 * shape.  Positive attributes, including correlated references from any
 	 * nested SubLink level, are safe to project independently. */
-	if (required.unsafe_reference)
+	*unsafe_reference = required.unsafe_reference;
+	if (*unsafe_reference)
 		return NULL;
 	return required.attributes;
 }
 
-static Bitmapset *
-bloompg_find_pulled_required_attributes(Query *query,
-	const RangeTblEntry *wanted)
+static void
+bloompg_collect_pulled_required_attributes(Query *query,
+	const RangeTblEntry *wanted, Bitmapset **attributes, bool *matched,
+	bool *unsafe_reference)
 {
 	ListCell *cell;
 	Index rti = 0;
 	const char *wanted_alias = wanted->eref != NULL ?
 		wanted->eref->aliasname : NULL;
 
-	if (query == NULL)
-		return NULL;
+	if (query == NULL || *unsafe_reference)
+		return;
 	foreach(cell, query->rtable)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, cell);
 		const char *alias;
-		Bitmapset *nested;
 
 		rti++;
 		alias = rte->eref != NULL ? rte->eref->aliasname : NULL;
@@ -111,14 +114,46 @@ bloompg_find_pulled_required_attributes(Query *query,
 			rte->relid == wanted->relid &&
 			(wanted_alias == NULL || alias == NULL ||
 			 strcmp(wanted_alias, alias) == 0))
-			return bloompg_query_required_attributes(query, rti);
+		{
+			Bitmapset *found;
+			bool found_unsafe;
+
+			*matched = true;
+			found = bloompg_query_required_attributes(query, rti,
+				&found_unsafe);
+			if (found_unsafe)
+			{
+				*unsafe_reference = true;
+				bms_free(found);
+				return;
+			}
+			*attributes = bms_join(*attributes, found);
+		}
 		if (rte->rtekind != RTE_SUBQUERY)
 			continue;
-		nested = bloompg_find_pulled_required_attributes(rte->subquery, wanted);
-		if (nested != NULL)
-			return nested;
+		bloompg_collect_pulled_required_attributes(rte->subquery, wanted,
+			attributes, matched, unsafe_reference);
+		if (*unsafe_reference)
+			return;
 	}
-	return NULL;
+}
+
+static Bitmapset *
+bloompg_find_pulled_required_attributes(Query *query,
+	const RangeTblEntry *wanted)
+{
+	Bitmapset *attributes = NULL;
+	bool matched = false;
+	bool unsafe_reference = false;
+
+	bloompg_collect_pulled_required_attributes(query, wanted, &attributes,
+		&matched, &unsafe_reference);
+	if (!matched || unsafe_reference)
+	{
+		bms_free(attributes);
+		return NULL;
+	}
+	return attributes;
 }
 
 static bool
@@ -667,6 +702,7 @@ bloompg_graph_build(Query *query, MemoryContext context)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, cell);
 		BloomPGTable *table;
+		bool unsafe_reference;
 
 		rti++;
 		if (rte->rtekind != RTE_RELATION && rte->rtekind != RTE_SUBQUERY &&
@@ -680,7 +716,8 @@ bloompg_graph_build(Query *query, MemoryContext context)
 		table->subquery = rte->rtekind == RTE_SUBQUERY ? rte->subquery : NULL;
 		if (rte->rtekind == RTE_RELATION)
 			table->required_attributes =
-				bloompg_query_required_attributes(query, rti);
+				bloompg_query_required_attributes(query, rti,
+					&unsafe_reference);
 		graph->tables = lappend(graph->tables, table);
 	}
 	bloompg_visit_jointree((Node *) query->jointree, graph);

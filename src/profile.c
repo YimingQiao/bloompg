@@ -303,14 +303,14 @@ bloompg_profile_collect_vector_runtime(BloomPGActiveProfile *active,
 		if (stores++ > 0)
 			appendStringInfoChar(&json, ',');
 		appendStringInfo(&json,
-			"{\"token\":" UINT64_FORMAT ",\"format\":\"%s\","
+			"{\"token\":" UINT64_FORMAT ",\"format\":\"vector\","
 			"\"rows\":" UINT64_FORMAT ",\"live_rows\":" UINT64_FORMAT
 			",\"chunks\":%u,\"memory_bytes\":%zu,\"varlen_values\":"
 			UINT64_FORMAT ",\"varlen_bytes\":%zu,\"selection_rewrites\":"
 			UINT64_FORMAT ",\"selection_rows_examined\":" UINT64_FORMAT
 			",\"selection_rows_rejected\":" UINT64_FORMAT
 			",\"slot_reconstructions\":" UINT64_FORMAT "}",
-			token, bloompg_column_store_spilled(store) ? "spill" : "vector",
+			token,
 			bloompg_column_store_rows(store),
 			bloompg_column_store_live_rows(store),
 			bloompg_column_store_vector_chunks(store),
