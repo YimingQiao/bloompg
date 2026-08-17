@@ -98,10 +98,10 @@ SELECT bloompg_last_trace();
   and unsupported scopes bypass BloomPG.
 
 BloomPG performs real scans during planning. Its query-wide materialization
-budget defaults to at most 512MB and falls back to the native plan when full;
-size it for expected analytical concurrency. BloomPG is intended for
-controlled analytical workloads, not as an unreviewed default for a
-multi-tenant OLTP cluster.
+budget defaults to one eighth of detected host/cgroup memory, capped at 2GB,
+and falls back to the native plan when full. Size it for expected analytical
+concurrency. BloomPG is intended for controlled analytical workloads, not as
+an unreviewed default for a multi-tenant OLTP cluster.
 
 ## Verify a build
 

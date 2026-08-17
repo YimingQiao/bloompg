@@ -106,16 +106,16 @@ bloompg_read_memory_limit(const char *path, uint64 *result)
 	return true;
 }
 
-/* Materialization is optional optimizer work, so the built-in default is
- * intentionally conservative.  Dedicated analytical deployments can raise
- * it with bloompg_tune.py; container limits must still win over host RAM. */
+/* Materialization is optional optimizer work.  Give a single analytical query
+ * useful headroom on a dedicated host, while keeping small machines and
+ * containers proportional to their detected memory. */
 static int
 bloompg_default_materialization_memory_kb(void)
 {
-	uint64 usable_bytes = UINT64CONST(512) * 1024 * 1024;
+	uint64 usable_bytes = 0;
 	uint64 cgroup_bytes;
 	uint64 default_bytes;
-	bool physical_known = false;
+	bool memory_known = false;
 
 #ifdef _SC_PHYS_PAGES
 	long		pages = sysconf(_SC_PHYS_PAGES);
@@ -125,7 +125,7 @@ bloompg_default_materialization_memory_kb(void)
 		(uint64) pages <= UINT64_MAX / (uint64) page_size)
 	{
 		usable_bytes = (uint64) pages * (uint64) page_size;
-		physical_known = true;
+		memory_known = true;
 	}
 #endif
 	if (bloompg_read_memory_limit("/sys/fs/cgroup/memory.max",
@@ -135,12 +135,16 @@ bloompg_default_materialization_memory_kb(void)
 	{
 		/* cgroup v1 can use a near-UINT64 sentinel for "unlimited". */
 		if (cgroup_bytes < (UINT64CONST(1) << 60) &&
-			(!physical_known || cgroup_bytes < usable_bytes))
+			(!memory_known || cgroup_bytes < usable_bytes))
+		{
 			usable_bytes = cgroup_bytes;
+			memory_known = true;
+		}
 	}
-	default_bytes = Min(UINT64CONST(512) * 1024 * 1024,
-		usable_bytes / 8);
-	/* Never let a convenience floor override a small container limit. */
+	default_bytes = memory_known ?
+		Min(UINT64CONST(2) * 1024 * 1024 * 1024, usable_bytes / 8) :
+		UINT64CONST(512) * 1024 * 1024;
+	/* The GUC itself has a 64kB minimum. */
 	default_bytes = Max(default_bytes, UINT64CONST(64) * 1024);
 	return (int) Min(default_bytes / 1024, (uint64) INT_MAX);
 }

@@ -19,6 +19,8 @@ All notable changes to BloomPG are documented here.
 - Enforce one query-wide materialization budget across column stores, parallel
   packet buffers, and P1 DSM copies; if it cannot be reserved, retain the
   native PostgreSQL plan instead of spilling.
+- Default that budget to one eighth of detected host/cgroup memory, capped at
+  2GB for the intended single-query analytical workload.
 - Bound backend-level prepared CTID and hydrated tuple caches and validate
   every serialized vector, selection, filter, and by-reference datum before
   worker access.

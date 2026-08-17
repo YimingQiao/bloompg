@@ -41,7 +41,7 @@ sides, and unsupported equality classes use this normal path in either mode.
 | `bloompg.bits_per_key` | `24` | Bloom-filter bit budget per estimated key. |
 | `bloompg.max_filter_bytes` | `64MB` | Per-filter memory ceiling. |
 | `bloompg.transfer_progress_metric` | `ndv` | Equality-transfer convergence signal: `rows` or `ndv`. |
-| `bloompg.materialization_memory` | up to `512MB` | Total memory budget for one query's optimizer-time materializations and parallel DSM copies. The default is capped at one eighth of the detected host/cgroup memory. |
+| `bloompg.materialization_memory` | up to `2GB` | Total memory budget for one query's optimizer-time materializations and parallel DSM copies. The default is one eighth of detected host/cgroup memory, capped at 2GB. |
 | `bloompg.transfer_workers` | `4` | Maximum workers for one eligible transfer scan; `0` is serial. |
 | `bloompg.transfer_parallel_min_rows` | `100000` | Minimum estimated input rows for parallel transfer scanning. |
 | `bloompg.replan_after_transfer` | `on` | Run the second PostgreSQL planning pass. |
