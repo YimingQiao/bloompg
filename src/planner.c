@@ -7,6 +7,7 @@
 #include "bloompg/profile.h"
 #include "bloompg/replan.h"
 #include "bloompg/runtime.h"
+#include "bloompg/scan.h"
 #include "bloompg/transfer.h"
 
 #include "lib/stringinfo.h"
@@ -101,6 +102,69 @@ bloompg_p1_has_parallel_work(List *replacements)
 			return true;
 	}
 	return false;
+}
+
+typedef bool (*BloomPGPlanPredicate)(Plan *plan);
+
+static bool
+bloompg_plan_children_match(Plan *plan, BloomPGPlanPredicate predicate)
+{
+	List *children = NIL;
+	ListCell *cell;
+
+	if (plan == NULL)
+		return false;
+	if (outerPlan(plan) != NULL && predicate(outerPlan(plan)))
+		return true;
+	if (innerPlan(plan) != NULL && predicate(innerPlan(plan)))
+		return true;
+	if (IsA(plan, Append))
+		children = castNode(Append, plan)->appendplans;
+	else if (IsA(plan, MergeAppend))
+		children = castNode(MergeAppend, plan)->mergeplans;
+	else if (IsA(plan, BitmapAnd))
+		children = castNode(BitmapAnd, plan)->bitmapplans;
+	else if (IsA(plan, BitmapOr))
+		children = castNode(BitmapOr, plan)->bitmapplans;
+	else if (IsA(plan, CustomScan))
+		children = castNode(CustomScan, plan)->custom_plans;
+	else if (IsA(plan, SubqueryScan) &&
+		predicate(castNode(SubqueryScan, plan)->subplan))
+		return true;
+	foreach(cell, children)
+	{
+		if (predicate((Plan *) lfirst(cell)))
+			return true;
+	}
+	return false;
+}
+
+static bool
+bloompg_plan_contains_parallel_replacement(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+	if (plan->parallel_aware &&
+		(bloompg_memory_scan_info(plan, NULL, NULL) ||
+		 bloompg_tid_scan_info(plan, NULL, NULL)))
+		return true;
+	return bloompg_plan_children_match(plan,
+		bloompg_plan_contains_parallel_replacement);
+}
+
+static bool
+bloompg_plan_has_parallel_rescan_hazard(Plan *plan)
+{
+	if (plan == NULL)
+		return false;
+	/* The shared Memory/TID chunk cursor has no rescan epoch barrier.  A
+	 * replacement below a nested-loop inner branch therefore requires a P1
+	 * plan without executor workers. */
+	if (IsA(plan, NestLoop) &&
+		bloompg_plan_contains_parallel_replacement(innerPlan(plan)))
+		return true;
+	return bloompg_plan_children_match(plan,
+		bloompg_plan_has_parallel_rescan_hazard);
 }
 
 static bool bloompg_query_scope_is_safe(Query *query);
@@ -299,6 +363,7 @@ bloompg_planner(Query *parse,
 			volatile bool transfer_failed = false;
 			volatile bool p1_nestloop_suppressed = false;
 			volatile bool p1_parallel_biased = false;
+			volatile bool p1_parallel_rescan_guard = false;
 			volatile int transfer_error_code = 0;
 			volatile double transfer_ms = 0.0;
 			volatile double p1_ms = 0.0;
@@ -374,6 +439,8 @@ bloompg_planner(Query *parse,
 					min_parallel_table_scan_size;
 				int saved_min_parallel_index_scan_size =
 					min_parallel_index_scan_size;
+				int saved_max_parallel_workers_per_gather =
+					max_parallel_workers_per_gather;
 
 				bloompg_replan_begin(transfer.replacements, graph);
 				INSTR_TIME_SET_CURRENT(p1_started);
@@ -399,10 +466,19 @@ bloompg_planner(Query *parse,
 				}
 				PG_TRY(_replan);
 				{
-					replacement_plan = bloompg_call_next_planner(copyObject(analysis_query),
-													 query_string,
-													 cursor_options,
-													 bound_params);
+					replacement_plan = bloompg_call_next_planner(
+						copyObject(analysis_query), query_string,
+						cursor_options, bound_params);
+					if (replacement_plan != NULL &&
+						bloompg_plan_has_parallel_rescan_hazard(
+							replacement_plan->planTree))
+					{
+						max_parallel_workers_per_gather = 0;
+						p1_parallel_rescan_guard = true;
+						replacement_plan = bloompg_call_next_planner(
+							copyObject(analysis_query), query_string,
+							cursor_options, bound_params);
+					}
 				}
 				PG_FINALLY(_replan);
 				{
@@ -413,6 +489,8 @@ bloompg_planner(Query *parse,
 						saved_min_parallel_table_scan_size;
 					min_parallel_index_scan_size =
 						saved_min_parallel_index_scan_size;
+					max_parallel_workers_per_gather =
+						saved_max_parallel_workers_per_gather;
 					bloompg_replan_end();
 				}
 				PG_END_TRY(_replan);
@@ -449,7 +527,8 @@ bloompg_planner(Query *parse,
 					p0_ms, native_preview_ms, graph_ms, (double) transfer_ms,
 					(double) p1_ms,
 					p1_nestloop_suppressed ? "off" : "unchanged",
-					p1_parallel_biased ? "biased" : "unchanged",
+					p1_parallel_rescan_guard ? "serial-rescan-guard" :
+						(p1_parallel_biased ? "biased" : "unchanged"),
 					p1_cardinality_adjustments, p1_cardinality_max_ratio);
 			appendStringInfo(&detail, " p1_paths=%s",
 				p1_path_transform_json);

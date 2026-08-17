@@ -15,6 +15,13 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class QueryDiscoveryTests(unittest.TestCase):
+    def test_reused_base_requires_identical_sql_hash(self):
+        base = {"status": "ok"}
+        record = {"query_sha256": "same", "base": base}
+        self.assertIs(RUNNER.reusable_base(record, "same"), base)
+        self.assertIsNone(RUNNER.reusable_base(record, "different"))
+        self.assertIsNone(RUNNER.reusable_base(None, "same"))
+
     def test_flat_query_id_is_unchanged(self):
         root = Path("/queries")
         self.assertEqual(RUNNER.query_id(root, root / "q01.sql"), "q01")

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Run SQL query files against PostgreSQL with BloomPG on and off.
 
-Each mode gets one unreported warmup followed by N timed executions in the
-same backend.  The warmup is part of the benchmark protocol: prepared samples
-may require a one-time build, while reported runs measure their steady-state
-use.  Results are compared as row multisets and one resumable JSON object is
-written per query.
+Each mode gets a configurable number of unreported warmups followed by N timed
+executions in the same backend.  Results are compared as row multisets and one
+resumable JSON object is written per query.
 """
 
 from __future__ import annotations
@@ -54,7 +52,16 @@ def parse_args() -> argparse.Namespace:
         "--timed-runs",
         type=int,
         default=1,
-        help="Measured executions after one warmup (default: 1)",
+        help="Measured executions after warmup (default: 1)",
+    )
+    parser.add_argument(
+        "--warmups",
+        type=int,
+        default=1,
+        help=(
+            "Unreported executions before measurement (default: 1); use 0 "
+            "for an externally prewarmed complete-pass protocol"
+        ),
     )
     parser.add_argument(
         "--capture-profile",
@@ -72,6 +79,15 @@ def parse_args() -> argparse.Namespace:
         help="Server and client timeout per execution in milliseconds; 0 disables it",
     )
     parser.add_argument("--parallel-workers", type=int, default=0)
+    parser.add_argument(
+        "--base-nestloop",
+        choices=("default", "on", "off"),
+        default="default",
+        help=(
+            "Override enable_nestloop only for native PostgreSQL; useful for "
+            "recording a conservative baseline when its default plan stalls"
+        ),
+    )
     parser.add_argument(
         "--transfer-workers",
         type=int,
@@ -165,9 +181,8 @@ def parse_args() -> argparse.Namespace:
         "--reuse-base-from",
         type=Path,
         help=(
-            "Reuse each query's base result from an existing JSONL file and "
-            "run only the Bloom side. Queries missing from that file still run "
-            "both modes."
+            "Reuse a base result only when query ID and SQL SHA-256 match an "
+            "existing JSONL record; otherwise run both modes."
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -205,6 +220,8 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         options.append(f"-c work_mem={args.work_mem}")
     if args.hash_mem_multiplier is not None:
         options.append(f"-c hash_mem_multiplier={args.hash_mem_multiplier}")
+    if not enabled and args.base_nestloop != "default":
+        options.append(f"-c enable_nestloop={args.base_nestloop}")
     return " ".join(options)
 
 
@@ -291,7 +308,7 @@ def terminate_sql(query_sql: str) -> str:
 
 
 def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
-    repetitions = args.timed_runs + 1
+    repetitions = args.warmups + args.timed_runs
     profile_suffix = ""
     if enabled and args.capture_profile:
         profile_suffix = (
@@ -372,11 +389,13 @@ def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
         record["result_batches_found"] = len(results)
         return record
 
-    timed = timings[1:]
+    warmups = timings[: args.warmups]
+    timed = timings[args.warmups :]
     hashes = [result_hash(result) for result in results]
     record.update(
         {
-            "warmup_ms": timings[0],
+            "warmup_ms": warmups[0] if len(warmups) == 1 else None,
+            "warmups_ms": warmups,
             "runs_ms": timed,
             "median_ms": statistics.median(timed),
             "result_hash": hashes[0],
@@ -401,6 +420,7 @@ SELECT json_build_object(
     'effective_cache_size', current_setting('effective_cache_size'),
     'work_mem', current_setting('work_mem'),
     'hash_mem_multiplier', current_setting('hash_mem_multiplier'),
+    'base_enable_nestloop', current_setting('enable_nestloop'),
     'max_parallel_workers_per_gather',
         current_setting('max_parallel_workers_per_gather'),
     'max_parallel_workers', current_setting('max_parallel_workers'),
@@ -520,13 +540,19 @@ def load_records(path: Path) -> dict[str, dict]:
         try:
             record = json.loads(line)
             query = record["query"]
-            base = record["base"]
+            record["base"]
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             raise SystemExit(
                 f"invalid reused base record at {path}:{line_number}: {error}"
             ) from error
-        records[query] = base
+        records[query] = record
     return records
+
+
+def reusable_base(record: dict | None, query_sha256: str) -> dict | None:
+    if record is None or record.get("query_sha256") != query_sha256:
+        return None
+    return record.get("base")
 
 
 def query_id(root: Path, path: Path) -> str:
@@ -599,6 +625,8 @@ def main() -> int:
     args = parse_args()
     if args.timed_runs < 1:
         raise SystemExit("--timed-runs must be positive")
+    if args.warmups < 0:
+        raise SystemExit("--warmups must be non-negative")
     if args.statement_timeout_ms < 0:
         raise SystemExit("--statement-timeout-ms must be non-negative")
     if args.parallel_workers < 0:
@@ -685,8 +713,10 @@ def main() -> int:
                 print(f"skip {query_name} (already recorded)", flush=True)
                 continue
             query_sql = query_path.read_text(encoding="utf-8")
+            query_sha256 = hashlib.sha256(query_sql.encode("utf-8")).hexdigest()
             modes: dict[str, dict] = {}
-            reused_base = reused_bases.get(query_name)
+            reuse_record = reused_bases.get(query_name)
+            reused_base = reusable_base(reuse_record, query_sha256)
             if reused_base is not None:
                 modes["base"] = reused_base
                 order = [True]
@@ -695,6 +725,11 @@ def main() -> int:
                     flush=True,
                 )
             else:
+                if reuse_record is not None:
+                    print(
+                        f"ignore stale base for {query_name}: SQL SHA-256 differs",
+                        flush=True,
+                    )
                 order = [False, True] if index % 2 == 0 else [True, False]
             for enabled in order:
                 label = "bloom" if enabled else "base"
@@ -704,7 +739,7 @@ def main() -> int:
             bloom = modes["bloom"]
             record = {
                 "query": query_name,
-                "query_sha256": hashlib.sha256(query_sql.encode("utf-8")).hexdigest(),
+                "query_sha256": query_sha256,
                 "profile_label": args.profile_label,
                 "settings": settings,
                 "base": base,

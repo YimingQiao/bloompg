@@ -15,14 +15,24 @@ queries continue to use PostgreSQL's native planner.
 
 ## Results
 
-PostgreSQL 18.4, indexed datasets, one warmup plus one measured run, planning
-included, and complete result bags checked against native PostgreSQL:
+PostgreSQL 18.4 on two Intel Xeon Platinum 8474C CPUs, using the SQL corpora
+from DataFusion-Bloom. BloomPG uses the default `ndv` progress metric. Times
+include planning, transfer, materialization, execution, and complete output
+consumption.
 
-| Workload | Mode | Native PG | BloomPG | Total speedup | Correct |
+| Workload | PostgreSQL storage | Completed | Native PG | BloomPG | Total speedup |
 |---|---|---:|---:|---:|---:|
-| JOB, 113 queries | `ndv` | 264.413 s | 62.654 s | **4.220x** | 113/113 |
-| JOB, 113 queries | `rows` | 264.413 s | 63.256 s | **4.180x** | 113/113 |
-| TPC-H SF10, 22 queries | `ndv` | 146.893 s | 140.728 s | **1.044x** | 22/22 |
+| CEB IMDB | 9.43 GB, indexed | 3,131/3,133 | 9,569.737 s* | 4,254.457 s | **2.249x** |
+| JOB | 9.43 GB, indexed | 113/113 | 229.143 s | 90.896 s | **2.521x** |
+| STATS-CEB | 113 MB, indexed | 141/146 | 196.899 s* | 240.583 s | **0.818x** |
+| TPC-H SF10 | 22.02 GB, indexed | 22/22 | 107.036 s | 116.567 s | **0.918x** |
+
+All completed Native/BloomPG pairs produced identical complete-output
+fingerprints. Each execution has a 60-second limit, so totals include only
+queries completed by both systems. `*` marks SHA-verified native PostgreSQL
+results reused from earlier complete passes; very slow reused baselines can
+have a different worker ceiling. Fresh JOB and TPC-H comparisons use the same
+128-worker ceiling on both sides. BloomPG uses a 2 GB materialization budget.
 
 ## Install
 
