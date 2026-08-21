@@ -24,7 +24,7 @@ consumption.
 |---|---|---:|---:|---:|---:|
 | CEB IMDB | 9.43 GB, indexed | 3,131/3,133 | 9,569.737 s* | 4,254.457 s | **2.249x** |
 | JOB | 9.43 GB, indexed | 113/113 | 229.143 s | 90.896 s | **2.521x** |
-| STATS-CEB | 113 MB, indexed | 141/146 | 196.899 s* | 240.583 s | **0.818x** |
+| STATS-CEB | 113 MB, indexed | 142/146 | 249.124 s* | 101.626 s | **2.451x** |
 | TPC-H SF10 | 22.02 GB, indexed | 22/22 | 107.036 s | 116.567 s | **0.918x** |
 
 All completed Native/BloomPG pairs produced identical complete-output

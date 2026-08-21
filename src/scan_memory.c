@@ -10,7 +10,6 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
-#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -280,11 +279,8 @@ bloompg_rescan_memory(CustomScanState *custom_state)
 	BloomPGMemoryState *state = (BloomPGMemoryState *) custom_state;
 
 	if (state->parallel_store != NULL && state->parallel_store->available)
-	{
-		if (!IsParallelWorker())
-			pg_atomic_write_u64(&state->parallel_store->next_item, 0);
+		/* Shared state is reset by ReInitializeDSMCustomScan before workers start. */
 		state->parallel_cursor.chunk_valid = false;
-	}
 	else if (state->entry != NULL)
 		bloompg_column_store_rescan(&state->store_scan);
 	else if (state->fallback_state != NULL)
