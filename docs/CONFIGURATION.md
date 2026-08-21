@@ -55,31 +55,34 @@ query-wide budget for dedicated analytical deployments and concurrency.
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `bloompg.index_transfer` | `on` | Let exact incoming join keys drive a compatible B-tree path. |
+| `bloompg.index_transfer` | `off` | Experimentally let exact incoming join keys drive a compatible B-tree path. |
 | `bloompg.index_transfer_max_fraction` | `0.15` | Maximum sampled survivor fraction for choosing that path. |
 | `bloompg.index_transfer_batch_keys` | `65536` | Exact keys in one direct B-tree probe batch. |
 | `bloompg.index_transfer_max_keys` | `100000` | Maximum exact distinct-key population eligible for index transfer. |
 | `bloompg.index_transfer_planner_max_keys` | `8192` | Maximum keys expanded into one private PostgreSQL access plan. |
 | `bloompg.index_guard_min_rows` | `100000` | Large indexed relations wait for an exact incoming join-key set. |
 
-The index guard delays only relations whose base cardinality reaches the
+Index-assisted materialization is opt-in. The index guard delays only
+relations whose base cardinality reaches the
 threshold and whose join key has a compatible B-tree index. If every active
-candidate is waiting, BloomPG selects the smallest current candidate. It may
-scan that candidate when its current row estimate is no larger than
-`index_transfer_max_keys`, because its distinct key count cannot be larger, or
-when the scan has an eligible parallel transfer path. A larger serial
-candidate with no ready exact-key index path ends transfer and retains the
-native PostgreSQL preview plan. The structured profile reports
-`native_fallback_reason = "index-guard-stalemate"` for this case.
+candidate is waiting, BloomPG materializes the smallest current candidate
+with the best available PostgreSQL access path, falling back to a sequential
+scan when no exact-key index path is ready. Index readiness controls how a
+relation is read; it never removes an excited relation from the equality-domain
+fixed point. Memory or execution-safety failures still retain the native
+PostgreSQL preview plan.
 
 ## P1 and materialization
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `bloompg.p1_parallel_bias` | `on` | Let exact post-transfer cardinalities favor parallel P1 paths. |
-| `bloompg.p1_parallel_min_rows` | `10000` | Minimum exact rows before applying the parallel cost bias. |
 | `bloompg.late_materialize` | `on` | Allow survivor-CTID materialization for wide relations. |
 | `bloompg.late_materialize_min_width` | `128B` | Projected-width threshold for TID mode. |
+
+P1 exposes serial and parallel paths for exact in-memory materializations up
+to the configured worker ceiling. PostgreSQL's normal cost model chooses
+between them. A narrow safety comparison retains the native plan only when P1
+selects a more expensive parameterized-index Nested Loop shape.
 
 ## Diagnostics
 

@@ -256,73 +256,102 @@ bloompg_execute_source(BloomPGRelationState *state,
 		parallel_workers_launched, packed_descriptor, inline_filter_ms);
 }
 
-/* An exact index remains the fast path only while its physical input is small
- * relative to one worker's heap share.  Cardinality and a bounded page probe
- * make that decision without comparing PostgreSQL cost units. */
-static bool
-bloompg_parallel_beats_index(BloomPGRelationState *state, int workers,
-	bool access_planned)
+typedef enum BloomPGAccessDecisionKind
 {
-	double fraction;
-	double estimated_rows;
-	uint64 ignored_keys;
+	BLOOMPG_ACCESS_CORE_INDEX,
+	BLOOMPG_ACCESS_DIRECT_INDEX,
+	BLOOMPG_ACCESS_PARALLEL_SCAN,
+	BLOOMPG_ACCESS_CORE_SCAN,
+	BLOOMPG_ACCESS_SERIAL_SCAN,
+	BLOOMPG_ACCESS_NATIVE_LOCAL
+} BloomPGAccessDecisionKind;
 
-	if (workers < 4)
-		return false;
-	foreach_ptr(BloomPGSampleFilter, filter, state->filters)
+typedef struct BloomPGAccessDecision
+{
+	BloomPGAccessDecisionKind kind;
+	const char *name;
+	const char *reason;
+	PlannedStmt *core_plan;
+	int		workers;
+	Size	parallel_memory;
+} BloomPGAccessDecision;
+
+/* Keep fixed-point scheduling independent from physical access.  A bounded
+ * exact domain is the only index fast path: core chooses among index, bitmap,
+ * and index-only paths when the domain is small enough to plan, while the
+ * direct probe covers the remaining bounded domains.  Everything else is a
+ * scan, parallel when the configured worker and memory budgets allow it. */
+static BloomPGAccessDecision
+bloompg_choose_access(BloomPGRelationState *state, const char *query_string,
+	ParamListInfo bound_params, bool query_parallel_safe)
+{
+	BloomPGAccessDecision decision = {
+		BLOOMPG_ACCESS_NATIVE_LOCAL, "native-local", "no-transfer-filter",
+		NULL, 0, 0
+	};
+	bool core_planned;
+	bool core_indexed;
+	bool direct_indexed = false;
+	bool scan_required;
+
+	core_planned = state->filters != NIL &&
+		bloompg_plan_transfer_access(state, query_string, bound_params,
+			&decision.core_plan);
+	core_indexed = core_planned &&
+		(state->access_plan_index_scans > 0 ||
+		 state->access_plan_index_only_scans > 0 ||
+		 state->access_plan_bitmap_heap_scans > 0);
+	if (!core_planned && state->filters != NIL)
+		direct_indexed = bloompg_index_prefilter_available(state);
+	if (core_indexed)
 	{
-		if (filter->filter != NULL && filter->filter->valid &&
-			filter->filter->inserted == 0)
-			return false;
+		decision.kind = BLOOMPG_ACCESS_CORE_INDEX;
+		decision.name = "core-index";
+		decision.reason = "bounded-exact-domain";
+		return decision;
 	}
-	/* Compare expected index work with one worker's heap share.  A plain index
-	 * loses locality sooner than a bitmap, while selective residual quals can
-	 * hide physical input behind a tiny output estimate; the latter cases get
-	 * a bounded exact-key page-footprint probe.  The final exception is a
-	 * near-limit search array on a very large heap, where thousands of scalar
-	 * B-tree probes form a serial cliff. */
-	if (access_planned)
+	if (direct_indexed)
 	{
-		double bitmap_page_fraction;
-		bool local_quals_may_hide_work =
-			state->local_rows <= state->base_rows *
-				bloompg_index_transfer_max_fraction &&
-			(state->access_plan_bitmap_heap_scans > 0 ||
-			 state->access_plan_exact_keys <=
-				state->access_plan_exact_filters);
-		double worker_share_divisor = local_quals_may_hide_work ? 16.0 :
-			(state->access_plan_bitmap_heap_scans > 0 ? 4.0 : 8.0);
-		bool plan_is_broad = state->access_plan_rows * (double) workers >=
-			state->base_rows / worker_share_divisor;
+		decision.kind = BLOOMPG_ACCESS_DIRECT_INDEX;
+		decision.name = "direct-index";
+		decision.reason = "bounded-exact-domain";
+		return decision;
+	}
 
-		/* A genuinely selective covering index avoids both heap I/O and tuple
-		 * fetches.  Do not replace that fast path with a full parallel heap scan
-		 * merely because a machine exposes many workers. */
-		if (state->access_plan_index_only_scans > 0 &&
-			state->access_plan_rows <= state->base_rows *
-				bloompg_index_transfer_max_fraction)
-			return false;
-		if (plan_is_broad)
-			return true;
-		if (local_quals_may_hide_work)
+	scan_required = state->filters != NIL || core_planned;
+	decision.workers = bloompg_transfer_worker_count(state,
+		query_parallel_safe || state->access_plan_parallel_safe);
+	if (decision.workers > 0)
+	{
+		decision.parallel_memory = bloompg_parallel_pack_memory(
+			decision.workers);
+		if (bloompg_memory_budget_reserve(state->memory_budget,
+				decision.parallel_memory))
 		{
-			if (bloompg_index_prefilter_page_fraction(state,
-					&bitmap_page_fraction))
-				return bitmap_page_fraction >
-					bloompg_index_transfer_max_fraction;
+			decision.kind = BLOOMPG_ACCESS_PARALLEL_SCAN;
+			decision.name = "parallel-scan";
+			decision.reason = scan_required ? "broad-domain" :
+				"parallel-local-scan";
+			return decision;
 		}
-		return state->base_rows >=
-			100.0 * (double) bloompg_transfer_parallel_min_rows &&
-			state->access_plan_exact_filters <= 2 &&
-			state->access_plan_exact_keys >=
-				(uint64) Max(bloompg_index_transfer_planner_max_keys / 2, 1);
 	}
-	if (!bloompg_index_prefilter_estimate(state, &fraction, &ignored_keys,
-			NULL))
-		return true;
-	estimated_rows = state->base_rows * Min(Max(fraction, 0.0), 1.0);
-	return estimated_rows * (double) workers >=
-		4.0 * (double) bloompg_transfer_parallel_min_rows;
+	decision.workers = 0;
+	decision.parallel_memory = 0;
+	if (core_planned)
+	{
+		decision.kind = BLOOMPG_ACCESS_CORE_SCAN;
+		decision.name = "core-scan";
+		decision.reason = "parallel-memory-unavailable";
+	}
+	else if (state->table->rte_kind == RTE_RELATION &&
+		state->filters != NIL &&
+		bloompg_scan_has_base_slot_semantics(state->fallback_plan))
+	{
+		decision.kind = BLOOMPG_ACCESS_SERIAL_SCAN;
+		decision.name = "serial-scan";
+		decision.reason = "parallel-unavailable";
+	}
+	return decision;
 }
 
 /*
@@ -584,61 +613,49 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	double scan_ms;
 	double filter_ms;
 	double inline_filter_ms = 0.0;
-	int parallel_workers = 0;
 	int parallel_workers_launched = 0;
-	PlannedStmt *access_statement = state->preplanned_access;
-	bool access_planned = access_statement != NULL;
+	BloomPGAccessDecision decision;
 	bool used_parallel_source = false;
-	bool use_parallel_source = false;
-	Size parallel_memory = 0;
 
 	state->materialization_used_filters |= state->filters != NIL;
 	INSTR_TIME_SET_CURRENT(started);
-	state->preplanned_access = NULL;
-	if (!access_planned)
-		access_planned = state->filters != NIL &&
-			bloompg_plan_transfer_access(state, query_string, bound_params,
-				&access_statement);
-	parallel_workers = bloompg_transfer_worker_count(state,
-		query_parallel_safe || state->access_plan_parallel_safe);
-	if (parallel_workers > 0 &&
-		bloompg_parallel_beats_index(state, parallel_workers, access_planned))
-	{
-		parallel_memory = bloompg_parallel_pack_memory(parallel_workers);
-		use_parallel_source = bloompg_memory_budget_reserve(
-			state->memory_budget, parallel_memory);
-	}
-	if (use_parallel_source)
+	decision = bloompg_choose_access(state, query_string, bound_params,
+		query_parallel_safe);
+	state->access_decision_kind = decision.name;
+	state->access_decision_reason = decision.reason;
+	state->access_decision_workers = decision.workers;
+	if (bloompg_log_transfer_steps)
+		elog(LOG, "bloompg access decision RTI %u kind=%s reason=%s workers=%d",
+			state->rti, decision.name, decision.reason, decision.workers);
+	if (decision.kind == BLOOMPG_ACCESS_PARALLEL_SCAN)
 	{
 		used_parallel_source = true;
 		state->materialization_access_path = "parallel-p0";
 		PG_TRY();
 		{
 			rows = bloompg_execute_source(state, candidate, source_plan, pending,
-				store, descriptor, query_string, bound_params, parallel_workers,
+				store, descriptor, query_string, bound_params, decision.workers,
 				next_plan_node_id, &parallel_workers_launched, &inline_filter_ms);
 		}
 		PG_FINALLY();
 		{
 			bloompg_memory_budget_release_reservation(state->memory_budget,
-				parallel_memory);
+				decision.parallel_memory);
 		}
 		PG_END_TRY();
 	}
-	else if (access_planned)
+	else if (decision.kind == BLOOMPG_ACCESS_CORE_INDEX ||
+		decision.kind == BLOOMPG_ACCESS_CORE_SCAN)
 	{
-		access_statement->rowMarks = NIL;
-		access_statement->resultRelations = NIL;
-		access_statement->jitFlags = 0;
-		rows = bloompg_run_source_statement(access_statement, pending, store,
+		decision.core_plan->rowMarks = NIL;
+		decision.core_plan->resultRelations = NIL;
+		decision.core_plan->jitFlags = 0;
+		rows = bloompg_run_source_statement(decision.core_plan, pending, store,
 			descriptor, query_string, bound_params, 0,
 			&parallel_workers_launched, NULL, &inline_filter_ms);
 	}
-	else if (state->table->rte_kind == RTE_RELATION &&
-		state->filters != NIL &&
-		(IsA(state->fallback_plan, SeqScan) ||
-		 (bloompg_scan_has_base_slot_semantics(state->fallback_plan) &&
-		  bloompg_index_prefilter_available(state))))
+	else if (decision.kind == BLOOMPG_ACCESS_DIRECT_INDEX ||
+		decision.kind == BLOOMPG_ACCESS_SERIAL_SCAN)
 		rows = bloompg_execute_prefiltered_base_scan(state, candidate, pending,
 			store, descriptor, query_string, bound_params);
 	else
@@ -671,7 +688,7 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	if (used_parallel_source)
 	{
 		state->parallel_scans++;
-		state->parallel_workers_requested += parallel_workers;
+		state->parallel_workers_requested += decision.workers;
 		state->parallel_workers_launched += parallel_workers_launched;
 		state->parallel_rows += rows;
 		state->parallel_scan_ms += scan_ms;

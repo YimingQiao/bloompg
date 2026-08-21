@@ -38,7 +38,6 @@ typedef struct BloomPGPlannedProfile
 	int			max_parallel_workers_per_gather;
 	int			materialization_memory_kb;
 	bool		replanned;
-	bool		p1_parallel_biased;
 	bool		transfer_failed;
 	int		transfer_error_code;
 	uint64	   *materialization_tokens;
@@ -191,15 +190,13 @@ bloompg_profile_build_json(BloomPGPlannedProfile *planned,
 		"\"statistics_ms\":%.3f,\"p1_ms\":%.3f,"
 		"\"p1_cardinality_adjustments\":" UINT64_FORMAT ","
 		"\"p1_cardinality_max_ratio\":%.6f,"
-		"\"replanned\":%s,\"p1_parallel_biased\":%s,"
-		"\"transfer_failed\":%s",
+		"\"replanned\":%s,\"transfer_failed\":%s",
 		planned->planning_ms, planned->p0_ms, planned->native_preview_ms,
 		planned->graph_ms,
 		planned->transfer_ms, planned->statistics_ms, planned->p1_ms,
 		planned->p1_cardinality_adjustments,
 		planned->p1_cardinality_max_ratio,
 		planned->replanned ? "true" : "false",
-		planned->p1_parallel_biased ? "true" : "false",
 		planned->transfer_failed ? "true" : "false");
 	if (planned->transfer_failed)
 		appendStringInfo(&json, ",\"transfer_sqlstate\":\"%s\"",
@@ -548,7 +545,6 @@ bloompg_profile_remember_plan(PlannedStmt *statement,
 	profile->materialization_memory_kb =
 		bloompg_materialization_memory_kb;
 	profile->replanned = input->replanned;
-	profile->p1_parallel_biased = input->p1_parallel_biased;
 	profile->transfer_failed = input->transfer_failed;
 	profile->transfer_error_code = input->transfer_error_code;
 	profile->materialization_count = list_length(input->materialization_tokens);

@@ -30,6 +30,7 @@ typedef struct BloomPGReplacement
 	 * Bloom filter.  This lets P1 retain keyed lookup without weakening the
 	 * relation-replacement contract. */
 	bool		native_parameterized_paths_equivalent;
+	Bitmapset  *materialization_filter_sources;
 	/* Parallel P1 scans serialize the materialization into DSM.  Expose that
 	 * path only when the copy was reserved from the query-wide budget. */
 	bool		parallel_dsm_allowed;
@@ -39,11 +40,6 @@ typedef struct BloomPGReplacement
 typedef struct BloomPGTransferOutcome
 {
 	bool		applied;
-	/* The transfer scheduler reached a state where every remaining large
-	 * source was waiting for an index-driving exact key set.  The caller must
-	 * discard optimizer-time artifacts and execute the native preview plan. */
-	bool		native_fallback;
-	const char *native_fallback_reason;
 	bool		analysis_plan_modified;
 	int			steps;
 	int			filters;

@@ -78,7 +78,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Server and client timeout per execution in milliseconds; 0 disables it",
     )
-    parser.add_argument("--parallel-workers", type=int, default=0)
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=0,
+        help="Global and per-Gather PostgreSQL parallel-worker ceiling",
+    )
     parser.add_argument(
         "--base-nestloop",
         choices=("default", "on", "off"),
@@ -101,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--index-transfer",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--index-transfer-max-fraction", type=float, default=0.15)
     parser.add_argument("--index-transfer-batch-keys", type=int, default=65_536)
@@ -123,17 +128,6 @@ def parse_args() -> argparse.Namespace:
             "Use legacy row-cardinality/lineage propagation or exact "
             "equality-domain NDV convergence (default: ndv)"
         ),
-    )
-    parser.add_argument(
-        "--p1-parallel-bias",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable exact-cardinality parallel bias during the second PG plan",
-    )
-    parser.add_argument(
-        "--p1-parallel-min-rows",
-        type=int,
-        default=10_000,
     )
     parser.add_argument(
         "--work-mem",
@@ -202,6 +196,7 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         f"-c bloompg.sample_size={args.sample_size}",
         f"-c bloompg.sample_seed={args.sample_seed}",
         f"-c bloompg.sample_rate={args.sample_rate}",
+        f"-c max_parallel_workers={args.parallel_workers}",
         f"-c max_parallel_workers_per_gather={args.parallel_workers}",
         f"-c bloompg.transfer_workers={transfer_workers}",
         f"-c bloompg.transfer_parallel_min_rows={args.transfer_parallel_min_rows}",
@@ -211,8 +206,6 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         f"-c bloompg.index_transfer_max_keys={args.index_transfer_max_keys}",
         f"-c bloompg.index_guard_min_rows={args.index_guard_min_rows}",
         f"-c bloompg.transfer_progress_metric={args.transfer_progress_metric}",
-        f"-c bloompg.p1_parallel_bias={'on' if args.p1_parallel_bias else 'off'}",
-        f"-c bloompg.p1_parallel_min_rows={args.p1_parallel_min_rows}",
         f"-c bloompg.profile={'on' if args.capture_profile else 'off'}",
         "-c bloompg.profile_log=off",
     ]
@@ -448,9 +441,6 @@ SELECT json_build_object(
         current_setting('bloompg.index_guard_min_rows')
     ,'bloompg_transfer_progress_metric',
         current_setting('bloompg.transfer_progress_metric')
-    ,'bloompg_p1_parallel_bias', current_setting('bloompg.p1_parallel_bias')
-    ,'bloompg_p1_parallel_min_rows',
-        current_setting('bloompg.p1_parallel_min_rows')
     ,'database', current_database()
     ,'database_bytes', pg_database_size(current_database())
     ,'user_index_count', (
@@ -643,8 +633,6 @@ def main() -> int:
         raise SystemExit("--index-transfer-max-keys must be positive")
     if args.index_guard_min_rows < 0:
         raise SystemExit("--index-guard-min-rows must be non-negative")
-    if args.p1_parallel_min_rows < 0:
-        raise SystemExit("--p1-parallel-min-rows must be non-negative")
     if args.queries_per_group is not None and args.queries_per_group < 1:
         raise SystemExit("--queries-per-group must be positive")
     if not 0.0 <= args.sample_rate <= 1.0:
@@ -671,6 +659,7 @@ def main() -> int:
         else args.transfer_workers
     )
     effective_checks = {
+        "max_parallel_workers": args.parallel_workers,
         "max_parallel_workers_per_gather": args.parallel_workers,
         "bloompg_sample_mode": args.sample_mode,
         "bloompg_sample_size": args.sample_size,
@@ -684,8 +673,6 @@ def main() -> int:
         "bloompg_index_transfer_max_keys": args.index_transfer_max_keys,
         "bloompg_index_guard_min_rows": args.index_guard_min_rows,
         "bloompg_transfer_progress_metric": args.transfer_progress_metric,
-        "bloompg_p1_parallel_bias": "on" if args.p1_parallel_bias else "off",
-        "bloompg_p1_parallel_min_rows": args.p1_parallel_min_rows,
     }
     mismatches = {
         name: (expected, settings.get(name))
@@ -694,12 +681,6 @@ def main() -> int:
     }
     if mismatches:
         raise SystemExit(f"effective benchmark settings do not match request: {mismatches}")
-    required_global_workers = min(args.parallel_workers, expected_transfer_workers)
-    if int(settings["max_parallel_workers"]) < required_global_workers:
-        raise SystemExit(
-            "max_parallel_workers is below the requested transfer worker group: "
-            f"{settings['max_parallel_workers']} < {required_global_workers}"
-        )
     if int(settings["max_worker_processes"]) < int(settings["max_parallel_workers"]):
         raise SystemExit(
             "max_worker_processes must be at least max_parallel_workers: "

@@ -191,8 +191,6 @@ def recommend(
         "bloompg.materialization_memory": pg_size(materialization_memory),
         "bloompg.transfer_workers": str(transfer_workers),
         "bloompg.transfer_parallel_min_rows": "100000",
-        "bloompg.p1_parallel_bias": "on",
-        "bloompg.p1_parallel_min_rows": "10000",
         "bloompg.sample_rate": "0.01",
         "bloompg.profile": "off",
         "bloompg.profile_log": "off",

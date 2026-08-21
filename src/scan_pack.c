@@ -121,15 +121,18 @@ bloompg_pack_physical_type(Form_pg_attribute attribute)
 }
 
 /* A worker retains input vectors, their by-reference heaps, and one serialized
- * payload at the same time. Divide the query budget by six copies per worker;
- * the normal 4MB target remains the upper bound for cache locality. */
+ * payload at the same time.  Six copies per worker is the conservative live
+ * transport bound.  Give transport at most half of the query budget so an
+ * otherwise valid parallel scan cannot reserve all memory and crowd out the
+ * column stores it is producing.  The normal 4MB target remains the upper
+ * bound for cache locality. */
 static Size
 bloompg_pack_target_bytes(int parallel_workers)
 {
 	Size query_bytes = mul_size((Size) bloompg_materialization_memory_kb,
 		(Size) 1024);
 	Size workers = (Size) Max(parallel_workers, 1);
-	Size target = query_bytes / workers / 6;
+	Size target = query_bytes / workers / 12;
 
 	return Min(BLOOMPG_PACK_MAX_TARGET_BYTES,
 		Max(target, BLOOMPG_PACK_MIN_TARGET_BYTES));

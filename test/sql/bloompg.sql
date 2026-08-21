@@ -429,12 +429,12 @@ INSERT INTO p1_outer_index
 SELECT CASE WHEN g % 10 = 0 THEN g / 10 ELSE 999999 END, g % 10 = 0
 FROM generate_series(1, 50000) AS g;
 INSERT INTO p1_outer_param
-SELECT g, g <= 10 FROM generate_series(1, 1000) AS g;
+SELECT g, g = 1 FROM generate_series(1, 1000) AS g;
 INSERT INTO p1_probe
 SELECT 1 + (g % 25000), 1 + (g % 25000), repeat('i', 128)
 FROM generate_series(1, 50000) AS g;
 INSERT INTO p1_param_probe
-SELECT 1 + (g % 100000), 1 + (g % 100000), repeat('p', 96)
+SELECT 1 + (g % 200), 1 + (g % 200), repeat('p', 96)
 FROM generate_series(1, 200000) AS g;
 CREATE INDEX p1_probe_k_idx ON p1_probe(k);
 CREATE INDEX p1_param_probe_k_idx ON p1_param_probe(k);
@@ -459,6 +459,7 @@ CALL assert_plan_contains('p1_index_only_plan',
     'SELECT count(*) FROM p1_outer_index o JOIN p1_probe i ON o.k = i.k WHERE o.keep AND i.k <= 6500',
     'Wrapped Access Path: Index Only Scan');
 
+SET bloompg.excitation_threshold = 0.002;
 CALL assert_same('p1_parameterized_index_rescan',
     'SELECT o.k, sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep GROUP BY o.k');
 CALL assert_plan_contains('p1_parameterized_index_filter',
@@ -472,6 +473,7 @@ SELECT COALESCE(
     AND (bloompg_last_profile()->'planning'->'path_transform'->>'input_paths')::integer =
         (bloompg_last_profile()->'planning'->'path_transform'->>'wrapped_paths')::integer,
     false) AS parameterized_pathset_preserved_ok;
+SET bloompg.excitation_threshold = 0.15;
 
 -- A local-qual-only Memory replacement remains semantically equivalent to
 -- its native parameterized paths.  P1 must be allowed to choose keyed lookup
@@ -527,6 +529,7 @@ RESET bloompg.index_transfer;
 CREATE INDEX filter_src_k_idx ON filter_src(k);
 ANALYZE filter_src;
 SET bloompg.excitation_threshold = 1.0;
+SET bloompg.index_transfer = on;
 SET bloompg.index_transfer_max_fraction = 1.0;
 SET bloompg.index_guard_min_rows = 0;
 SET bloompg.transfer_progress_metric = 'rows';
@@ -567,11 +570,10 @@ SELECT EXISTS (
     ) AND bloompg_last_profile()->'transfer'->'summary'
         ->>'progress_metric' = 'rows' AS index_wait_guard_profile_ok;
 
--- A guarded relation may be scanned to break a wait only when its estimated
--- rows also bound the exact key driver.  Otherwise the optimizer must keep
--- PostgreSQL's native plan instead of silently scanning a large input.  The
--- incoming seed filter deliberately targets an unindexed column; only a later
--- edge targets the guarded relation's leading index column.
+-- Index readiness controls the physical access path, not fixed-point
+-- participation.  If every source is waiting, the smallest guarded relation
+-- must be materialized even when its current filter targets an unindexed
+-- column, so it can publish the later indexed-key domain.
 CREATE TABLE guard_seed(k integer, keep boolean);
 CREATE TABLE guard_middle(seed_key integer, indexed_key integer);
 CREATE TABLE guard_tail(indexed_key integer);
@@ -584,34 +586,33 @@ CREATE INDEX guard_middle_indexed_key_idx
     ON guard_middle(indexed_key);
 ANALYZE guard_seed, guard_middle, guard_tail;
 SET bloompg.index_transfer_max_keys = 50;
-CALL assert_same('index_guard_native_fallback',
+CALL assert_same('index_guard_wait_break',
     'SELECT count(*) FROM guard_seed s JOIN guard_middle m ON s.k = m.seed_key JOIN guard_tail t ON m.indexed_key = t.indexed_key WHERE s.keep');
 SET bloompg.enable = on;
-SELECT count(*) = 100 AS index_guard_native_fallback_query_ok
+SELECT count(*) = 100 AS index_guard_wait_break_query_ok
 FROM guard_seed s
 JOIN guard_middle m ON s.k = m.seed_key
 JOIN guard_tail t ON m.indexed_key = t.indexed_key
 WHERE s.keep;
 SELECT COALESCE(
-    (bloompg_last_profile()->'transfer'->'summary'
+    NOT (bloompg_last_profile()->'transfer'->'summary'
         ->>'native_fallback')::boolean
-    AND bloompg_last_profile()->'transfer'->'summary'
-        ->>'native_fallback_reason' = 'index-guard-stalemate'
     AND (bloompg_last_profile()->'transfer'->'summary'
-        ->>'applied')::boolean = false
+        ->>'applied')::boolean
     AND EXISTS (
         SELECT 1
         FROM jsonb_array_elements(
             bloompg_last_profile()->'transfer'->'relations') AS relation
         WHERE relation->>'alias' = 'm'
+          AND relation->>'replacement' = 'memory'
           AND (relation->'materialization'->'selection'
-              ->>'native_fallback')::boolean
-          AND (relation->'materialization'->>'exact_scans')::integer = 0),
-    false) AS index_guard_native_fallback_profile_ok;
+              ->>'fallback')::boolean
+          AND (relation->'materialization'->>'exact_scans')::integer > 0),
+    false) AS index_guard_wait_break_profile_ok;
 
--- A wide exact set on one index must not force materialization while a
--- smaller producer is deliberately retaining a different parameterized
--- index path.  The result is still too large to discard those native paths.
+-- A native parameterized path must not truncate propagation in a wider graph.
+-- When the exact access planner rejects the key population, the scheduler
+-- falls back to one physical scan and continues the equality-domain transfer.
 CREATE TABLE protected_dimension(id integer, keep boolean);
 CREATE TABLE protected_source(id integer, dimension_id integer);
 CREATE TABLE guarded_dimension(id integer, keep boolean);
@@ -636,31 +637,28 @@ ANALYZE protected_dimension, protected_source, guarded_dimension,
 SET bloompg.index_transfer_max_fraction = 0.15;
 SET bloompg.index_transfer_max_keys = 50;
 SET bloompg.index_transfer_planner_max_keys = 1;
-CALL assert_same('index_guard_protected_source',
+CALL assert_same('index_guard_complete_transfer',
     'SELECT count(*) FROM protected_dimension d JOIN protected_source p ON d.id = p.dimension_id JOIN protected_guarded_fact f ON p.id = f.protected_id JOIN guarded_dimension g ON g.id = f.guarded_id WHERE d.keep AND g.keep');
 SET bloompg.enable = on;
-SELECT count(*) = 200 AS index_guard_protected_source_query_ok
+SELECT count(*) = 200 AS index_guard_complete_transfer_query_ok
 FROM protected_dimension d
 JOIN protected_source p ON d.id = p.dimension_id
 JOIN protected_guarded_fact f ON p.id = f.protected_id
 JOIN guarded_dimension g ON g.id = f.guarded_id
 WHERE d.keep AND g.keep;
 SELECT COALESCE(
-    (bloompg_last_profile()->'transfer'->'summary'
+    NOT (bloompg_last_profile()->'transfer'->'summary'
         ->>'native_fallback')::boolean
-    AND bloompg_last_profile()->'transfer'->'summary'
-        ->>'native_fallback_reason' = 'index-guard-protected-source'
+    AND (bloompg_last_profile()->'transfer'->'summary'
+        ->>'applied')::boolean
     AND EXISTS (
         SELECT 1
         FROM jsonb_array_elements(
             bloompg_last_profile()->'transfer'->'relations') AS relation
         WHERE relation->>'alias' = 'f'
-          AND (relation->'materialization'->'selection'
-              ->>'index_ready')::boolean
-          AND (relation->'materialization'->'selection'
-              ->>'native_fallback')::boolean
-          AND (relation->'materialization'->>'base_scans')::integer = 0),
-    false) AS index_guard_protected_source_profile_ok;
+          AND relation->>'replacement' = 'memory'
+          AND (relation->'materialization'->>'exact_scans')::integer > 0),
+    false) AS index_guard_complete_transfer_profile_ok;
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 RESET bloompg.transfer_progress_metric;
@@ -668,6 +666,7 @@ RESET bloompg.index_guard_min_rows;
 RESET bloompg.index_transfer_max_fraction;
 RESET bloompg.index_transfer_max_keys;
 RESET bloompg.index_transfer_planner_max_keys;
+RESET bloompg.index_transfer;
 
 SET bloompg.excitation_threshold = 0.0;
 SET bloompg.profile = on;
@@ -765,7 +764,6 @@ SELECT g, 1 + (g % 100), g <= 200 FROM generate_series(1, 1000) AS g;
 INSERT INTO parallel_rescan_fact
 SELECT 1 + (g % 1000), g FROM generate_series(1, 5000) AS g;
 ANALYZE parallel_rescan_gate, parallel_rescan_hub, parallel_rescan_fact;
-SET bloompg.p1_parallel_min_rows = 0;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_material = off;
@@ -776,7 +774,6 @@ CALL assert_parallel_rescan_plan('parallel_nested_loop_rescan_plan',
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
-RESET bloompg.p1_parallel_min_rows;
 
 CREATE TABLE parallel_filter_src(k integer, keep boolean);
 CREATE TABLE parallel_filter_dst(k integer, payload text);

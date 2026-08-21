@@ -7,8 +7,8 @@ All notable changes to BloomPG are documented here.
 - Parallelize eligible transfer scans with relation-sized worker groups and
   preserve relation-local parallelism when an unrelated SubLink restricts the
   outer query.
-- Use exact P1 inputs from 10,000 rows to expose parallel hash alternatives,
-  avoiding serial join cliffs after successful transfer.
+- Expose shared Memory inputs as parallel paths up to the configured worker
+  ceiling and let PostgreSQL's normal costs choose serial or parallel P1.
 - Columnize scan output in workers, send vector packets through Gather, and
   bulk-import fixed-width and variable-width columns in the leader.
 - Use the same vector packets for shared Parallel Append waves, including
@@ -25,8 +25,9 @@ All notable changes to BloomPG are documented here.
   every serialized vector, selection, filter, and by-reference datum before
   worker access.
 - Preserve selective index-only paths, use exact-key PostgreSQL index/bitmap
-  plans where appropriate, and retain the native plan for parameterized index
-  joins and unsafe index-guard stalemates.
+  plans where appropriate when the experimental `index_transfer` feature is
+  enabled. Stable transfer defaults to scan paths while index selection is
+  refined independently.
 - Keep parallel replacement and filter state available below Gather, while
   separating Gather-shared cursors from worker-replicated nested-loop cursors
   so each rescan restarts at the correct executor lifecycle boundary.

@@ -16,23 +16,24 @@ queries continue to use PostgreSQL's native planner.
 ## Results
 
 PostgreSQL 18.4 on two Intel Xeon Platinum 8474C CPUs, using the SQL corpora
-from DataFusion-Bloom. BloomPG uses the default `ndv` progress metric. Times
-include planning, transfer, materialization, execution, and complete output
-consumption.
+from DataFusion-Bloom. Both sides use the same 16-worker global and per-Gather
+ceiling. BloomPG also uses 16 transfer workers, the default `ndv` progress
+metric, and a 2 GB materialization budget. Times include planning, transfer,
+materialization, execution, and complete output consumption.
 
 | Workload | PostgreSQL storage | Completed | Native PG | BloomPG | Total speedup |
 |---|---|---:|---:|---:|---:|
-| CEB IMDB | 9.43 GB, indexed | 3,131/3,133 | 9,569.737 s* | 4,254.457 s | **2.249x** |
-| JOB | 9.43 GB, indexed | 113/113 | 229.143 s | 90.896 s | **2.521x** |
-| STATS-CEB | 113 MB, indexed | 142/146 | 249.124 s* | 101.626 s | **2.451x** |
-| TPC-H SF10 | 22.02 GB, indexed | 22/22 | 107.036 s | 116.567 s | **0.918x** |
+| CEB IMDB | 9.43 GB, indexed | 3,132/3,133 | 15,826.369 s | 3,822.980 s | **4.140x** |
+| JOB | 9.43 GB, indexed | 113/113 | 217.753 s | 69.337 s | **3.141x** |
+| STATS-CEB | 113 MB, indexed | 145/146 | 697.363 s | 237.348 s | **2.938x** |
+| TPC-H SF10 | 22.02 GB, indexed | 22/22 | 119.082 s | 114.413 s | **1.041x** |
 
 All completed Native/BloomPG pairs produced identical complete-output
-fingerprints. Each execution has a 60-second limit, so totals include only
-queries completed by both systems. `*` marks SHA-verified native PostgreSQL
-results reused from earlier complete passes; very slow reused baselines can
-have a different worker ceiling. Fresh JOB and TPC-H comparisons use the same
-128-worker ceiling on both sides. BloomPG uses a 2 GB materialization budget.
+fingerprints. Each execution has a 300-second limit, and totals include only
+queries completed by both systems. BloomPG completed every query; native
+PostgreSQL reached the limit once in CEB and once in STATS-CEB. PostgreSQL's
+normal indexes remain available to both sides, while BloomPG's experimental
+index-assisted transfer materialization is disabled for this table.
 
 ## Install
 
@@ -79,13 +80,15 @@ The main controls are:
 ```sql
 SET bloompg.enable = on;
 SET bloompg.transfer_progress_metric = 'ndv'; -- default; use 'rows' for compatibility
-SET bloompg.index_transfer = on;
 SET bloompg.transfer_workers = 8;
 ```
 
 `ndv` tracks only exact equality-key cardinality and is the recommended
 default. `rows` keeps the original row-count propagation algorithm. See
 [configuration](docs/CONFIGURATION.md) for all settings and memory guidance.
+Exact-key index-assisted materialization is available as an experimental,
+opt-in feature through `bloompg.index_transfer`; stable transfer uses scan
+paths by default.
 
 For query-level diagnostics:
 

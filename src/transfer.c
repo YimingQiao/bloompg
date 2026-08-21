@@ -39,16 +39,13 @@ static bool bloompg_edge_matches_direction(const BloomPGJoinEdge *edge,
 typedef enum BloomPGScheduleAction
 {
 	BLOOMPG_SCHEDULE_STOP,
-	BLOOMPG_SCHEDULE_MATERIALIZE,
-	BLOOMPG_SCHEDULE_REQUIRE_INDEX,
-	BLOOMPG_SCHEDULE_NATIVE_FALLBACK
+	BLOOMPG_SCHEDULE_MATERIALIZE
 } BloomPGScheduleAction;
 
 typedef struct BloomPGScheduleDecision
 {
 	BloomPGScheduleAction action;
 	BloomPGRelationState *source;
-	const char *reason;
 } BloomPGScheduleDecision;
 
 static bool
@@ -161,31 +158,6 @@ bloompg_has_pending_smaller_index_source(BloomPGRelationState *destination,
 	return false;
 }
 
-/* A smaller producer can deliberately stay native because PostgreSQL already
- * has a parameterized index path for it.  Such a producer will never publish
- * the key set awaited by a larger neighbour.  Treat it as a protected pending
- * source rather than silently breaking the wait with a large materialization
- * that would discard the neighbour's own join indexes. */
-static bool
-bloompg_has_protected_smaller_index_source(
-	BloomPGRelationState *destination, BloomPGRelationState **states, int count)
-{
-	int member = -1;
-
-	while ((member = bms_next_member(destination->join_index_sources,
-		member)) >= 0)
-	{
-		BloomPGRelationState *source = member <= count ? states[member] : NULL;
-
-		if (source != NULL && source != destination &&
-			source->native_index_guarded &&
-			source->base_rows < destination->base_rows &&
-			!bloompg_filter_received_from(destination, source->rti))
-			return true;
-	}
-	return false;
-}
-
 static bool
 bloompg_index_guard_delays(BloomPGRelationState *state,
 	BloomPGRelationState **states, int count, bool *index_ready)
@@ -197,8 +169,7 @@ bloompg_index_guard_delays(BloomPGRelationState *state,
 		return false;
 	*index_ready = bloompg_index_prefilter_available(state);
 	return !*index_ready ||
-		bloompg_has_pending_smaller_index_source(state, states, count) ||
-		bloompg_has_protected_smaller_index_source(state, states, count);
+		bloompg_has_pending_smaller_index_source(state, states, count);
 }
 
 static bool
@@ -209,15 +180,42 @@ bloompg_state_precedes(BloomPGRelationState *left,
 		(left->current_rows == right->current_rows && left->rti < right->rti);
 }
 
+/* PostgreSQL may pull a correlated SubLink relation into the planned range
+ * table and expose a parameterized index path for it.  Once every safe
+ * destination of such a plan-derived leaf is already in its lineage,
+ * materializing the leaf can only send a filter back along an edge that has
+ * already been traversed; it cannot open a new transfer frontier.  Preserve
+ * the native path and let P1 enforce the installed filter at execution. */
+static bool
+bloompg_terminal_native_index_leaf(BloomPGRelationState *state,
+	BloomPGRelationState **states, int count, const BloomPGJoinGraph *graph)
+{
+	int destination_rti;
+
+	if (!state->table->plan_derived || !state->native_parameterized_index)
+		return false;
+	for (destination_rti = 1; destination_rti <= count; destination_rti++)
+	{
+		BloomPGRelationState *destination = states[destination_rti];
+
+		if (destination == NULL || destination == state ||
+			bms_is_member(destination->rti, state->lineage))
+			continue;
+		if (bloompg_count_direction_keys(graph, state->rti,
+				destination->rti) > 0)
+			return false;
+	}
+	return true;
+}
+
 /* Preserve the fixed point's smallest-active order, delaying the first
  * physical read of a non-small relation when an exact incoming key set could
  * unlock its index.  The scheduler owns the complete wait-break decision so
  * callers never have to reconstruct a state from independent booleans. */
 static BloomPGScheduleDecision
-bloompg_schedule_next(BloomPGRelationState **states, int count,
-	bool query_parallel_safe)
+bloompg_schedule_next(BloomPGRelationState **states, int count)
 {
-	BloomPGScheduleDecision decision = {BLOOMPG_SCHEDULE_STOP, NULL, NULL};
+	BloomPGScheduleDecision decision = {BLOOMPG_SCHEDULE_STOP, NULL};
 	BloomPGRelationState *best = NULL;
 	BloomPGRelationState *fallback = NULL;
 	int rti;
@@ -252,34 +250,13 @@ bloompg_schedule_next(BloomPGRelationState **states, int count,
 	if (fallback == NULL)
 		return decision;
 
+	/* Index readiness changes how a relation is read, not whether it
+	 * participates in the transfer fixed point.  If every active relation is
+	 * waiting, materialize the smallest one with the best access path currently
+	 * available (including a sequential path) so propagation cannot stop at a
+	 * partial Filter/unchanged frontier. */
 	fallback->selection.disposition = BLOOMPG_SELECTION_WAIT_BREAK;
-	/* A protected producer cannot become ready later.  Small outcomes remain
-	 * safe to materialize; a non-small relation must first prove that its
-	 * available exact keys produce a real index access path. */
-	if (fallback->current_rows >
-			(double) bloompg_index_transfer_max_keys &&
-		bloompg_has_protected_smaller_index_source(fallback, states, count))
-	{
-		decision.action = BLOOMPG_SCHEDULE_REQUIRE_INDEX;
-		decision.source = fallback;
-		return decision;
-	}
-	/* A small guarded source is a safe escape hatch because its row estimate
-	 * bounds the exact key population.  A large source may use a parallel heap
-	 * path only when the whole query is parallel-safe; relation-local safety is
-	 * sufficient for ordinary materialization, but must not turn a restricted
-	 * index stalemate into a speculative fact-table scan. */
-	if (!fallback->selection.index_ready &&
-		fallback->current_rows > (double) bloompg_index_transfer_max_keys &&
-		(!query_parallel_safe ||
-		 bloompg_transfer_worker_count(fallback, query_parallel_safe) <= 0))
-	{
-		fallback->selection.disposition = BLOOMPG_SELECTION_NATIVE_FALLBACK;
-		decision.action = BLOOMPG_SCHEDULE_NATIVE_FALLBACK;
-		decision.reason = "index-guard-stalemate";
-	}
-	else
-		decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
+	decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
 	decision.source = fallback;
 	return decision;
 }
@@ -346,9 +323,8 @@ bloompg_make_apply_spec(const BloomPGJoinGraph *graph,
  * probe as transfer.  For an isolated two-relation join whose outer scan is
  * large enough to run in parallel, PostgreSQL can distribute those probes
  * across the outer workers and there is nowhere else to propagate the
- * materialized result.  The same duplication occurs for a large outer key
- * population even in a wider graph.  Keep those statements native before
- * any optimizer-time scan.
+ * materialized result.  Keep only that terminal case native; a wider graph
+ * must retain every excited relation in the transfer fixed point.
  */
 static BloomPGRelationState *
 bloompg_initial_native_index_guard(BloomPGRelationState **states,
@@ -356,15 +332,15 @@ bloompg_initial_native_index_guard(BloomPGRelationState **states,
 	bool query_parallel_safe)
 {
 	BloomPGScheduleDecision schedule = bloompg_schedule_next(states,
-		relation_count, query_parallel_safe);
+		relation_count);
 	BloomPGRelationState *source = schedule.source;
 	int destination_rti;
 	int destinations = 0;
 	int protected_destinations = 0;
 	int participating_relations = 0;
-	bool terminal_parallel_pair;
 
-	if (source == NULL)
+	if (source == NULL ||
+		bloompg_transfer_worker_count(source, query_parallel_safe) <= 0)
 		return NULL;
 	for (destination_rti = 1; destination_rti <= relation_count;
 		 destination_rti++)
@@ -372,10 +348,7 @@ bloompg_initial_native_index_guard(BloomPGRelationState **states,
 		if (states[destination_rti] != NULL)
 			participating_relations++;
 	}
-	terminal_parallel_pair = participating_relations == 2 &&
-		bloompg_transfer_worker_count(source, query_parallel_safe) > 0;
-	if (!terminal_parallel_pair &&
-		source->current_rows <= (double) bloompg_index_transfer_max_keys)
+	if (participating_relations != 2)
 		return NULL;
 	for (destination_rti = 1; destination_rti <= relation_count;
 		 destination_rti++)
@@ -625,11 +598,9 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 				if (states[rti] != NULL)
 					states[rti]->active = false;
 			}
-			guard_source->native_index_guarded = true;
 			appendStringInfo(&detail,
-				" native_index_bypass=%u:%.0f>%d",
-				guard_source->rti, guard_source->current_rows,
-				bloompg_index_transfer_max_keys);
+				" native_index_terminal_bypass=%u:%.0f",
+				guard_source->rti, guard_source->current_rows);
 		}
 	}
 
@@ -637,7 +608,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	for (;;)
 	{
 		BloomPGScheduleDecision schedule = bloompg_schedule_next(states,
-			relation_count, query_parallel_safe);
+			relation_count);
 		BloomPGRelationState *source = schedule.source;
 		List *pending_transfers = NIL;
 		BloomPGColumnStore *store;
@@ -653,38 +624,6 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		if (schedule.action == BLOOMPG_SCHEDULE_STOP)
 			break;
 		Assert(source != NULL);
-		if (schedule.action == BLOOMPG_SCHEDULE_REQUIRE_INDEX)
-		{
-			PlannedStmt *access_statement = NULL;
-
-			/* Breaking a protected wait is safe only when PostgreSQL itself can
-			 * turn the available exact keys into an index access path.  Cache the
-			 * auxiliary plan so physical materialization does not plan it twice. */
-			if (bloompg_plan_transfer_access(source, query_string, bound_params,
-					&access_statement))
-			{
-				source->preplanned_access = access_statement;
-				schedule.action = BLOOMPG_SCHEDULE_MATERIALIZE;
-			}
-			else
-			{
-				source->selection.disposition =
-					BLOOMPG_SELECTION_NATIVE_FALLBACK;
-				schedule.action = BLOOMPG_SCHEDULE_NATIVE_FALLBACK;
-				schedule.reason = "index-guard-protected-source";
-			}
-		}
-		if (schedule.action == BLOOMPG_SCHEDULE_NATIVE_FALLBACK)
-		{
-			outcome.applied = false;
-			outcome.native_fallback = true;
-			outcome.native_fallback_reason = schedule.reason;
-			appendStringInfo(&detail,
-				" native_fallback=%s:rti=%u:rows=%.0f>keys=%d",
-				outcome.native_fallback_reason, source->rti,
-				source->current_rows, bloompg_index_transfer_max_keys);
-			break;
-		}
 		appendStringInfo(&detail,
 			" select=%u:index_ready=%s:guarded=%s:fallback=%s",
 			source->rti, source->selection.index_ready ? "yes" : "no",
@@ -944,6 +883,9 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 				sizeof(AttrNumber) * pending->spec.nkeys);
 			sample_filter->lineage = bms_copy(source->lineage);
 			destination->filters = lappend(destination->filters, sample_filter);
+			destination->materialization_filter_sources = bms_add_member(
+				destination->materialization_filter_sources,
+				source->replacement_rti);
 			*pending->sent_lineage = bms_union(*pending->sent_lineage,
 														 source->lineage);
 			carries_new_lineage = !bms_is_subset(source->lineage,
@@ -999,14 +941,12 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 				destination->active = bloompg_is_excited(
 					destination->current_rows, destination->excitation_rows);
 				if (destination->active &&
-					destination->native_parameterized_index &&
-					(contain_subplans((Node *) destination->fallback_plan->qual) ||
-					 !bloompg_index_prefilter_available(destination)))
+					bloompg_terminal_native_index_leaf(destination, states,
+						relation_count, graph))
 				{
 					destination->active = false;
-					destination->native_index_guarded = true;
 					appendStringInfo(&detail,
-						" native_index_guard=%u", destination->rti);
+						" terminal_native_index=%u", destination->rti);
 				}
 				appendStringInfo(&detail, " estimate=%u:%.0f/%.0f%s%s",
 					destination->rti, destination->current_rows,
@@ -1037,10 +977,9 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	}
 	bloompg_equality_domains_finish(equality_domains, &outcome, &detail);
 
-	if (!outcome.native_fallback)
-		bloompg_finalize_replacements(candidate, graph, states, relation_count,
-			query_string, bound_params, query_parallel_safe,
-			&next_plan_node_id, &outcome, &detail);
+	bloompg_finalize_replacements(candidate, graph, states, relation_count,
+		query_string, bound_params, query_parallel_safe,
+		&next_plan_node_id, &outcome, &detail);
 	outcome.profile_json = bloompg_transfer_finish_profile(states,
 		relation_count, outcome, &detail,
 		collect_profile ? &profile_steps : NULL);

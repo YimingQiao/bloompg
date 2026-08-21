@@ -50,8 +50,6 @@ bloompg_selection_name(BloomPGSelectionState selection)
 			return "waiting";
 		case BLOOMPG_SELECTION_WAIT_BREAK:
 			return "wait-break";
-		case BLOOMPG_SELECTION_NATIVE_FALLBACK:
-			return "native-fallback";
 	}
 	return "unknown";
 }
@@ -74,14 +72,12 @@ bloompg_transfer_profile_append_step(StringInfo json, int step,
 		"\"selection_state\":\"%s\","
 		"\"selection_index_ready\":%s,\"selection_guarded\":%s,"
 		"\"selection_guard_fallback\":%s,"
-		"\"selection_native_fallback\":%s",
+		"\"selection_native_fallback\":false",
 		bms_num_members(source->join_index_sources),
 		bloompg_selection_name(source->selection),
 		source->selection.index_ready ? "true" : "false",
 		bloompg_selection_is_guarded(source->selection) ? "true" : "false",
 		source->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
-			"true" : "false",
-		source->selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK ?
 			"true" : "false");
 	appendStringInfo(json, ",\"destination_rti\":%u,\"destination\":",
 		pending->destination->rti);
@@ -458,11 +454,13 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->intermediate_sampling_profile.probe_ms);
 			appendStringInfo(&profile_relations,
 				"\"materialization\":{\"access_path\":\"%s\","
+				"\"decision\":{\"kind\":\"%s\",\"reason\":\"%s\","
+				"\"workers\":%d},"
 				"\"selection\":{\"policy\":\"index-wait-guard-v2\","
 				"\"state\":\"%s\",\"join_index_sources\":%d,"
 				"\"index_ready\":%s,"
 				"\"guarded\":%s,\"fallback\":%s,"
-				"\"native_fallback\":%s},"
+				"\"native_fallback\":false},"
 				"\"access_plan\":{\"attempts\":" UINT64_FORMAT
 				",\"planning_ms\":%.3f,\"kind\":\"%s\","
 				"\"rejection\":\"%s\",\"exact_filters\":" UINT64_FORMAT
@@ -505,14 +503,17 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				"\"wave\":",
 				state->materialization_access_path != NULL ?
 					state->materialization_access_path : "none",
+				state->access_decision_kind != NULL ?
+					state->access_decision_kind : "none",
+				state->access_decision_reason != NULL ?
+					state->access_decision_reason : "none",
+				state->access_decision_workers,
 				bloompg_selection_name(state->selection),
 				bms_num_members(state->join_index_sources),
 				state->selection.index_ready ? "true" : "false",
 				bloompg_selection_is_guarded(state->selection) ?
 					"true" : "false",
 				state->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
-					"true" : "false",
-				state->selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK ?
 					"true" : "false",
 				state->access_plan_attempts, state->access_plan_ms,
 				state->access_plan_kind != NULL ?
@@ -714,8 +715,8 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 
 		initStringInfo(&profile_json);
 		appendStringInfo(&profile_json,
-			"{\"summary\":{\"applied\":%s,\"native_fallback\":%s,"
-			"\"native_fallback_reason\":\"%s\","
+			"{\"summary\":{\"applied\":%s,\"native_fallback\":false,"
+			"\"native_fallback_reason\":\"none\","
 			"\"progress_metric\":\"%s\","
 			"\"steps\":%d,"
 			"\"filters\":%d,\"build_rows\":" UINT64_FORMAT
@@ -748,9 +749,6 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				",\"parallel_wave_relations\":" UINT64_FORMAT "},"
 			"\"steps\":[%s],\"relations\":[%s]}",
 			outcome.applied ? "true" : "false",
-			outcome.native_fallback ? "true" : "false",
-			outcome.native_fallback_reason != NULL ?
-				outcome.native_fallback_reason : "none",
 			bloompg_transfer_progress_metric ==
 				BLOOMPG_TRANSFER_PROGRESS_NDV ? "ndv" : "rows",
 			outcome.steps,

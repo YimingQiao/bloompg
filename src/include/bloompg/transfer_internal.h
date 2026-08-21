@@ -42,8 +42,7 @@ typedef enum BloomPGSelectionDisposition
 	BLOOMPG_SELECTION_UNCONSIDERED,
 	BLOOMPG_SELECTION_ELIGIBLE,
 	BLOOMPG_SELECTION_WAITING,
-	BLOOMPG_SELECTION_WAIT_BREAK,
-	BLOOMPG_SELECTION_NATIVE_FALLBACK
+	BLOOMPG_SELECTION_WAIT_BREAK
 } BloomPGSelectionDisposition;
 
 typedef struct BloomPGSelectionState
@@ -56,8 +55,7 @@ static inline bool
 bloompg_selection_is_guarded(BloomPGSelectionState selection)
 {
 	return selection.disposition == BLOOMPG_SELECTION_WAITING ||
-		selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ||
-		selection.disposition == BLOOMPG_SELECTION_NATIVE_FALLBACK;
+		selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK;
 }
 
 typedef struct BloomPGRelationState
@@ -85,12 +83,14 @@ typedef struct BloomPGRelationState
 	Bitmapset  *lineage;
 	bool		active;
 	bool		native_parameterized_index;
-	bool		native_index_guarded;
 	bool		materialized;
 	bool		prefetched;
 	bool		changed;
 	bool		materialization_used_filters;
-	PlannedStmt *preplanned_access;
+	/* P1 relation IDs whose exact rows built filters consumed by this
+	 * materialization.  They identify parameterized native paths that enforce
+	 * the same join domain without weakening fixed-point propagation. */
+	Bitmapset  *materialization_filter_sources;
 	uint64		materialization_token;
 	uint64		prefetch_token;
 	uint64		prefetch_rows;
@@ -152,8 +152,11 @@ typedef struct BloomPGRelationState
 	uint64		index_probe_dominated_candidates;
 	int			index_bitmap_input_count;
 	BloomPGIndexBitmapInputProfile
-				index_bitmap_inputs[BLOOMPG_MAX_INDEX_BITMAP_SOURCES];
+					index_bitmap_inputs[BLOOMPG_MAX_INDEX_BITMAP_SOURCES];
 	const char *materialization_access_path;
+	const char *access_decision_kind;
+	const char *access_decision_reason;
+	int			access_decision_workers;
 	uint64		access_plan_attempts;
 	double		access_plan_ms;
 	uint64		access_plan_exact_filters;
@@ -320,10 +323,6 @@ extern char *bloompg_transfer_finish_profile(
 /* Exact-bitmap-driven B-tree access (transfer_index.c). */
 typedef bool (*BloomPGIndexTupleCallback)(TupleTableSlot *slot, void *context);
 extern bool bloompg_index_prefilter_available(BloomPGRelationState *state);
-extern bool bloompg_index_prefilter_estimate(BloomPGRelationState *state,
-	double *fraction, uint64 *keys, Oid *index_oid);
-extern bool bloompg_index_prefilter_page_fraction(
-	BloomPGRelationState *state, double *fraction);
 extern bool bloompg_relation_has_transfer_index(BloomPGRelationState *state,
 	AttrNumber attribute, Oid equality_operator, Oid collation);
 extern bool bloompg_index_prefilter_scan(BloomPGRelationState *state,

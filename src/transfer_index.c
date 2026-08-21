@@ -23,10 +23,6 @@
 #include "utils/relcache.h"
 #include "utils/typcache.h"
 
-#include <math.h>
-
-#define BLOOMPG_INDEX_PAGE_PROBE_KEYS UINT64CONST(256)
-
 /*
  * Index-assisted transfer deliberately starts with the case for which Bloom
  * already owns a compact, exact and deduplicated key set: a one-column
@@ -797,126 +793,6 @@ bloompg_index_prefilter_available(BloomPGRelationState *state)
 	available = bloompg_find_index_candidate(heap_relation, state, &candidate,
 		NULL);
 	table_close(heap_relation, AccessShareLock);
-	return available;
-}
-
-bool
-bloompg_index_prefilter_estimate(BloomPGRelationState *state,
-	double *fraction, uint64 *keys, Oid *index_oid)
-{
-	BloomPGIndexCandidate candidate;
-	Relation heap_relation;
-	bool available;
-
-	if (state == NULL || state->table == NULL ||
-		state->table->rte_kind != RTE_RELATION ||
-		!OidIsValid(state->table->relation_oid))
-		return false;
-	heap_relation = table_open(state->table->relation_oid, AccessShareLock);
-	available = bloompg_find_index_candidate(heap_relation, state, &candidate,
-		NULL);
-	table_close(heap_relation, AccessShareLock);
-	if (!available)
-		return false;
-	if (fraction != NULL)
-		*fraction = candidate.estimated_fraction;
-	if (keys != NULL)
-		*keys = candidate.distinct_keys;
-	if (index_oid != NULL)
-		*index_oid = candidate.index_oid;
-	return true;
-}
-
-/* Count the heap pages addressed by the current exact-key bitmap.  This is a
- * bounded physical probe: unlike output cardinality or planner cost, it tells
- * the transfer scheduler whether an index still avoids most of the heap. */
-bool
-bloompg_index_prefilter_page_fraction(BloomPGRelationState *state,
-	double *fraction)
-{
-	BloomPGIndexCandidate *candidates = NULL;
-	TIDBitmap *combined = NULL;
-	Relation heap_relation;
-	TBMIterator iterator;
-	TBMIterateResult result;
-	int *selected = NULL;
-	int count;
-	int selected_count;
-	int ignored_dominated_count;
-	uint64 page_count = 0;
-	BlockNumber heap_pages;
-	bool iterator_started = false;
-	bool available = false;
-	uint64 keys_probed = 0;
-	uint64 ignored_batches = 0;
-	uint64 ignored_index_tuples = 0;
-
-	if (fraction != NULL)
-		*fraction = 0.0;
-	if (state == NULL || state->table == NULL ||
-		state->table->rte_kind != RTE_RELATION ||
-		!OidIsValid(state->table->relation_oid) || !ActiveSnapshotSet())
-		return false;
-	heap_relation = table_open(state->table->relation_oid, AccessShareLock);
-	PG_TRY();
-	{
-		count = bloompg_collect_index_candidates(heap_relation, state,
-			&candidates);
-		if (count > 0)
-		{
-			selected = palloc_array(int, count);
-			if (bloompg_bitmap_candidates_preferred(state, candidates, count,
-					selected, &selected_count, &ignored_dominated_count) &&
-				selected_count == 1)
-			{
-				BloomPGIndexCandidate *candidate =
-					&candidates[selected[0]];
-				uint64 key_stride = (candidate->distinct_keys +
-					BLOOMPG_INDEX_PAGE_PROBE_KEYS - 1) /
-					BLOOMPG_INDEX_PAGE_PROBE_KEYS;
-
-				combined = bloompg_build_candidate_bitmap(GetActiveSnapshot(),
-					candidate, &keys_probed, &ignored_batches,
-					&ignored_index_tuples, key_stride);
-				available = combined != NULL;
-			}
-		}
-		if (available && !tbm_is_empty(combined))
-		{
-			iterator = tbm_begin_iterate(combined, NULL,
-				InvalidDsaPointer);
-			iterator_started = true;
-			while (tbm_iterate(&iterator, &result))
-			{
-				CHECK_FOR_INTERRUPTS();
-				page_count++;
-			}
-		}
-		heap_pages = RelationGetNumberOfBlocks(heap_relation);
-		if (fraction != NULL && heap_pages > 0 && keys_probed > 0)
-		{
-			double sampled_fraction = Min((double) page_count /
-				(double) heap_pages, 1.0);
-			double key_scale = (double)
-				candidates[selected[0]].distinct_keys / (double) keys_probed;
-
-			*fraction = sampled_fraction >= 1.0 ? 1.0 :
-				1.0 - pow(1.0 - sampled_fraction, key_scale);
-		}
-	}
-	PG_FINALLY();
-	{
-		if (iterator_started && !tbm_exhausted(&iterator))
-			tbm_end_iterate(&iterator);
-		if (combined != NULL)
-			tbm_free(combined);
-		if (selected != NULL)
-			pfree(selected);
-		if (candidates != NULL)
-			pfree(candidates);
-		table_close(heap_relation, AccessShareLock);
-	}
-	PG_END_TRY();
 	return available;
 }
 

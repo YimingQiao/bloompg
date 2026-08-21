@@ -61,6 +61,9 @@ bloompg_record_prefetch(BloomPGRelationState *state, uint64 token,
 	state->parallel_rows += rows;
 	state->parallel_scan_ms += scan_ms;
 	state->materialization_access_path = "parallel-prefetch-p0";
+	state->access_decision_kind = "parallel-scan";
+	state->access_decision_reason = "shared-prefetch";
+	state->access_decision_workers = workers_requested;
 }
 
 static void
@@ -187,7 +190,7 @@ bloompg_select_prefetch_peer(BloomPGRelationState *source,
  * Speculatively materialize the next two excited base sources in one physical
  * wave.  Logical propagation remains ordered: a filter produced by the first
  * source is applied to the peer's already-columnar result before that peer is
- * allowed to propagate.  Thus this changes scheduling, not the transfer fixed
+ * allowed to propagate.  This changes scheduling, not the transfer fixed
  * point, and each heap is still read at most once.
  */
 bool

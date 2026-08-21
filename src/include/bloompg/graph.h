@@ -31,6 +31,7 @@ typedef struct BloomPGTable
 	Index		rti;
 	Oid			relation_oid;
 	RTEKind		rte_kind;
+	bool		plan_derived;
 	char	   *alias;
 	Query	   *subquery;
 	Bitmapset  *required_attributes;

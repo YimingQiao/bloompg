@@ -10,6 +10,7 @@
 #include "nodes/nodeFuncs.h"
 #include "catalog/pg_class.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 
@@ -81,6 +82,33 @@ bloompg_replacement_is_exact(Index rti)
 	return replacement != NULL && replacement->rows > 0.0 &&
 		(replacement->kind == BLOOMPG_REPLACEMENT_MEMORY ||
 		 replacement->kind == BLOOMPG_REPLACEMENT_TID);
+}
+
+/* A materialized relation and its native parameterized index path are
+ * interchangeable in a join only when every filter consumed by the
+ * materialization came directly from an exact relation that parameterizes
+ * the native path.  The join clauses then enforce the same key domains while
+ * retaining PostgreSQL's efficient keyed-rescan implementation. */
+static bool
+bloompg_parameterized_path_is_equivalent(BloomPGReplacement *replacement,
+	Path *path)
+{
+	int source_rti = -1;
+
+	if (path->param_info == NULL)
+		return false;
+	if (replacement->native_parameterized_paths_equivalent)
+		return true;
+	if (replacement->materialization_filter_sources == NULL)
+		return false;
+	while ((source_rti = bms_next_member(
+		replacement->materialization_filter_sources, source_rti)) >= 0)
+	{
+		if (!bms_is_member(source_rti, path->param_info->ppi_req_outer) ||
+			!bloompg_replacement_is_exact(source_rti))
+			return false;
+	}
+	return true;
 }
 
 static BloomPGJoinKeyStatistics *
@@ -495,15 +523,15 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 	 * reachable only as executor safety children. */
 	native_paths = rel->pathlist;
 	native_partial_paths = rel->partial_pathlist;
-	if (replacement->native_parameterized_paths_equivalent &&
-		(replacement->kind == BLOOMPG_REPLACEMENT_MEMORY ||
-		 replacement->kind == BLOOMPG_REPLACEMENT_TID))
+	if (replacement->kind == BLOOMPG_REPLACEMENT_MEMORY ||
+		replacement->kind == BLOOMPG_REPLACEMENT_TID)
 	{
 		foreach(cell, native_paths)
 		{
 			Path *candidate = lfirst(cell);
 
-			if (candidate->param_info != NULL)
+			if (bloompg_parameterized_path_is_equivalent(replacement,
+					candidate))
 				equivalent_parameterized_paths =
 					lappend(equivalent_parameterized_paths, candidate);
 		}
@@ -525,12 +553,20 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 	}
 	path = bloompg_replacement_path(replacement, rti, rel, fallback, rows,
 		false, 0);
+	/* A large materialization whose exact incoming domain can also be enforced
+	 * by a parameterized index is a poor inner-rescan choice: a single bad
+	 * cardinality estimate can multiply a full vector scan thousands of times.
+	 * Soft-disable that unparameterized alternative.  PostgreSQL may still use
+	 * it to break a parameterization cycle, but otherwise prefers the keyed
+	 * path that already enforces the same domain. */
+	if (replacement->materialization_filter_sources != NULL &&
+		rows > (double) bloompg_index_guard_min_rows &&
+		equivalent_parameterized_paths != NIL)
+		path->path.disabled_nodes = 1;
 	add_path(rel, &path->path);
-	/* A local-qual-only materialization and its native parameterized paths
-	 * produce the same logical rows.  Keep those keyed alternatives beside the
-	 * replacement so PostgreSQL can choose between one sequential vector read
-	 * and repeated index probes.  A materialization that consumed an incoming
-	 * Bloom filter is not equivalent and therefore remains a true replacement. */
+	/* Keep only native parameterized paths that enforce every exact domain
+	 * consumed by the materialization.  PostgreSQL can then choose between one
+	 * sequential vector read and logically equivalent repeated index probes. */
 	foreach(cell, equivalent_parameterized_paths)
 		add_path(rel, (Path *) lfirst(cell));
 	if (equivalent_parameterized_count > 0)
@@ -548,12 +584,21 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 	}
 	if (partial_fallback != NULL)
 	{
+		int parallel_workers = Max(partial_fallback->parallel_workers,
+			Min(bloompg_transfer_workers,
+				max_parallel_workers_per_gather));
 		double divisor = Max(original_rows /
 			Max(partial_fallback->rows, 1.0), 1.0);
-		double partial_rows = Max(rows / divisor, 1.0);
-		CustomPath *partial = bloompg_replacement_path(replacement, rti, rel,
+		double partial_rows;
+		CustomPath *partial;
+
+		if (parallel_workers > partial_fallback->parallel_workers)
+			divisor *= (double) parallel_workers /
+				(double) partial_fallback->parallel_workers;
+		partial_rows = Max(rows / divisor, 1.0);
+		partial = bloompg_replacement_path(replacement, rti, rel,
 			partial_fallback, partial_rows, true,
-			partial_fallback->parallel_workers);
+			parallel_workers);
 
 		add_partial_path(rel, &partial->path);
 	}
@@ -567,7 +612,10 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 			"memory",
 			rti, rows, partial_fallback != NULL ? " plus parallel path" : "",
 			equivalent_parameterized_count > 0 ?
-			" plus equivalent parameterized paths" : "");
+			psprintf(" plus " UINT64_FORMAT "/" UINT64_FORMAT
+				" equivalent parameterized paths",
+				equivalent_parameterized_count,
+				retained_parameterized_paths) : "");
 }
 
 static Plan *

@@ -122,7 +122,7 @@ class OutputParsingTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
-    def test_sampling_mode_is_explicit_in_pgoptions(self):
+    def test_benchmark_controls_are_explicit_in_pgoptions(self):
         args = SimpleNamespace(
             parallel_workers=8,
             transfer_workers=4,
@@ -133,8 +133,6 @@ class SettingsTests(unittest.TestCase):
             index_transfer_max_keys=100_000,
             index_guard_min_rows=100_000,
             transfer_progress_metric="ndv",
-            p1_parallel_bias=True,
-            p1_parallel_min_rows=100_000,
             capture_profile=True,
             work_mem="512MB",
             hash_mem_multiplier=2.0,
@@ -149,6 +147,8 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("-c bloompg.sample_mode=instant", options)
         self.assertIn("-c bloompg.sample_size=20000", options)
         self.assertIn("-c bloompg.transfer_progress_metric=ndv", options)
+        self.assertIn("-c max_parallel_workers=8", options)
+        self.assertIn("-c max_parallel_workers_per_gather=8", options)
 
 
 if __name__ == "__main__":

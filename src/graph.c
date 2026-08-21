@@ -760,6 +760,7 @@ bloompg_graph_augment_plan(BloomPGJoinGraph *graph, PlannedStmt *statement)
 			BloomPGTable *table = palloc0(sizeof(BloomPGTable));
 
 			table->rti = rti;
+			table->plan_derived = true;
 			table->relation_oid = rte->rtekind == RTE_RELATION ?
 				rte->relid : InvalidOid;
 			table->rte_kind = rte->rtekind;

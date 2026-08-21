@@ -21,13 +21,11 @@ bool bloompg_log_transfer_steps = false;
 bool bloompg_profile_enabled = false;
 bool bloompg_profile_log = true;
 bool bloompg_replan_after_transfer = true;
-bool bloompg_p1_parallel_bias = true;
-int bloompg_p1_parallel_min_rows = 10000;
 bool bloompg_late_materialize = true;
 int bloompg_late_materialize_min_width = 128;
 int bloompg_transfer_workers = 4;
 int bloompg_transfer_parallel_min_rows = 100000;
-bool bloompg_index_transfer = true;
+bool bloompg_index_transfer = false;
 double bloompg_index_transfer_max_fraction = 0.15;
 int bloompg_index_transfer_batch_keys = 65536;
 int bloompg_index_transfer_max_keys = 100000;
@@ -207,28 +205,6 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
-	DefineCustomBoolVariable("bloompg.p1_parallel_bias",
-								 "Use exact post-transfer rows to favor parallel P1 plans for substantial materializations.",
-								 NULL,
-								 &bloompg_p1_parallel_bias,
-								 true,
-								 PGC_USERSET,
-								 0,
-								 NULL,
-								 NULL,
-								 NULL);
-	DefineCustomIntVariable("bloompg.p1_parallel_min_rows",
-							"Minimum exact materialized rows before Bloom biases only the P1 optimizer toward parallel execution.",
-							NULL,
-							&bloompg_p1_parallel_min_rows,
-							10000,
-							0,
-							INT_MAX,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
 	DefineCustomBoolVariable("bloompg.late_materialize",
 							 "Prefer TID-backed late materialization for wide relations.",
 							 NULL,
@@ -277,9 +253,9 @@ _PG_init(void)
 							NULL);
 	DefineCustomBoolVariable("bloompg.index_transfer",
 							 "Use exact transfer keys to drive matching B-tree indexes.",
-							 NULL,
+							 "Experimental; disabled by default because parallel scans can outperform medium-sized exact-key probes.",
 							 &bloompg_index_transfer,
-							 true,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL,

@@ -21,7 +21,6 @@ typedef struct BloomPGPlanProfileInput
 	uint64		p1_cardinality_adjustments;
 	double		p1_cardinality_max_ratio;
 	bool		replanned;
-	bool		p1_parallel_biased;
 	bool		transfer_failed;
 	int		transfer_error_code;
 	List	   *materialization_tokens;

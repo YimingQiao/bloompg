@@ -167,6 +167,9 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 		replacement->rows = state->current_rows;
 		replacement->native_parameterized_paths_equivalent =
 			!state->materialization_used_filters;
+		if (state->materialization_used_filters)
+			replacement->materialization_filter_sources = bms_copy(
+				state->materialization_filter_sources);
 		if (final_rows == 0)
 		{
 			replacement->kind = BLOOMPG_REPLACEMENT_EMPTY;
