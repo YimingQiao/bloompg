@@ -27,8 +27,13 @@ All notable changes to BloomPG are documented here.
 - Preserve selective index-only paths, use exact-key PostgreSQL index/bitmap
   plans where appropriate, and retain the native plan for parameterized index
   joins and unsafe index-guard stalemates.
-- Keep parallel replacement-scan DSM cursors stable across lazy leader
-  rescans by separating shared and backend-local CustomScan reset state.
+- Keep parallel replacement and filter state available below Gather, while
+  separating Gather-shared cursors from worker-replicated nested-loop cursors
+  so each rescan restarts at the correct executor lifecycle boundary.
+- Remove the emergency P1 nested-loop suppression switch now that parallel
+  rescans follow PostgreSQL's CustomScan DSM lifecycle directly.
+- Initialize NULL bitmap-probe Datums before the null-aware fast path, avoiding
+  undefined reads under compiler instrumentation.
 - Prune materialized projections through nested correlated SubLinks and retain
   fail-closed behavior for whole-row and system-column references.
 - Add assertion-enabled regression coverage for vector packets, toasted and

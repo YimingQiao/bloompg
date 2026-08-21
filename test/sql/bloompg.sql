@@ -98,6 +98,32 @@ BEGIN
 END
 $$;
 
+CREATE PROCEDURE assert_parallel_rescan_plan(label text, query_text text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    plan_json jsonb;
+BEGIN
+    PERFORM set_config('bloompg.enable', 'on', true);
+    EXECUTE
+        'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) ' ||
+        query_text
+    INTO plan_json;
+    IF NOT jsonb_path_exists(plan_json, (
+        '$.** ? (@."Node Type" == "Nested Loop")."Plans"[*] ? ' ||
+        '(@."Parent Relationship" == "Inner" && ' ||
+        '@."Node Type" == "Gather" && @."Actual Loops" > 1 && ' ||
+        '@."Workers Launched" > 0)')::jsonpath) THEN
+        RAISE EXCEPTION '% did not rescan a worker-backed inner Gather', label;
+    END IF;
+    IF NOT jsonb_path_exists(plan_json, (
+        '$.** ? (@."Custom Plan Provider" == "BloomPG Memory" && ' ||
+        '@."Snapshot Reuse" == "parallel DSM (replicated)" && ' ||
+        '@."Actual Loops" > 1)')::jsonpath) THEN
+        RAISE EXCEPTION '% did not rescan a replicated materialization', label;
+    END IF;
+END
+$$;
+
 CREATE PROCEDURE assert_parameter_same(label text, bound_value integer)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -724,6 +750,33 @@ CALL assert_same('parallel_partition',
 CALL assert_plan_contains('parallel_plan',
     'SELECT count(*) FROM a JOIN b ON a.k = b.k WHERE a.keep',
     'Parallel Custom Scan (BloomPG');
+
+-- A partial join can use a regular replacement as its replicated inner side,
+-- while a higher nested loop repeatedly launches an inner Gather.  Both the
+-- worker-local cursor and the Gather-wide shared cursor must restart at their
+-- own lifecycle boundary.
+CREATE TABLE parallel_rescan_gate(kind integer, keep boolean);
+CREATE TABLE parallel_rescan_hub(k integer, kind integer, keep boolean);
+CREATE TABLE parallel_rescan_fact(k integer, payload integer);
+INSERT INTO parallel_rescan_gate
+SELECT g, g = 1 FROM generate_series(1, 200) AS g;
+INSERT INTO parallel_rescan_hub
+SELECT g, 1 + (g % 100), g <= 200 FROM generate_series(1, 1000) AS g;
+INSERT INTO parallel_rescan_fact
+SELECT 1 + (g % 1000), g FROM generate_series(1, 5000) AS g;
+ANALYZE parallel_rescan_gate, parallel_rescan_hub, parallel_rescan_fact;
+SET bloompg.p1_parallel_min_rows = 0;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+CALL assert_same('parallel_nested_loop_rescan',
+    'SELECT g.kind, h.k, f.payload FROM parallel_rescan_gate g JOIN parallel_rescan_hub h ON g.kind = h.kind JOIN parallel_rescan_fact f ON h.k = f.k WHERE g.keep AND h.keep');
+CALL assert_parallel_rescan_plan('parallel_nested_loop_rescan_plan',
+    'SELECT g.kind, h.k, f.payload FROM parallel_rescan_gate g JOIN parallel_rescan_hub h ON g.kind = h.kind JOIN parallel_rescan_fact f ON h.k = f.k WHERE g.keep AND h.keep');
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+RESET bloompg.p1_parallel_min_rows;
 
 CREATE TABLE parallel_filter_src(k integer, keep boolean);
 CREATE TABLE parallel_filter_dst(k integer, payload text);

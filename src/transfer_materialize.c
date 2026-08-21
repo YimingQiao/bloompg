@@ -377,7 +377,7 @@ bloompg_contains_materialized_filter(BloomPGFilter *filter,
 {
 	if (filter->kind == BLOOMPG_FILTER_BITMAP && filter->nkeys == 1)
 	{
-		Datum value;
+		Datum value = (Datum) 0;
 		bool present = bloompg_column_chunk_get_datum(view, attributes[0], row,
 			&value);
 
@@ -393,7 +393,7 @@ bloompg_insert_materialized_filter(BloomPGFilter *filter,
 {
 	if (filter->kind == BLOOMPG_FILTER_BITMAP && filter->nkeys == 1)
 	{
-		Datum value;
+		Datum value = (Datum) 0;
 		bool present = bloompg_column_chunk_get_datum(view, attributes[0], row,
 			&value);
 

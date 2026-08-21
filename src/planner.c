@@ -7,6 +7,7 @@
 #include "bloompg/profile.h"
 #include "bloompg/replan.h"
 #include "bloompg/runtime.h"
+#include "bloompg/scan.h"
 #include "bloompg/transfer.h"
 
 #include "lib/stringinfo.h"
@@ -297,7 +298,6 @@ bloompg_planner(Query *parse,
 			BloomPGPlanProfileInput profile_input;
 			volatile bool replanned = false;
 			volatile bool transfer_failed = false;
-			volatile bool p1_nestloop_suppressed = false;
 			volatile bool p1_parallel_biased = false;
 			volatile int transfer_error_code = 0;
 			volatile double transfer_ms = 0.0;
@@ -367,7 +367,6 @@ bloompg_planner(Query *parse,
 				transfer.replacements != NIL)
 			{
 				PlannedStmt *volatile replacement_plan = NULL;
-				bool saved_enable_nestloop = enable_nestloop;
 				double saved_parallel_setup_cost = parallel_setup_cost;
 				double saved_parallel_tuple_cost = parallel_tuple_cost;
 				int saved_min_parallel_table_scan_size =
@@ -377,12 +376,6 @@ bloompg_planner(Query *parse,
 
 				bloompg_replan_begin(transfer.replacements, graph);
 				INSTR_TIME_SET_CURRENT(p1_started);
-				if (bloompg_p1_disable_nestloop &&
-					(enable_hashjoin || enable_mergejoin))
-				{
-					enable_nestloop = false;
-					p1_nestloop_suppressed = true;
-				}
 				if (bloompg_p1_parallel_bias && query_parallel_safe &&
 					max_parallel_workers_per_gather > 0 &&
 					bloompg_p1_has_parallel_work(transfer.replacements))
@@ -405,7 +398,6 @@ bloompg_planner(Query *parse,
 				}
 				PG_FINALLY(_replan);
 				{
-					enable_nestloop = saved_enable_nestloop;
 					parallel_setup_cost = saved_parallel_setup_cost;
 					parallel_tuple_cost = saved_parallel_tuple_cost;
 					min_parallel_table_scan_size =
@@ -415,6 +407,8 @@ bloompg_planner(Query *parse,
 					bloompg_replan_end();
 				}
 				PG_END_TRY(_replan);
+				bloompg_prepare_parallel_plan(
+					(PlannedStmt *) replacement_plan);
 				bloompg_replan_cardinality_stats(
 					&p1_cardinality_adjustments,
 					&p1_cardinality_max_ratio);
@@ -443,11 +437,10 @@ bloompg_planner(Query *parse,
 			appendStringInfo(&detail,
 				" phases=p0:%.3fms native:%.3fms graph:%.3fms"
 					" transfer:%.3fms p1:%.3fms"
-					" p1_nestloop=%s p1_parallel=%s"
+					" p1_parallel=%s"
 					" p1_cardinality=" UINT64_FORMAT ":%.2fx",
 					p0_ms, native_preview_ms, graph_ms, (double) transfer_ms,
 					(double) p1_ms,
-					p1_nestloop_suppressed ? "off" : "unchanged",
 					p1_parallel_biased ? "biased" : "unchanged",
 					p1_cardinality_adjustments, p1_cardinality_max_ratio);
 			appendStringInfo(&detail, " p1_paths=%s",
@@ -483,7 +476,6 @@ bloompg_planner(Query *parse,
 			profile_input.p1_cardinality_max_ratio =
 				p1_cardinality_max_ratio;
 			profile_input.replanned = replanned;
-			profile_input.p1_nestloop_suppressed = p1_nestloop_suppressed;
 			profile_input.p1_parallel_biased = p1_parallel_biased;
 			profile_input.transfer_failed = transfer_failed;
 			profile_input.transfer_error_code = transfer_error_code;

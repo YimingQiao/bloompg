@@ -68,5 +68,6 @@ extern Plan *bloompg_make_empty_scan_path(List *targetlist,
 								   Plan *fallback_plan,
 								   uint64 token);
 extern bool bloompg_empty_scan_info(Plan *plan, uint64 *token);
+extern void bloompg_prepare_parallel_plan(PlannedStmt *statement);
 
 #endif

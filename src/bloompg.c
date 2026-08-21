@@ -21,7 +21,6 @@ bool bloompg_log_transfer_steps = false;
 bool bloompg_profile_enabled = false;
 bool bloompg_profile_log = true;
 bool bloompg_replan_after_transfer = true;
-bool bloompg_p1_disable_nestloop = false;
 bool bloompg_p1_parallel_bias = true;
 int bloompg_p1_parallel_min_rows = 10000;
 bool bloompg_late_materialize = true;
@@ -208,16 +207,6 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
-	DefineCustomBoolVariable("bloompg.p1_disable_nestloop",
-								 "Emergency guard that disables P1 nested loops after transfer.",
-								 NULL,
-								 &bloompg_p1_disable_nestloop,
-								 false,
-								 PGC_USERSET,
-								 0,
-								 NULL,
-								 NULL,
-								 NULL);
 	DefineCustomBoolVariable("bloompg.p1_parallel_bias",
 								 "Use exact post-transfer rows to favor parallel P1 plans for substantial materializations.",
 								 NULL,

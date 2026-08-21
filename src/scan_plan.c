@@ -43,6 +43,15 @@ bloompg_attr_array_to_list(const AttrNumber *values, int count)
 	return result;
 }
 
+static List *
+bloompg_materialization_metadata(uint64 token, uint64 rows)
+{
+	return list_make3(
+		makeString(psprintf(UINT64_FORMAT, token)),
+		makeString(psprintf(UINT64_FORMAT, rows)),
+		makeInteger(BLOOMPG_PARALLEL_ACCESS_SHARED));
+}
+
 Oid *
 bloompg_list_to_oid_array(List *values, int expected)
 {
@@ -166,7 +175,6 @@ bloompg_make_memory_scan(Plan *fallback_plan,
 	CustomScan *scan = makeNode(CustomScan);
 	Plan *plan = &scan->scan.plan;
 	List *scan_targetlist = fallback_plan->targetlist;
-	List *metadata = NIL;
 
 	if (IsA(fallback_plan, CustomScan) &&
 		castNode(CustomScan, fallback_plan)->custom_scan_tlist != NIL)
@@ -196,9 +204,7 @@ bloompg_make_memory_scan(Plan *fallback_plan,
 	scan->custom_scan_tlist = copyObject(scan_targetlist);
 	scan->custom_relids = NULL;
 	scan->methods = &bloompg_memory_scan_methods;
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, token)));
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, rows)));
-	scan->custom_private = metadata;
+	scan->custom_private = bloompg_materialization_metadata(token, rows);
 	return plan;
 }
 
@@ -213,7 +219,6 @@ bloompg_make_memory_scan_path(List *targetlist,
 {
 	CustomScan *scan = makeNode(CustomScan);
 	Plan *plan = &scan->scan.plan;
-	List *metadata = NIL;
 
 	plan->targetlist = copyObject(targetlist);
 	plan->qual = NIL;
@@ -227,9 +232,7 @@ bloompg_make_memory_scan_path(List *targetlist,
 	scan->custom_scan_tlist = copyObject(scan_targetlist);
 	scan->custom_relids = NULL;
 	scan->methods = &bloompg_memory_scan_methods;
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, token)));
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, rows)));
-	scan->custom_private = metadata;
+	scan->custom_private = bloompg_materialization_metadata(token, rows);
 	return plan;
 }
 
@@ -241,7 +244,6 @@ bloompg_make_empty_scan_path(List *targetlist,
 {
 	CustomScan *scan = makeNode(CustomScan);
 	Plan *plan = &scan->scan.plan;
-	List *metadata = NIL;
 
 	plan->targetlist = copyObject(targetlist);
 	plan->qual = NIL;
@@ -255,9 +257,7 @@ bloompg_make_empty_scan_path(List *targetlist,
 	scan->custom_scan_tlist = copyObject(scan_targetlist);
 	scan->custom_relids = NULL;
 	scan->methods = &bloompg_empty_scan_methods;
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, token)));
-	metadata = lappend(metadata, makeString(pstrdup("0")));
-	scan->custom_private = metadata;
+	scan->custom_private = bloompg_materialization_metadata(token, 0);
 	return plan;
 }
 
@@ -270,7 +270,6 @@ bloompg_make_tid_scan_path(List *targetlist,
 {
 	CustomScan *scan = makeNode(CustomScan);
 	Plan *plan = &scan->scan.plan;
-	List *metadata = NIL;
 
 	plan->targetlist = copyObject(targetlist);
 	plan->qual = NIL;
@@ -284,9 +283,7 @@ bloompg_make_tid_scan_path(List *targetlist,
 	scan->custom_scan_tlist = NIL;
 	scan->custom_relids = bms_make_singleton(rti);
 	scan->methods = &bloompg_tid_scan_methods;
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, token)));
-	metadata = lappend(metadata, makeString(psprintf(UINT64_FORMAT, rows)));
-	scan->custom_private = metadata;
+	scan->custom_private = bloompg_materialization_metadata(token, rows);
 	return plan;
 }
 
@@ -419,7 +416,7 @@ bloompg_memory_scan_info(Plan *plan, uint64 *token, uint64 *rows)
 		return false;
 	scan = castNode(CustomScan, plan);
 	if (scan->methods != &bloompg_memory_scan_methods ||
-		list_length(scan->custom_private) != 2)
+		list_length(scan->custom_private) != 3)
 		return false;
 	if (token != NULL)
 		*token = strtoull(strVal(list_nth(scan->custom_private, 0)), NULL, 10);
@@ -437,7 +434,7 @@ bloompg_empty_scan_info(Plan *plan, uint64 *token)
 		return false;
 	scan = castNode(CustomScan, plan);
 	if (scan->methods != &bloompg_empty_scan_methods ||
-		list_length(scan->custom_private) != 2)
+		list_length(scan->custom_private) != 3)
 		return false;
 	if (token != NULL)
 		*token = strtoull(strVal(list_nth(scan->custom_private, 0)), NULL, 10);
@@ -453,7 +450,7 @@ bloompg_tid_scan_info(Plan *plan, uint64 *token, uint64 *rows)
 		return false;
 	scan = castNode(CustomScan, plan);
 	if (scan->methods != &bloompg_tid_scan_methods ||
-		list_length(scan->custom_private) != 2)
+		list_length(scan->custom_private) != 3)
 		return false;
 	if (token != NULL)
 		*token = strtoull(strVal(list_nth(scan->custom_private, 0)), NULL, 10);
@@ -483,6 +480,108 @@ bloompg_filter_scan_uses_token(Plan *plan, uint64 token)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * Materializations and filters live in the planning backend until a Gather
+ * serializes them.  A partial replacement path is already parallel-aware and
+ * divides its materialization among workers.  A regular path may nevertheless
+ * be selected as the replicated inner side of a partial join.  Mark only
+ * those final-plan nodes parallel-aware so they receive DSM, and tag
+ * materialization scans to give every worker an independent local cursor.
+ */
+static void
+bloompg_prepare_parallel_custom_scan(Plan *plan)
+{
+	CustomScan *scan;
+
+	if (plan == NULL || !IsA(plan, CustomScan) || plan->parallel_aware)
+		return;
+	scan = castNode(CustomScan, plan);
+	if (scan->methods == &bloompg_memory_scan_methods ||
+		scan->methods == &bloompg_empty_scan_methods ||
+		scan->methods == &bloompg_tid_scan_methods)
+	{
+		if (list_length(scan->custom_private) != 3 ||
+			intVal(list_nth(scan->custom_private, 2)) !=
+			BLOOMPG_PARALLEL_ACCESS_SHARED)
+			elog(ERROR, "invalid bloompg materialization metadata");
+		intVal(list_nth(scan->custom_private, 2)) =
+			BLOOMPG_PARALLEL_ACCESS_REPLICATED;
+		plan->parallel_aware = true;
+		if (bloompg_log_transfer_steps)
+			elog(LOG, "bloompg P1 enabled replicated DSM for %s plan node %d",
+				scan->methods->CustomName, plan->plan_node_id);
+		return;
+	}
+	if (scan->methods == &bloompg_filter_scan_methods ||
+		scan->methods == &bloompg_prefilter_scan_methods)
+	{
+		plan->parallel_aware = true;
+		if (bloompg_log_transfer_steps)
+			elog(LOG, "bloompg P1 enabled filter DSM for %s plan node %d",
+				scan->methods->CustomName, plan->plan_node_id);
+		return;
+	}
+}
+
+static void
+bloompg_prepare_parallel_plan_node(Plan *plan, bool below_gather)
+{
+	List *children = NIL;
+	ListCell *cell;
+	bool children_below_gather;
+
+	if (plan == NULL)
+		return;
+	if (below_gather)
+		bloompg_prepare_parallel_custom_scan(plan);
+	children_below_gather = below_gather || IsA(plan, Gather) ||
+		IsA(plan, GatherMerge);
+	bloompg_prepare_parallel_plan_node(outerPlan(plan),
+		children_below_gather);
+	bloompg_prepare_parallel_plan_node(innerPlan(plan),
+		children_below_gather);
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			children = castNode(Append, plan)->appendplans;
+			break;
+		case T_MergeAppend:
+			children = castNode(MergeAppend, plan)->mergeplans;
+			break;
+		case T_BitmapAnd:
+			children = castNode(BitmapAnd, plan)->bitmapplans;
+			break;
+		case T_BitmapOr:
+			children = castNode(BitmapOr, plan)->bitmapplans;
+			break;
+		case T_CustomScan:
+			children = castNode(CustomScan, plan)->custom_plans;
+			break;
+		case T_SubqueryScan:
+			bloompg_prepare_parallel_plan_node(
+				castNode(SubqueryScan, plan)->subplan,
+				children_below_gather);
+			break;
+		default:
+			break;
+	}
+	foreach(cell, children)
+		bloompg_prepare_parallel_plan_node((Plan *) lfirst(cell),
+			children_below_gather);
+}
+
+void
+bloompg_prepare_parallel_plan(PlannedStmt *statement)
+{
+	ListCell *cell;
+
+	if (statement == NULL)
+		return;
+	bloompg_prepare_parallel_plan_node(statement->planTree, false);
+	foreach(cell, statement->subplans)
+		bloompg_prepare_parallel_plan_node((Plan *) lfirst(cell), false);
 }
 
 void

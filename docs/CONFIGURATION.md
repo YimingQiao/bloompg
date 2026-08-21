@@ -78,7 +78,6 @@ native PostgreSQL preview plan. The structured profile reports
 |---|---:|---|
 | `bloompg.p1_parallel_bias` | `on` | Let exact post-transfer cardinalities favor parallel P1 paths. |
 | `bloompg.p1_parallel_min_rows` | `10000` | Minimum exact rows before applying the parallel cost bias. |
-| `bloompg.p1_disable_nestloop` | `off` | Emergency guard that suppresses P1 nested loops. |
 | `bloompg.late_materialize` | `on` | Allow survivor-CTID materialization for wide relations. |
 | `bloompg.late_materialize_min_width` | `128B` | Projected-width threshold for TID mode. |
 

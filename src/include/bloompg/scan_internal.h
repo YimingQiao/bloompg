@@ -20,6 +20,12 @@ typedef enum BloomPGParallelStoreFormat
 	BLOOMPG_PARALLEL_STORE_COLUMNS
 } BloomPGParallelStoreFormat;
 
+typedef enum BloomPGParallelAccess
+{
+	BLOOMPG_PARALLEL_ACCESS_SHARED,
+	BLOOMPG_PARALLEL_ACCESS_REPLICATED
+} BloomPGParallelAccess;
+
 typedef struct BloomPGParallelColumnVector
 {
 	Oid			type_oid;
@@ -57,9 +63,16 @@ typedef struct BloomPGParallelStore
 typedef struct BloomPGParallelCursor
 {
 	uint64		chunk_index;
+	uint64		next_chunk;
 	uint32		selected_index;
 	bool		chunk_valid;
 } BloomPGParallelCursor;
+
+static inline void
+bloompg_parallel_cursor_reset(BloomPGParallelCursor *cursor)
+{
+	MemSet(cursor, 0, sizeof(*cursor));
+}
 
 typedef struct BloomPGApplyState
 {
@@ -83,6 +96,7 @@ typedef struct BloomPGMemoryState
 	BloomPGParallelCursor parallel_cursor;
 	Size		parallel_size;
 	bool		parallel_active;
+	BloomPGParallelAccess parallel_access;
 	bool		snapshot_reused;
 } BloomPGMemoryState;
 
@@ -100,6 +114,7 @@ typedef struct BloomPGTidState
 	BloomPGParallelCursor parallel_cursor;
 	Size		parallel_size;
 	bool		parallel_active;
+	BloomPGParallelAccess parallel_access;
 } BloomPGTidState;
 
 typedef struct BloomPGExecFilter
@@ -175,6 +190,7 @@ extern void bloompg_fill_parallel_store(
 	BloomPGRuntimeMaterializationEntry *entry,
 	BloomPGParallelStore *parallel_store, Size allocated);
 extern bool bloompg_parallel_next_column(BloomPGParallelStore *store,
-	BloomPGParallelCursor *cursor, TupleTableSlot *slot);
+	BloomPGParallelCursor *cursor, TupleTableSlot *slot,
+	BloomPGParallelAccess access);
 
 #endif

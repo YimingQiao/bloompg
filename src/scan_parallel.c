@@ -341,7 +341,8 @@ bloompg_parallel_validate_column_chunk(BloomPGParallelStore *store,
 
 bool
 bloompg_parallel_next_column(BloomPGParallelStore *store,
-	BloomPGParallelCursor *cursor, TupleTableSlot *slot)
+	BloomPGParallelCursor *cursor, TupleTableSlot *slot,
+	BloomPGParallelAccess access)
 {
 	char *base = (char *) store;
 	BloomPGParallelColumnChunk *chunk;
@@ -356,7 +357,9 @@ bloompg_parallel_next_column(BloomPGParallelStore *store,
 	{
 		if (!cursor->chunk_valid)
 		{
-			cursor->chunk_index = pg_atomic_fetch_add_u64(&store->next_item, 1);
+			cursor->chunk_index = access == BLOOMPG_PARALLEL_ACCESS_SHARED ?
+				pg_atomic_fetch_add_u64(&store->next_item, 1) :
+				cursor->next_chunk++;
 			if (cursor->chunk_index >= store->chunks)
 				return false;
 			cursor->selected_index = 0;

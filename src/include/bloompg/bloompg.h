@@ -23,7 +23,6 @@ extern bool bloompg_log_transfer_steps;
 extern bool bloompg_profile_enabled;
 extern bool bloompg_profile_log;
 extern bool bloompg_replan_after_transfer;
-extern bool bloompg_p1_disable_nestloop;
 extern bool bloompg_p1_parallel_bias;
 extern int bloompg_p1_parallel_min_rows;
 extern bool bloompg_late_materialize;

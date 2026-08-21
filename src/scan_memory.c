@@ -110,10 +110,15 @@ bloompg_begin_memory(CustomScanState *custom_state, EState *estate, int eflags)
 	CustomScan *scan = castNode(CustomScan, custom_state->ss.ps.plan);
 	List *metadata = scan->custom_private;
 
-	if (list_length(metadata) != 2)
+	if (list_length(metadata) != 3)
 		elog(ERROR, "invalid bloompg memory metadata");
 	state->token = strtoull(strVal(list_nth(metadata, 0)), NULL, 10);
 	state->planned_rows = strtoull(strVal(list_nth(metadata, 1)), NULL, 10);
+	state->parallel_access =
+		(BloomPGParallelAccess) intVal(list_nth(metadata, 2));
+	if (state->parallel_access != BLOOMPG_PARALLEL_ACCESS_SHARED &&
+		state->parallel_access != BLOOMPG_PARALLEL_ACCESS_REPLICATED)
+		elog(ERROR, "invalid bloompg parallel memory access mode");
 	state->entry = bloompg_runtime_find_materialization(state->token,
 										 estate->es_snapshot);
 	if (state->entry != NULL && state->entry->store != NULL)
@@ -142,7 +147,7 @@ bloompg_exec_memory(CustomScanState *custom_state)
 	if (state->parallel_store != NULL && state->parallel_store->available)
 	{
 		if (!bloompg_parallel_next_column(state->parallel_store,
-			&state->parallel_cursor, scan_slot))
+			&state->parallel_cursor, scan_slot, state->parallel_access))
 			return NULL;
 		if (custom_state->ss.ps.ps_ProjInfo != NULL)
 		{
@@ -212,7 +217,7 @@ bloompg_initialize_memory_dsm(CustomScanState *custom_state,
 		(BloomPGParallelStore *) coordinate, state->parallel_size);
 	state->parallel_store = (BloomPGParallelStore *) coordinate;
 	state->parallel_active = state->parallel_store->available;
-	state->parallel_cursor.chunk_valid = false;
+	bloompg_parallel_cursor_reset(&state->parallel_cursor);
 	if (bloompg_log_transfer_steps)
 		elog(LOG, "bloompg parallel memory DSM end token=" UINT64_FORMAT,
 			state->token);
@@ -228,9 +233,10 @@ bloompg_reinitialize_memory_dsm(CustomScanState *custom_state,
 	BloomPGMemoryState *state = (BloomPGMemoryState *) custom_state;
 
 	(void) pcxt;
-	if (parallel_store->available)
+	if (parallel_store->available &&
+		state->parallel_access == BLOOMPG_PARALLEL_ACCESS_SHARED)
 		pg_atomic_write_u64(&parallel_store->next_item, 0);
-	state->parallel_cursor.chunk_valid = false;
+	bloompg_parallel_cursor_reset(&state->parallel_cursor);
 }
 
 static void
@@ -255,7 +261,7 @@ bloompg_initialize_memory_worker(CustomScanState *custom_state,
 	}
 	state->parallel_store = parallel_store;
 	state->parallel_active = true;
-	state->parallel_cursor.chunk_valid = false;
+	bloompg_parallel_cursor_reset(&state->parallel_cursor);
 }
 
 static void
@@ -279,8 +285,13 @@ bloompg_rescan_memory(CustomScanState *custom_state)
 	BloomPGMemoryState *state = (BloomPGMemoryState *) custom_state;
 
 	if (state->parallel_store != NULL && state->parallel_store->available)
-		/* Shared state is reset by ReInitializeDSMCustomScan before workers start. */
-		state->parallel_cursor.chunk_valid = false;
+	{
+		if (state->parallel_access == BLOOMPG_PARALLEL_ACCESS_REPLICATED)
+			bloompg_parallel_cursor_reset(&state->parallel_cursor);
+		else
+			/* Shared state is reset by ReInitializeDSMCustomScan before workers start. */
+			state->parallel_cursor.chunk_valid = false;
+	}
 	else if (state->entry != NULL)
 		bloompg_column_store_rescan(&state->store_scan);
 	else if (state->fallback_state != NULL)
@@ -302,7 +313,10 @@ bloompg_explain_memory(CustomScanState *custom_state,
 									state->planned_rows), explain);
 	ExplainPropertyText("Snapshot Reuse",
 							state->parallel_active ?
-							"parallel DSM" : state->snapshot_reused ? "true" : "fallback",
+							(state->parallel_access ==
+							 BLOOMPG_PARALLEL_ACCESS_REPLICATED ?
+							 "parallel DSM (replicated)" : "parallel DSM (shared)") :
+							state->snapshot_reused ? "true" : "fallback",
 							explain);
 }
 
@@ -319,6 +333,8 @@ bloompg_explain_empty(CustomScanState *custom_state,
 	ExplainPropertyInteger("Materialization Token", NULL,
 		(int64) state->token, explain);
 	ExplainPropertyText("Snapshot Reuse",
-		state->parallel_active ? "parallel DSM" :
+		state->parallel_active ?
+		(state->parallel_access == BLOOMPG_PARALLEL_ACCESS_REPLICATED ?
+		 "parallel DSM (replicated)" : "parallel DSM (shared)") :
 		state->snapshot_reused ? "true" : "fallback", explain);
 }
