@@ -39,6 +39,28 @@ index-assisted transfer materialization is disabled for this table.
 
 BloomPG currently requires PostgreSQL 18 server headers and PGXS.
 
+### Docker quickstart
+
+Build PostgreSQL 18 with BloomPG, create a small analytical schema, and compare
+the same four-table query with native PostgreSQL and BloomPG:
+
+```bash
+docker compose up --build --abort-on-container-exit --exit-code-from demo demo
+```
+
+The demo prepares BloomPG's reusable table samples, then prints both complete
+query timings and BloomPG's transfer trace. The query intentionally fixes a
+poor left-deep join order whose selective relation appears last, illustrating
+the multi-join analytical plans BloomPG targets. Remove the demo database
+afterward with `docker compose down --volumes`. To open an interactive SQL
+prompt while the database is running, use:
+
+```bash
+docker compose exec db psql -U postgres -d bloompg_demo
+```
+
+### Build from source
+
 ```bash
 make PG_CONFIG=/path/to/postgresql-18/bin/pg_config
 make PG_CONFIG=/path/to/postgresql-18/bin/pg_config install

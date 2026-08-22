@@ -1,0 +1,12 @@
+.git
+.github
+.ruff_cache
+benchmark_results
+dist
+results
+test/results
+**/__pycache__
+**/*.bc
+**/*.o
+*.pyc
+**/*.so

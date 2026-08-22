@@ -1,0 +1,42 @@
+services:
+  db:
+    build: .
+    environment:
+      POSTGRES_DB: bloompg_demo
+      POSTGRES_PASSWORD: bloompg
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=bloompg
+      - -c
+      - max_worker_processes=16
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_workers_per_gather=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bloompg_demo"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    volumes:
+      - bloompg-data:/var/lib/postgresql
+
+  demo:
+    image: postgres:18-bookworm
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: bloompg
+    command:
+      - psql
+      - --host=db
+      - --username=postgres
+      - --dbname=bloompg_demo
+      - --file=/demo/query.sql
+    volumes:
+      - ./examples/docker-query.sql:/demo/query.sql:ro
+
+volumes:
+  bloompg-data:

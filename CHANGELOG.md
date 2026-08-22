@@ -4,6 +4,8 @@ All notable changes to BloomPG are documented here.
 
 ## Unreleased
 
+## 0.1.2 - 2026-08-22
+
 - Let the optimizer's internal subtransaction own cleanup of detached
   executors interrupted by an error. Calling `ExecutorEnd` before
   `ExecutorFinish` violated PostgreSQL's executor lifecycle under assertion
@@ -14,9 +16,6 @@ All notable changes to BloomPG are documented here.
 - Skip InitPlan-dependent qualifiers in the lightweight sampling executor;
   exact materialization still evaluates them after PostgreSQL has populated
   their internal executor parameters.
-
-## 0.1.2 - 2026-08-17
-
 - Parallelize eligible transfer scans with relation-sized worker groups and
   preserve relation-local parallelism when an unrelated SubLink restricts the
   outer query.
