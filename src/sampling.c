@@ -764,14 +764,32 @@ bloompg_build_tid_sample(PlannedStmt *candidate, Index rti, Plan *scan,
 }
 
 /*
+ * An InitPlan leaves no SubPlan node behind in the qualifier itself: the
+ * SubPlan hangs off the Plan and the qualifier only references its output
+ * through a PARAM_EXEC Param.  contain_subplans() cannot see that, and the
+ * synthetic state below never fills es_param_exec_vals, so evaluating such a
+ * Param would dereference an absent parameter slot.
+ */
+static bool
+bloompg_exec_param_walker(Node *node, void *context)
+{
+	(void) context;
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return castNode(Param, node)->paramkind == PARAM_EXEC;
+	return expression_tree_walker(node, bloompg_exec_param_walker, NULL);
+}
+
+/*
  * A query-local sample workspace deliberately uses a lightweight synthetic
  * PlanState instead of starting a complete QueryDesc.  Such a state has no
  * es_subplanstates, so asking ExecInitQual() to initialize a SubPlan would
  * dereference an absent executor subplan list.  Subquery predicates are safe
  * to omit here: sampling only controls estimates and cascade scheduling, while
  * the formal materialization scan executes the original plan (including every
- * SubPlan) under the current snapshot.  Keep independent top-level conjuncts
- * so column/local selectivity remains useful whenever possible.
+ * SubPlan and InitPlan) under the current snapshot.  Keep independent top-level
+ * conjuncts so column/local selectivity remains useful whenever possible.
  */
 static List *
 bloompg_sampling_safe_quals(List *quals)
@@ -783,8 +801,10 @@ bloompg_sampling_safe_quals(List *quals)
 	{
 		Node *qual = lfirst(cell);
 
-		if (!contain_subplans(qual))
-			result = lappend(result, qual);
+		if (contain_subplans(qual) ||
+			bloompg_exec_param_walker(qual, NULL))
+			continue;
+		result = lappend(result, qual);
 	}
 	return result;
 }

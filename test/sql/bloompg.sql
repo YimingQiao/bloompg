@@ -319,7 +319,26 @@ CALL assert_same('prepared_sample',
     'SELECT count(*) FROM a JOIN b ON a.k = b.k WHERE a.keep');
 CALL assert_same('prepared_subplan_qual',
     'SELECT count(*) FROM a JOIN b ON a.k = b.k WHERE a.keep AND b.k NOT IN (SELECT c.k FROM c WHERE c.flag)');
+SET bloompg.profile = on;
+SET bloompg.profile_log = off;
+CALL assert_same('prepared_initplan_qual',
+    'SELECT count(*) FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k WHERE a.keep AND c.flag AND a.k2 <= (SELECT max(c2.k2) FROM c AS c2 WHERE c2.flag)');
 SET bloompg.enable = on;
+SELECT count(*) > 0 AS prepared_initplan_query_ok
+FROM a
+JOIN b ON a.k = b.k
+JOIN c ON b.k = c.k
+WHERE a.keep
+  AND c.flag
+  AND a.k2 <= (SELECT max(c2.k2) FROM c AS c2 WHERE c2.flag);
+SELECT bloompg_last_profile()->>'status' = 'complete'
+   AND (bloompg_last_profile()->'transfer'->'summary'
+        ->>'applied')::boolean
+   AND jsonb_array_length(
+        bloompg_last_profile()->'transfer'->'steps') > 0
+    AS prepared_initplan_transfer_ok;
+SET bloompg.profile = off;
+RESET bloompg.profile_log;
 SELECT count(*) > 0 AS prepared_sample_query_ok
 FROM a JOIN b ON a.k = b.k
 WHERE a.keep;

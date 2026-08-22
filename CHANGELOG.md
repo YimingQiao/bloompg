@@ -11,6 +11,9 @@ All notable changes to BloomPG are documented here.
   failed executor.
 - Size equality-domain and transfer matrices with PostgreSQL's checked `Size`
   arithmetic so relation-count products cannot overflow before allocation.
+- Skip InitPlan-dependent qualifiers in the lightweight sampling executor;
+  exact materialization still evaluates them after PostgreSQL has populated
+  their internal executor parameters.
 
 ## 0.1.2 - 2026-08-17
 
