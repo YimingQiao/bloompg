@@ -429,12 +429,22 @@ bloompg_profile_executor_run(QueryDesc *query_desc, ScanDirection direction,
 
 	if (active != NULL)
 		INSTR_TIME_SET_CURRENT(started);
-	bloompg_profile_call_run(query_desc, direction, count);
-	if (active != NULL)
+	PG_TRY();
 	{
-		active->run_ms += bloompg_profile_elapsed_ms(started);
-		active->run_calls++;
+		bloompg_profile_call_run(query_desc, direction, count);
+		if (active != NULL)
+		{
+			active->run_ms += bloompg_profile_elapsed_ms(started);
+			active->run_calls++;
+		}
 	}
+	PG_CATCH();
+	{
+		if (active != NULL)
+			bloompg_profile_remove_active(active);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -445,12 +455,22 @@ bloompg_profile_executor_finish(QueryDesc *query_desc)
 
 	if (active != NULL)
 		INSTR_TIME_SET_CURRENT(started);
-	bloompg_profile_call_finish(query_desc);
-	if (active != NULL)
+	PG_TRY();
 	{
-		active->finish_ms += bloompg_profile_elapsed_ms(started);
-		active->finish_calls++;
+		bloompg_profile_call_finish(query_desc);
+		if (active != NULL)
+		{
+			active->finish_ms += bloompg_profile_elapsed_ms(started);
+			active->finish_calls++;
+		}
 	}
+	PG_CATCH();
+	{
+		if (active != NULL)
+			bloompg_profile_remove_active(active);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static void

@@ -746,13 +746,7 @@ bloompg_build_tid_sample(PlannedStmt *candidate, Index rti, Plan *scan,
 	}
 	PG_CATCH();
 	{
-		if (query_desc != NULL)
-		{
-			if (query_desc->estate != NULL)
-				ExecutorEnd(query_desc);
-			FreeQueryDesc(query_desc);
-		}
-		receiver->receiver.rDestroy((DestReceiver *) receiver);
+		/* The optimizer subtransaction abort owns failed executor cleanup. */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1707,14 +1701,7 @@ bloompg_sample_relation(PlannedStmt *candidate,
 	}
 	PG_CATCH();
 	{
-		if (query_desc != NULL)
-		{
-			if (query_desc->estate != NULL)
-				ExecutorEnd(query_desc);
-			FreeQueryDesc(query_desc);
-		}
-		if (receiver != NULL)
-			receiver->rDestroy(receiver);
+		/* The optimizer subtransaction abort owns failed executor cleanup. */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

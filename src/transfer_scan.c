@@ -198,13 +198,9 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 	}
 	PG_CATCH();
 	{
-		if (query_desc != NULL)
-		{
-			if (query_desc->estate != NULL)
-				ExecutorEnd(query_desc);
-			FreeQueryDesc(query_desc);
-		}
-		receiver->receiver.rDestroy((DestReceiver *) receiver);
+		/* The surrounding optimizer subtransaction owns an executor that
+		 * failed before ExecutorFinish.  Its abort releases the EState,
+		 * snapshots, receiver, and workers; ExecutorEnd is not legal here. */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -443,7 +439,6 @@ bloompg_execute_prefiltered_base_scan(BloomPGRelationState *state,
 	SeqScanState *scan_state;
 	TableScanDesc scan_descriptor;
 	TupleTableSlot *scan_slot;
-	bool receiver_started = false;
 	bool local_first;
 	double local_fraction;
 	double transfer_fraction;
@@ -509,7 +504,6 @@ bloompg_execute_prefiltered_base_scan(BloomPGRelationState *state,
 		query_desc->estate->es_direction = ForwardScanDirection;
 		receiver->receiver.rStartup((DestReceiver *) receiver,
 			query_desc->operation, query_desc->tupDesc);
-		receiver_started = true;
 
 		/* An exact empty build cannot match, so it is safe to avoid touching
 		 * the heap (and any local expressions) altogether. */
@@ -554,7 +548,6 @@ bloompg_execute_prefiltered_base_scan(BloomPGRelationState *state,
 
 scan_complete:
 		receiver->receiver.rShutdown((DestReceiver *) receiver);
-		receiver_started = false;
 		ExecutorFinish(query_desc);
 		ExecutorEnd(query_desc);
 		FreeQueryDesc(query_desc);
@@ -566,15 +559,8 @@ scan_complete:
 	}
 	PG_CATCH();
 	{
-		if (receiver_started)
-			receiver->receiver.rShutdown((DestReceiver *) receiver);
-		if (query_desc != NULL)
-		{
-			if (query_desc->estate != NULL)
-				ExecutorEnd(query_desc);
-			FreeQueryDesc(query_desc);
-		}
-		receiver->receiver.rDestroy((DestReceiver *) receiver);
+		/* See bloompg_run_source_statement(): subtransaction abort is the
+		 * only safe cleanup for an executor interrupted by ERROR. */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

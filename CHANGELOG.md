@@ -2,6 +2,14 @@
 
 All notable changes to BloomPG are documented here.
 
+## Unreleased
+
+- Let the optimizer's internal subtransaction own cleanup of detached
+  executors interrupted by an error. Calling `ExecutorEnd` before
+  `ExecutorFinish` violated PostgreSQL's executor lifecycle under assertion
+  builds; fallback now rolls the subtransaction back without touching the
+  failed executor.
+
 ## 0.1.2 - 2026-08-17
 
 - Parallelize eligible transfer scans with relation-sized worker groups and

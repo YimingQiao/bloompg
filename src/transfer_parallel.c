@@ -545,13 +545,7 @@ bloompg_execute_parallel_batch(BloomPGRelationState *source,
 	}
 	PG_CATCH();
 	{
-		if (query_desc != NULL)
-		{
-			if (query_desc->estate != NULL)
-				ExecutorEnd(query_desc);
-			FreeQueryDesc(query_desc);
-		}
-		receiver->receiver.rDestroy((DestReceiver *) receiver);
+		/* The optimizer subtransaction abort owns failed executor cleanup. */
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

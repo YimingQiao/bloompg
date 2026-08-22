@@ -9,5 +9,8 @@ BreakBeforeBraces: Allman
 AlwaysBreakAfterReturnType: AllDefinitions
 PointerAlignment: Right
 DerivePointerAlignment: false
+SpaceAfterCStyleCast: true
+IndentGotoLabels: false
+AlignAfterOpenBracket: DontAlign
 SortIncludes: Never
 ...
