@@ -6,6 +6,8 @@ All notable changes to BloomPG are documented here.
 
 ## 0.1.2 - 2026-08-22
 
+- Add a PostgreSQL 18 Docker quickstart with an instant-sampling star-schema
+  comparison, plus metadata that improves PGXN discovery.
 - Let the optimizer's internal subtransaction own cleanup of detached
   executors interrupted by an error. Calling `ExecutorEnd` before
   `ExecutorFinish` violated PostgreSQL's executor lifecycle under assertion

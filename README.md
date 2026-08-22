@@ -41,17 +41,16 @@ BloomPG currently requires PostgreSQL 18 server headers and PGXS.
 
 ### Docker quickstart
 
-Build PostgreSQL 18 with BloomPG, create a small analytical schema, and compare
-the same four-table query with native PostgreSQL and BloomPG:
+Build PostgreSQL 18 with BloomPG, create a small star schema, and compare the
+same five-table analytical query with native PostgreSQL and BloomPG:
 
 ```bash
 docker compose up --build --abort-on-container-exit --exit-code-from demo demo
 ```
 
-The demo prepares BloomPG's reusable table samples, then prints both complete
-query timings and BloomPG's transfer trace. The query intentionally fixes a
-poor left-deep join order whose selective relation appears last, illustrating
-the multi-join analytical plans BloomPG targets. Remove the demo database
+The demo uses query-local instant sampling and prints both complete query
+timings and BloomPG's transfer trace for an ordinary five-table analytical
+query under PostgreSQL's default optimizer settings. Remove the demo database
 afterward with `docker compose down --volumes`. To open an interactive SQL
 prompt while the database is running, use:
 

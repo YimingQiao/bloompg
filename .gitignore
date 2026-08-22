@@ -16,3 +16,4 @@ test/regression.out
 
 # Benchmark output is local.  README carries only the release summary.
 benchmark_results/
+dist/
