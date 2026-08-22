@@ -50,8 +50,10 @@ jobs:
             --format=tar \
             --prefix="bloompg-${VERSION}/" \
             "${GITHUB_SHA}" | gzip -n > "${archive}"
-          tar -tzf "${archive}" | grep --quiet \
-            "^bloompg-${VERSION}/META.json$"
+          tar -tzf "${archive}" > "${RUNNER_TEMP}/archive-files.txt"
+          grep --fixed-strings --line-regexp --quiet \
+            "bloompg-${VERSION}/META.json" \
+            "${RUNNER_TEMP}/archive-files.txt"
           sha256sum "${archive}" > "${archive}.sha256"
 
       - name: Upload package artifact
