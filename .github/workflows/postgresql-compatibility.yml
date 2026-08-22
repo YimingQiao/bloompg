@@ -1,0 +1,154 @@
+name: PostgreSQL Compatibility
+
+"on":
+  workflow_dispatch:
+    inputs:
+      bloom_mode:
+        description: BloomPG mode for the PostgreSQL core regression suite
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - disabled
+          - enabled
+      postgres_ref:
+        description: Pinned PostgreSQL REL_18_4 commit
+        required: true
+        default: f5cc81719e6da4cbdb1f797c48b693e91018153a
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgresql-compatibility-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  assertions:
+    name: PostgreSQL 18 assertions (${{ inputs.bloom_mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      PGPORT: '55432'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Set test paths
+        run: |
+          echo "PGHOST=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          echo "PG_PREFIX=${RUNNER_TEMP}/postgresql-assert" >> "${GITHUB_ENV}"
+          echo "PGDATA=${RUNNER_TEMP}/pgdata-assert" >> "${GITHUB_ENV}"
+
+      - name: Validate PostgreSQL commit input
+        env:
+          POSTGRES_REF: ${{ inputs.postgres_ref }}
+        run: |
+          [[ "${POSTGRES_REF}" =~ ^[0-9a-f]{40}$ ]]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          repository: postgres/postgres
+          ref: ${{ inputs.postgres_ref }}
+          path: postgres
+
+      - name: Install PostgreSQL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            bison flex libipc-run-perl libreadline-dev zlib1g-dev
+
+      - name: Build assertion-enabled PostgreSQL
+        working-directory: postgres
+        run: |
+          ./configure \
+            --prefix="${PG_PREFIX}" \
+            --enable-cassert \
+            --enable-debug \
+            CFLAGS='-O0 -g3 -fno-omit-frame-pointer'
+          make -s -j2
+          make -s install
+          echo "${PG_PREFIX}/bin" >> "${GITHUB_PATH}"
+
+      - name: Build and install BloomPG
+        run: |
+          make -j2 PG_CONFIG="${PG_PREFIX}/bin/pg_config"
+          make install PG_CONFIG="${PG_PREFIX}/bin/pg_config"
+
+      - name: Start assertion server
+        run: |
+          "${PG_PREFIX}/bin/initdb" -D "${PGDATA}" --no-locale
+          {
+            echo "shared_preload_libraries = 'bloompg'"
+            echo 'max_worker_processes = 16'
+            echo 'max_parallel_workers = 8'
+            echo 'max_parallel_workers_per_gather = 4'
+          } >> "${PGDATA}/postgresql.conf"
+          "${PG_PREFIX}/bin/pg_ctl" \
+            -D "${PGDATA}" \
+            -l "${RUNNER_TEMP}/postgres-assert.log" \
+            -o "-k ${PGHOST} -p ${PGPORT}" -w start
+
+      - name: Verify assertion build and extension load
+        run: |
+          test "$(psql -XAt postgres -c 'SHOW debug_assertions')" = 'on'
+          psql -X -v ON_ERROR_STOP=1 postgres <<'SQL'
+          CREATE EXTENSION bloompg;
+          SELECT bloompg_version();
+          SQL
+
+      - name: Run BloomPG regression and unit tests
+        run: |
+          make installcheck \
+            PG_CONFIG="${PG_PREFIX}/bin/pg_config" \
+            PGHOST="${PGHOST}" PGPORT="${PGPORT}"
+          make pythoncheck PG_CONFIG="${PG_PREFIX}/bin/pg_config"
+
+      - name: Run PostgreSQL core regression with BloomPG preloaded
+        env:
+          BLOOM_MODE: ${{ inputs.bloom_mode }}
+        run: |
+          set -euo pipefail
+          run_suite() {
+            local label="$1"
+            local enabled="$2"
+            dropdb --if-exists regression
+            if ! PGOPTIONS="-c bloompg.enable=${enabled}" \
+              make -C postgres/src/test/regress installcheck; then
+              test ! -f postgres/src/test/regress/regression.diffs || \
+                cp postgres/src/test/regress/regression.diffs \
+                  "${RUNNER_TEMP}/postgresql-${label}.diffs"
+              return 1
+            fi
+          }
+          case "${BLOOM_MODE}" in
+            both)
+              run_suite disabled off
+              run_suite enabled on
+              ;;
+            disabled)
+              run_suite disabled off
+              ;;
+            enabled)
+              run_suite enabled on
+              ;;
+          esac
+
+      - name: Stop assertion server
+        if: always()
+        run: |
+          test ! -d "${PGDATA}" || \
+            "${PG_PREFIX}/bin/pg_ctl" \
+              -D "${PGDATA}" -m immediate -w stop || true
+
+      - name: Upload compatibility diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgresql-compatibility-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/postgres-assert.log
+            ${{ runner.temp }}/postgresql-*.diffs
+            test/regression.diffs

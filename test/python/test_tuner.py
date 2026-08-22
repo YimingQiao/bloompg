@@ -2,7 +2,6 @@ import importlib.util
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "bloompg_tune", ROOT / "scripts" / "bloompg_tune.py"
@@ -24,9 +23,7 @@ class TuningTests(unittest.TestCase):
             active_operators=8,
             storage="ssd",
         )
-        self.assertEqual(
-            result["bloompg"]["bloompg.materialization_memory"], "512MB"
-        )
+        self.assertEqual(result["bloompg"]["bloompg.materialization_memory"], "512MB")
 
 
 if __name__ == "__main__":

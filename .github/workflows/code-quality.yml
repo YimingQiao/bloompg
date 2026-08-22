@@ -1,0 +1,201 @@
+name: Code Quality
+
+"on":
+  push:
+    paths:
+      - '.clang-format'
+      - '.github/workflows/code-quality.yml'
+      - 'Makefile'
+      - 'META.json'
+      - 'bloompg.control'
+      - 'pyproject.toml'
+      - 'scripts/**'
+      - 'src/**'
+      - 'test/**'
+  pull_request:
+    paths:
+      - '.clang-format'
+      - '.github/workflows/code-quality.yml'
+      - 'Makefile'
+      - 'META.json'
+      - 'bloompg.control'
+      - 'pyproject.toml'
+      - 'scripts/**'
+      - 'src/**'
+      - 'test/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format and metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install format tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-format python3-venv
+          python3 -m venv "${RUNNER_TEMP}/quality-venv"
+          "${RUNNER_TEMP}/quality-venv/bin/pip" install ruff==0.12.9
+
+      - name: Check Python
+        run: |
+          "${RUNNER_TEMP}/quality-venv/bin/ruff" format --check scripts test/python
+          "${RUNNER_TEMP}/quality-venv/bin/ruff" check scripts test/python
+          python3 -m compileall -q scripts test/python
+
+      - name: Check release metadata
+        run: python3 scripts/validate_release.py
+
+      - name: Check changed C formatting
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == 'pull_request' ]]; then
+            base_sha="${PR_BASE}"
+          elif [[ -n "${PUSH_BASE}" && ! "${PUSH_BASE}" =~ ^0+$ ]]; then
+            base_sha="${PUSH_BASE}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base_sha='HEAD^'
+          else
+            echo 'No parent commit; skipping incremental C format check'
+            exit 0
+          fi
+          if git diff --quiet "${base_sha}" HEAD -- 'src/*.c' 'src/include/**/*.h'; then
+            echo 'No C source changes'
+            exit 0
+          fi
+          format_diff="$(
+            git clang-format --diff --extensions c,h \
+              "${base_sha}" HEAD -- src
+          )"
+          if grep -q '^diff --git ' <<< "${format_diff}"; then
+            echo "${format_diff}"
+            echo 'Run git clang-format on the changed lines.' >&2
+            exit 1
+          fi
+
+  codeql:
+    name: CodeQL C analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install PostgreSQL 18 headers
+        run: |
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-server-dev-18
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4c0873ef8656cb3c50b3f42fb63bc1ade0cfa827 # v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - name: Build extension for analysis
+        run: make -j2 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@4c0873ef8656cb3c50b3f42fb63bc1ade0cfa827 # v4
+
+  sanitizers:
+    name: ASAN and UBSAN
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install PostgreSQL 18
+        run: |
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-18 postgresql-server-dev-18
+
+      - name: Build and install instrumented extension
+        run: |
+          sanitizer_flags='-O1 -g3 -fno-omit-frame-pointer -fsanitize=address,undefined'
+          warning_flags='-std=gnu11 -Wall -Wextra -Werror=vla -Wno-clobbered'
+          make -j2 \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            PG_CFLAGS="${warning_flags} ${sanitizer_flags}" \
+            LDFLAGS='-fsanitize=address,undefined' \
+            SHLIB_LINK='-fsanitize=address,undefined'
+          sudo make install \
+            PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+            PG_CFLAGS="${warning_flags} ${sanitizer_flags}" \
+            LDFLAGS='-fsanitize=address,undefined' \
+            SHLIB_LINK='-fsanitize=address,undefined'
+          readelf -d /usr/lib/postgresql/18/lib/bloompg.so \
+            | grep --quiet 'libasan'
+          readelf -d /usr/lib/postgresql/18/lib/bloompg.so \
+            | grep --quiet 'libubsan'
+
+      - name: Start sanitizer server
+        run: |
+          /usr/lib/postgresql/18/bin/initdb \
+            -D "${RUNNER_TEMP}/pgdata" --no-locale
+          {
+            echo "shared_preload_libraries = 'bloompg'"
+            echo 'max_worker_processes = 16'
+            echo 'max_parallel_workers = 8'
+            echo 'max_parallel_workers_per_gather = 4'
+          } >> "${RUNNER_TEMP}/pgdata/postgresql.conf"
+          export ASAN_OPTIONS='abort_on_error=1:detect_leaks=0:detect_stack_use_after_return=1:strict_string_checks=1'
+          export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'
+          export LD_PRELOAD
+          LD_PRELOAD="$(gcc -print-file-name=libasan.so)"
+          /usr/lib/postgresql/18/bin/pg_ctl \
+            -D "${RUNNER_TEMP}/pgdata" \
+            -l "${RUNNER_TEMP}/postgres-sanitizer.log" \
+            -o "-k ${RUNNER_TEMP} -p 55432" -w start
+
+      - name: Regression and Python tests
+        env:
+          PGHOST: ${{ runner.temp }}
+          PGPORT: '55432'
+        run: |
+          make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          make pythoncheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+
+      - name: Stop test server
+        if: always()
+        run: |
+          test ! -d "${RUNNER_TEMP}/pgdata" || \
+            /usr/lib/postgresql/18/bin/pg_ctl \
+              -D "${RUNNER_TEMP}/pgdata" -m immediate -w stop || true
+
+      - name: Upload sanitizer diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sanitizer-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/postgres-sanitizer.log
+            test/regression.diffs

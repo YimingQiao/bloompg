@@ -1,0 +1,13 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+ColumnLimit: 80
+IndentWidth: 4
+TabWidth: 4
+UseTab: AlignWithSpaces
+BreakBeforeBraces: Allman
+AlwaysBreakAfterReturnType: AllDefinitions
+PointerAlignment: Right
+DerivePointerAlignment: false
+SortIncludes: Never
+...

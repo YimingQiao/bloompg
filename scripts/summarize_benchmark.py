@@ -37,7 +37,9 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def load(path: Path) -> list[dict]:
     records: list[dict] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         try:
             record = json.loads(line)
         except json.JSONDecodeError as error:
@@ -58,7 +60,9 @@ def summarize(records: list[dict]) -> dict:
     result: dict = {
         "queries": len(records),
         "valid_pairs": len(valid),
-        "result_matches": sum(record.get("results_match") is True for record in records),
+        "result_matches": sum(
+            record.get("results_match") is True for record in records
+        ),
         "invalid": [
             {
                 "query": record.get("query"),
@@ -75,7 +79,8 @@ def summarize(records: list[dict]) -> dict:
     total_base = sum(record["base"]["median_ms"] for record in valid)
     total_bloom = sum(record["bloom"]["median_ms"] for record in valid)
     profiled = [
-        record for record in valid
+        record
+        for record in valid
         if isinstance(record.get("bloom", {}).get("profile_ms"), dict)
     ]
     phase_names = ("planning", "transfer", "p1", "execution")
@@ -147,14 +152,20 @@ def main() -> int:
                 f"execution={phases['execution']:.3f}ms"
             )
         count = min(args.show, len(summary["ranked"]))
-        print("lowest " + " ".join(
-            f"{item['query']}={item['speedup']:.3f}x"
-            for item in summary["ranked"][:count]
-        ))
-        print("highest " + " ".join(
-            f"{item['query']}={item['speedup']:.3f}x"
-            for item in summary["ranked"][-count:]
-        ))
+        print(
+            "lowest "
+            + " ".join(
+                f"{item['query']}={item['speedup']:.3f}x"
+                for item in summary["ranked"][:count]
+            )
+        )
+        print(
+            "highest "
+            + " ".join(
+                f"{item['query']}={item['speedup']:.3f}x"
+                for item in summary["ranked"][-count:]
+            )
+        )
     if summary["invalid"]:
         print("invalid " + json.dumps(summary["invalid"], sort_keys=True))
     return 0

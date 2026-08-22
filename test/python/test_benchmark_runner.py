@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "run_pg_benchmark", ROOT / "scripts" / "run_pg_benchmark.py"

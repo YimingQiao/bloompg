@@ -1,0 +1,76 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Validate and package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Validate release metadata and tag
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          arguments=()
+          if [[ "${REF_TYPE}" == 'tag' ]]; then
+            arguments+=(--tag "${REF_NAME}")
+          fi
+          python3 scripts/validate_release.py "${arguments[@]}"
+          version="$(python3 scripts/validate_release.py --print-version)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build source package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="dist/bloompg-${VERSION}.tar.gz"
+          git archive \
+            --format=tar \
+            --prefix="bloompg-${VERSION}/" \
+            "${GITHUB_SHA}" | gzip -n > "${archive}"
+          tar -tzf "${archive}" | grep --quiet \
+            "^bloompg-${VERSION}/META.json$"
+          sha256sum "${archive}" > "${archive}.sha256"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bloompg-${{ steps.version.outputs.version }}-source
+          if-no-files-found: error
+          path: dist
+
+      - name: Publish tagged release assets
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --title "BloomPG ${TAG#v}" \
+              --generate-notes
+          fi
+          gh release upload "${TAG}" dist/* --clobber

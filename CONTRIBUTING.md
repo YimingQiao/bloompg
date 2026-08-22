@@ -54,6 +54,29 @@ workers.
 Sampling estimates are never correctness evidence. A test that only checks an
 `EXPLAIN` shape is not a substitute for result equivalence.
 
+## Automated checks
+
+The regular CI builds PostgreSQL 18 packages, runs the extension regression
+suite and Python tests, and exercises the SQL upgrade path. Source changes also
+run Ruff, incremental clang-format checks, CodeQL, and the regression suite
+with an ASAN/UBSAN-instrumented BloomPG library.
+
+Before pushing Python changes, run:
+
+```bash
+ruff format scripts test/python
+ruff check scripts test/python
+```
+
+Use `git clang-format` on changed C lines. Existing PostgreSQL-style source is
+not mechanically reformatted as a whole.
+
+The manually dispatched PostgreSQL Compatibility workflow builds the pinned
+PostgreSQL 18 source with assertions, runs BloomPG's tests, and then runs the
+PostgreSQL core regression suite with BloomPG preloaded and enabled/disabled.
+The Release workflow checks all version declarations and upgrade paths before
+creating a reproducible source archive and checksum for a `v*` tag.
+
 ## Performance protocol
 
 The benchmark runner records effective settings, alternates mode order, warms

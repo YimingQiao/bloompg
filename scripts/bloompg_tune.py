@@ -14,7 +14,6 @@ import os
 import sys
 from pathlib import Path
 
-
 KIB = 1024
 MIB = 1024 * KIB
 GIB = 1024 * MIB
@@ -144,9 +143,7 @@ def recommend(
     work_mem = executor_pool // concurrency // active_operators
     work_mem = floor_to(clamp(work_mem, 64 * MIB, 512 * MIB), 16 * MIB)
 
-    maintenance_work_mem = floor_to(
-        clamp(memory // 16, 512 * MIB, 4 * GIB), 256 * MIB
-    )
+    maintenance_work_mem = floor_to(clamp(memory // 16, 512 * MIB, 4 * GIB), 256 * MIB)
 
     # BloomPG enforces this once across every materialization and parallel DSM
     # copy owned by a query.  Concurrent analytical backends share a 50% pool.
@@ -169,9 +166,7 @@ def recommend(
     max_parallel_workers = max(
         1, min(desired_parallel_capacity, max(cpus - background_worker_reserve, 1))
     )
-    max_worker_processes = max(
-        8, max_parallel_workers + background_worker_reserve
-    )
+    max_worker_processes = max(8, max_parallel_workers + background_worker_reserve)
     max_parallel_workers_per_gather = transfer_workers
 
     postgres = {
@@ -228,8 +223,13 @@ def render_conf(result: dict) -> str:
     lines.extend(f"{key} = '{value}'" for key, value in result["postgresql"].items())
     lines.extend(("", "# BloomPG settings"))
     lines.extend(f"{key} = '{value}'" for key, value in result["bloompg"].items())
-    lines.extend(("", "# Add bloompg to, rather than replace, existing preload libraries:",
-                  "# shared_preload_libraries = '...,bloompg'"))
+    lines.extend(
+        (
+            "",
+            "# Add bloompg to, rather than replace, existing preload libraries:",
+            "# shared_preload_libraries = '...,bloompg'",
+        )
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -251,7 +251,9 @@ def render_text(result: dict, source: str) -> str:
     lines.extend(("", "Notes:"))
     lines.extend(f"  - {note}" for note in result["notes"])
     lines.append("")
-    lines.append("No settings were changed. Use --format conf --output PATH after review.")
+    lines.append(
+        "No settings were changed. Use --format conf --output PATH after review."
+    )
     return "\n".join(lines) + "\n"
 
 

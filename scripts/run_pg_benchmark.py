@@ -19,7 +19,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PSQL = ROOT.parent / ".pg18" / "bin" / "psql"
 TIMING_RE = re.compile(r"^Time:\s+([0-9]+(?:\.[0-9]+)?)\s+ms(?:\s|$)")
@@ -312,9 +311,7 @@ def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
     script = (
         f"SET statement_timeout = {args.statement_timeout_ms};\n"
         "\\pset pager off\n"
-        "\\timing on\n"
-        + terminate_sql(query_sql) * repetitions
-        + profile_suffix
+        "\\timing on\n" + terminate_sql(query_sql) * repetitions + profile_suffix
     )
     mode = "bloom" if enabled else "base"
     env = os.environ.copy()
@@ -359,9 +356,7 @@ def run_mode(args: argparse.Namespace, query_sql: str, enabled: bool) -> dict:
     profile = None
     profile_error = None
     if enabled and args.capture_profile and completed.returncode == 0:
-        query_stdout, profile, profile_error = split_profile_output(
-            completed.stdout
-        )
+        query_stdout, profile, profile_error = split_profile_output(completed.stdout)
     timings, results = parse_psql_output(query_stdout)
     record: dict = {
         "mode": mode,
@@ -507,7 +502,9 @@ def read_result_records(path: Path) -> list[dict]:
     records: list[dict] = []
     if not path.is_file():
         return records
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         try:
             record = json.loads(line)
         except json.JSONDecodeError as error:
@@ -526,7 +523,9 @@ def load_records(path: Path) -> dict[str, dict]:
     records: dict[str, dict] = {}
     if not path.is_file():
         raise SystemExit(f"reused base results not found: {path}")
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         try:
             record = json.loads(line)
             query = record["query"]
@@ -578,7 +577,9 @@ def discover_queries(args: argparse.Namespace, matcher: re.Pattern[str]) -> list
     if args.queries_per_group is not None:
         grouped: dict[Path, list[Path]] = {}
         for path in candidates:
-            grouped.setdefault(path.relative_to(args.queries_dir).parent, []).append(path)
+            grouped.setdefault(path.relative_to(args.queries_dir).parent, []).append(
+                path
+            )
         candidates = [
             path
             for group in sorted(grouped)
@@ -680,7 +681,9 @@ def main() -> int:
         if str(expected) != str(settings.get(name))
     }
     if mismatches:
-        raise SystemExit(f"effective benchmark settings do not match request: {mismatches}")
+        raise SystemExit(
+            f"effective benchmark settings do not match request: {mismatches}"
+        )
     if int(settings["max_worker_processes"]) < int(settings["max_parallel_workers"]):
         raise SystemExit(
             "max_worker_processes must be at least max_parallel_workers: "
