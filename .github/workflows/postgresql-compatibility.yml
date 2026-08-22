@@ -105,6 +105,11 @@ jobs:
             PGHOST="${PGHOST}" PGPORT="${PGPORT}"
           make pythoncheck PG_CONFIG="${PG_PREFIX}/bin/pg_config"
 
+      - name: Stop extension regression server
+        run: |
+          "${PG_PREFIX}/bin/pg_ctl" \
+            -D "${PGDATA}" -m fast -w stop
+
       - name: Run PostgreSQL core regression with BloomPG preloaded
         env:
           BLOOM_MODE: ${{ inputs.bloom_mode }}
@@ -113,14 +118,29 @@ jobs:
           run_suite() {
             local label="$1"
             local enabled="$2"
-            dropdb --if-exists regression
+            local data="${RUNNER_TEMP}/pgdata-core-${label}"
+            local log="${RUNNER_TEMP}/postgresql-${label}.log"
+            local status=0
+            "${PG_PREFIX}/bin/initdb" -D "${data}" --no-locale
+            {
+              echo "shared_preload_libraries = 'bloompg'"
+              echo 'max_worker_processes = 16'
+              echo 'max_parallel_workers = 8'
+              echo 'max_parallel_workers_per_gather = 4'
+            } >> "${data}/postgresql.conf"
+            "${PG_PREFIX}/bin/pg_ctl" \
+              -D "${data}" -l "${log}" \
+              -o "-k ${PGHOST} -p ${PGPORT}" -w start
             if ! PGOPTIONS="-c bloompg.enable=${enabled}" \
               make -C postgres/src/test/regress installcheck; then
               test ! -f postgres/src/test/regress/regression.diffs || \
                 cp postgres/src/test/regress/regression.diffs \
                   "${RUNNER_TEMP}/postgresql-${label}.diffs"
-              return 1
+              status=1
             fi
+            "${PG_PREFIX}/bin/pg_ctl" \
+              -D "${data}" -m immediate -w stop
+            return "${status}"
           }
           case "${BLOOM_MODE}" in
             both)
@@ -135,12 +155,16 @@ jobs:
               ;;
           esac
 
-      - name: Stop assertion server
+      - name: Ensure test servers are stopped
         if: always()
         run: |
-          test ! -d "${PGDATA}" || \
-            "${PG_PREFIX}/bin/pg_ctl" \
-              -D "${PGDATA}" -m immediate -w stop || true
+          for data in "${PGDATA}" "${RUNNER_TEMP}"/pgdata-core-*; do
+            if [[ -d "${data}" ]] && \
+              "${PG_PREFIX}/bin/pg_ctl" -D "${data}" status >/dev/null 2>&1; then
+              "${PG_PREFIX}/bin/pg_ctl" \
+                -D "${data}" -m immediate -w stop || true
+            fi
+          done
 
       - name: Upload compatibility diagnostics
         if: failure()
@@ -150,5 +174,6 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/postgres-assert.log
+            ${{ runner.temp }}/postgresql-*.log
             ${{ runner.temp }}/postgresql-*.diffs
             test/regression.diffs
