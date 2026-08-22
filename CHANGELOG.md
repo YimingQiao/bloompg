@@ -9,6 +9,8 @@ All notable changes to BloomPG are documented here.
   `ExecutorFinish` violated PostgreSQL's executor lifecycle under assertion
   builds; fallback now rolls the subtransaction back without touching the
   failed executor.
+- Size equality-domain and transfer matrices with PostgreSQL's checked `Size`
+  arithmetic so relation-count products cannot overflow before allocation.
 
 ## 0.1.2 - 2026-08-17
 

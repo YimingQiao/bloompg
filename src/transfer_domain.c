@@ -45,7 +45,7 @@ struct BloomPGEqualityDomain
 struct BloomPGEqualityDomains
 {
 	int			relation_count;
-	int			matrix_width;
+	Size		matrix_width;
 	BloomPGEqualityDomain **directions;
 	List	   *domains;
 	uint64		prepare_epoch;
@@ -151,11 +151,14 @@ bloompg_equality_domains_create(const BloomPGJoinGraph *graph,
 	BloomPGEqualityDomain **first_directions;
 	bool *root_valid;
 	int *direction_counts;
-	int maximum_members = Max(list_length(graph->edges) * 2, 1);
+	Size maximum_members = Max(
+		mul_size((Size) list_length(graph->edges), 2), (Size) 1);
 	int member_count = 0;
-	int matrix_width = relation_count + 1;
+	Size matrix_width = add_size((Size) relation_count, 1);
+	Size matrix_cells = mul_size(matrix_width, matrix_width);
 	ListCell *cell;
 	int member;
+	Size direction;
 
 	if (bloompg_transfer_progress_metric != BLOOMPG_TRANSFER_PROGRESS_NDV)
 		return NULL;
@@ -163,7 +166,7 @@ bloompg_equality_domains_create(const BloomPGJoinGraph *graph,
 	result->relation_count = relation_count;
 	result->matrix_width = matrix_width;
 	result->directions = palloc0_array(BloomPGEqualityDomain *,
-		matrix_width * matrix_width);
+		matrix_cells);
 	members = palloc0_array(BloomPGEqualityMember, maximum_members);
 	foreach(cell, graph->edges)
 	{
@@ -220,16 +223,16 @@ bloompg_equality_domains_create(const BloomPGJoinGraph *graph,
 	/* A transfer with more than one edge between the same pair is composite
 	 * and remains on the established edge path. */
 	first_directions = palloc0_array(BloomPGEqualityDomain *,
-		matrix_width * matrix_width);
-	direction_counts = palloc0_array(int, matrix_width * matrix_width);
+		matrix_cells);
+	direction_counts = palloc0_array(int, matrix_cells);
 	foreach(cell, graph->edges)
 	{
 		BloomPGJoinEdge *edge = lfirst(cell);
 		int left_member;
 		int root;
 		BloomPGEqualityDomain *domain;
-		int left_offset;
-		int right_offset;
+		Size left_offset;
+		Size right_offset;
 
 		if (!bloompg_domain_edge_eligible(edge))
 			continue;
@@ -245,10 +248,10 @@ bloompg_equality_domains_create(const BloomPGJoinGraph *graph,
 		if (direction_counts[right_offset]++ == 0)
 			first_directions[right_offset] = domain;
 	}
-	for (member = 0; member < matrix_width * matrix_width; member++)
+	for (direction = 0; direction < matrix_cells; direction++)
 	{
-		if (direction_counts[member] == 1)
-			result->directions[member] = first_directions[member];
+		if (direction_counts[direction] == 1)
+			result->directions[direction] = first_directions[direction];
 	}
 	pfree(direction_counts);
 	pfree(first_directions);

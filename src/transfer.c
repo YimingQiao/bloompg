@@ -429,7 +429,8 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	Bitmapset *main_plan_relids;
 	Bitmapset *used_subquery_relids = NULL;
 	int relation_count = list_length(candidate->rtable);
-	int matrix_width = relation_count + 1;
+	Size matrix_width = add_size((Size) relation_count, 1);
+	Size matrix_cells = mul_size(matrix_width, matrix_width);
 	int next_plan_node_id;
 	uint64 next_parallel_wave_id = 1;
 	ListCell *cell;
@@ -460,7 +461,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	PG_TRY();
 	{
 	states = palloc0_array(BloomPGRelationState *, matrix_width);
-	sent_lineage = palloc0_array(Bitmapset *, matrix_width * matrix_width);
+	sent_lineage = palloc0_array(Bitmapset *, matrix_cells);
 	main_plan_relids = bloompg_plan_relids(candidate->planTree);
 	foreach(cell, graph->tables)
 	{
