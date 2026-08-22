@@ -128,6 +128,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development and performance-test
 guidelines. Report security issues privately as described in
 [SECURITY.md](SECURITY.md).
 
+## Related projects
+
+Bloom, BloomPG, and Bloom for Apache DataFusion are sibling projects exploring
+robust predicate transfer across different query engines.
+
+- [Bloom](https://github.com/YimingQiao/bloom) — DuckDB extension.
+- [BloomPG](https://github.com/YimingQiao/bloompg) — PostgreSQL extension
+  (this repository).
+- [Bloom for Apache DataFusion](https://github.com/YimingQiao/datafusion-bloom)
+  — Apache DataFusion library.
+
 ## References
 
 - Yifei Yang, Hangdong Zhao, Xiangyao Yu, and Paraschos Koutris,
@@ -139,7 +150,6 @@ guidelines. Report security issues privately as described in
 - Yiming Qiao, Peter Boncz, and Huanchen Zhang,
   [*Robust Predicate Transfer with Dynamic Execution*](https://duckdb.org/library/robust-predicate-transfer-vldb/),
   PVLDB 2026.
-- [Bloom reference implementation for DuckDB](https://github.com/YimingQiao/bloom).
 
 ## License
 
