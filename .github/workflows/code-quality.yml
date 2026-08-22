@@ -3,7 +3,6 @@ name: Code Quality
 "on":
   push:
     paths:
-      - '.clang-format'
       - '.github/workflows/code-quality.yml'
       - 'Makefile'
       - 'META.json'
@@ -14,7 +13,6 @@ name: Code Quality
       - 'test/**'
   pull_request:
     paths:
-      - '.clang-format'
       - '.github/workflows/code-quality.yml'
       - 'Makefile'
       - 'META.json'
@@ -41,10 +39,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install format tools
+      - name: Install Python format tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang-format python3-venv
           python3 -m venv "${RUNNER_TEMP}/quality-venv"
           "${RUNNER_TEMP}/quality-venv/bin/pip" install ruff==0.12.9
 
@@ -57,34 +53,13 @@ jobs:
       - name: Check release metadata
         run: python3 scripts/validate_release.py
 
-      - name: Check changed C formatting
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE: ${{ github.event.before }}
+      - name: Check repository whitespace
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == 'pull_request' ]]; then
-            base_sha="${PR_BASE}"
-          elif [[ -n "${PUSH_BASE}" && ! "${PUSH_BASE}" =~ ^0+$ ]]; then
-            base_sha="${PUSH_BASE}"
-          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            base_sha='HEAD^'
-          else
-            echo 'No parent commit; skipping incremental C format check'
-            exit 0
-          fi
-          if git diff --quiet "${base_sha}" HEAD -- 'src/*.c' 'src/include/**/*.h'; then
-            echo 'No C source changes'
-            exit 0
-          fi
-          format_diff="$(
-            git clang-format --diff --extensions c,h \
-              "${base_sha}" HEAD -- src
-          )"
-          if grep -q '^diff --git ' <<< "${format_diff}"; then
-            echo "${format_diff}"
-            echo 'Run git clang-format on the changed lines.' >&2
+          if git grep -nI -E '[[:blank:]]+$' -- \
+            '*.c' '*.h' '*.py' '*.sql' '*.md' '*.yml' \
+            'Makefile' '*.control'; then
+            echo 'Trailing whitespace found.' >&2
             exit 1
           fi
 

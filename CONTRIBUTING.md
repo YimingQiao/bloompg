@@ -68,8 +68,9 @@ ruff format scripts test/python
 ruff check scripts test/python
 ```
 
-Use `git clang-format` on changed C lines. Existing PostgreSQL-style source is
-not mechanically reformatted as a whole.
+Keep C changes in the surrounding PostgreSQL style. The automated whitespace
+check rejects trailing blanks; the project deliberately does not run a
+non-PostgreSQL formatter over C sources.
 
 The manually dispatched PostgreSQL Compatibility workflow builds the pinned
 PostgreSQL 18 source with assertions, runs BloomPG's tests, and then runs the
