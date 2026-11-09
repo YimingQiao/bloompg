@@ -82,7 +82,6 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 				bloompg_runtime_release_materialization(state->prefetch_token);
 				state->prefetched = false;
 				state->prefetch_token = 0;
-				state->prefetch_rows = 0;
 			}
 			continue;
 		}
@@ -92,7 +91,6 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 			state->materialization_token = state->prefetch_token;
 			state->prefetched = false;
 			state->prefetch_token = 0;
-			state->prefetch_rows = 0;
 		}
 		/* If sampling says the newly attached formal filters did not excite the
 		 * destination, keep its native P1 access path and apply those filters at

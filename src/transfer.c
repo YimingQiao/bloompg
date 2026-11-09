@@ -125,59 +125,28 @@ bloompg_initialize_join_index_sources(BloomPGRelationState **states,
 }
 
 static bool
-bloompg_filter_received_from(BloomPGRelationState *state, Index source_rti)
-{
-	ListCell *cell;
-
-	foreach(cell, state->filters)
-	{
-		BloomPGSampleFilter *filter = lfirst(cell);
-
-		if (bms_is_member(source_rti, filter->lineage))
-			return true;
-	}
-	return false;
-}
-
-static bool
-bloompg_has_pending_smaller_index_source(BloomPGRelationState *destination,
-	BloomPGRelationState **states, int count)
-{
-	int member = -1;
-
-	while ((member = bms_next_member(destination->join_index_sources,
-		member)) >= 0)
-	{
-		BloomPGRelationState *source = member <= count ? states[member] : NULL;
-
-		if (source != NULL && source != destination && source->active &&
-			source->base_rows < destination->base_rows &&
-			!bloompg_filter_received_from(destination, source->rti))
-			return true;
-	}
-	return false;
-}
-
-static bool
-bloompg_index_guard_delays(BloomPGRelationState *state,
-	BloomPGRelationState **states, int count, bool *index_ready)
-{
-	*index_ready = false;
-	if (state->materialized || state->prefetched ||
-		state->join_index_sources == NULL ||
-		state->base_rows <= (double) bloompg_index_guard_min_rows)
-		return false;
-	*index_ready = bloompg_index_prefilter_available(state);
-	return !*index_ready ||
-		bloompg_has_pending_smaller_index_source(state, states, count);
-}
-
-static bool
 bloompg_state_precedes(BloomPGRelationState *left,
 	BloomPGRelationState *right)
 {
-	return right == NULL || left->current_rows < right->current_rows ||
-		(left->current_rows == right->current_rows && left->rti < right->rti);
+	if (right == NULL)
+		return true;
+	if (left->current_rows != right->current_rows)
+		return left->current_rows < right->current_rows;
+	/* Within one priority tier, usable index access breaks output ties even
+	 * when the index condition is too broad to earn scheduling priority. */
+	if (bloompg_index_transfer)
+	{
+		bool left_index = !left->materialized && left->filters != NIL &&
+			bloompg_index_prefilter_available(left,
+				bloompg_index_transfer_max_fraction);
+		bool right_index = !right->materialized && right->filters != NIL &&
+			bloompg_index_prefilter_available(right,
+				bloompg_index_transfer_max_fraction);
+
+		if (left_index != right_index)
+			return left_index;
+	}
+	return left->rti < right->rti;
 }
 
 /* PostgreSQL may pull a correlated SubLink relation into the planned range
@@ -208,56 +177,34 @@ bloompg_terminal_native_index_leaf(BloomPGRelationState *state,
 	return true;
 }
 
-/* Preserve the fixed point's smallest-active order, delaying the first
- * physical read of a non-small relation when an exact incoming key set could
- * unlock its index.  The scheduler owns the complete wait-break decision so
- * callers never have to reconstruct a state from independent booleans. */
+/* Prefer selective incoming index access, then minimize estimated output. */
 static BloomPGScheduleDecision
 bloompg_schedule_next(BloomPGRelationState **states, int count)
 {
 	BloomPGScheduleDecision decision = {BLOOMPG_SCHEDULE_STOP, NULL};
-	BloomPGRelationState *best = NULL;
-	BloomPGRelationState *fallback = NULL;
 	int rti;
 
 	for (rti = 1; rti <= count; rti++)
 	{
 		BloomPGRelationState *state = states[rti];
-		bool index_ready;
-		bool guarded;
 
 		if (state == NULL || !state->active)
 			continue;
-		guarded = bloompg_index_guard_delays(state, states, count,
-			&index_ready);
-		state->selection.index_ready = index_ready;
-		state->selection.disposition = guarded ? BLOOMPG_SELECTION_WAITING :
-			BLOOMPG_SELECTION_ELIGIBLE;
-		if (guarded)
-		{
-			if (bloompg_state_precedes(state, fallback))
-				fallback = state;
-		}
-		else if (bloompg_state_precedes(state, best))
-			best = state;
+		state->selection.index_ready = bloompg_index_transfer &&
+			!state->materialized && state->filters != NIL &&
+			bloompg_index_prefilter_available(state,
+				Min(bloompg_index_priority_max_fraction,
+					bloompg_index_transfer_max_fraction));
+		state->selection.disposition = BLOOMPG_SELECTION_ELIGIBLE;
+		if (decision.source == NULL ||
+			(state->selection.index_ready &&
+			 !decision.source->selection.index_ready) ||
+			(state->selection.index_ready == decision.source->selection.index_ready &&
+			 bloompg_state_precedes(state, decision.source)))
+			decision.source = state;
 	}
-	if (best != NULL)
-	{
+	if (decision.source != NULL)
 		decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
-		decision.source = best;
-		return decision;
-	}
-	if (fallback == NULL)
-		return decision;
-
-	/* Index readiness changes how a relation is read, not whether it
-	 * participates in the transfer fixed point.  If every active relation is
-	 * waiting, materialize the smallest one with the best access path currently
-	 * available (including a sequential path) so propagation cannot stop at a
-	 * partial Filter/unchanged frontier. */
-	fallback->selection.disposition = BLOOMPG_SELECTION_WAIT_BREAK;
-	decision.action = BLOOMPG_SCHEDULE_MATERIALIZE;
-	decision.source = fallback;
 	return decision;
 }
 
@@ -320,16 +267,14 @@ bloompg_make_apply_spec(const BloomPGJoinGraph *graph,
 
 /*
  * A parameterized native index path already performs the same key-driven
- * probe as transfer.  For an isolated two-relation join whose outer scan is
- * large enough to run in parallel, PostgreSQL can distribute those probes
- * across the outer workers and there is nowhere else to propagate the
- * materialized result.  Keep only that terminal case native; a wider graph
+ * probe as transfer.  For an isolated two-relation join there is nowhere
+ * else to propagate the materialized result.  This applies equally to
+ * serial and parallel execution.  Keep only that terminal case native; a wider graph
  * must retain every excited relation in the transfer fixed point.
  */
 static BloomPGRelationState *
 bloompg_initial_native_index_guard(BloomPGRelationState **states,
-	int relation_count, const BloomPGJoinGraph *graph,
-	bool query_parallel_safe)
+	int relation_count, const BloomPGJoinGraph *graph)
 {
 	BloomPGScheduleDecision schedule = bloompg_schedule_next(states,
 		relation_count);
@@ -339,8 +284,7 @@ bloompg_initial_native_index_guard(BloomPGRelationState **states,
 	int protected_destinations = 0;
 	int participating_relations = 0;
 
-	if (source == NULL ||
-		bloompg_transfer_worker_count(source, query_parallel_safe) <= 0)
+	if (source == NULL)
 		return NULL;
 	for (destination_rti = 1; destination_rti <= relation_count;
 		 destination_rti++)
@@ -413,10 +357,8 @@ bloompg_find_shared_filter(List *pending_transfers,
 
 BloomPGTransferOutcome
 bloompg_apply_transfers(PlannedStmt *candidate,
-						Query *analysis_query,
 						BloomPGJoinGraph *graph,
 						const char *query_string,
-						int cursor_options,
 						ParamListInfo bound_params,
 						bool query_parallel_safe,
 						const Bitmapset *native_parameterized_indexes)
@@ -482,8 +424,6 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		state->replacement_rti = table->rti;
 		state->memory_budget = memory_budget;
 		state->table = table;
-		state->analysis_query = analysis_query;
-		state->cursor_options = cursor_options;
 		state->replacement_kind = "unchanged";
 		state->native_parameterized_index =
 			bms_is_member(table->rti, native_parameterized_indexes);
@@ -587,8 +527,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	equality_domains = bloompg_equality_domains_create(graph, relation_count);
 	{
 		BloomPGRelationState *guard_source =
-			bloompg_initial_native_index_guard(states, relation_count, graph,
-				query_parallel_safe);
+			bloompg_initial_native_index_guard(states, relation_count, graph);
 
 		if (guard_source != NULL)
 		{
@@ -626,11 +565,8 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 			break;
 		Assert(source != NULL);
 		appendStringInfo(&detail,
-			" select=%u:index_ready=%s:guarded=%s:fallback=%s",
-			source->rti, source->selection.index_ready ? "yes" : "no",
-			bloompg_selection_is_guarded(source->selection) ? "yes" : "no",
-			source->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
-				"yes" : "no");
+			" select=%u:index_ready=%s",
+			source->rti, source->selection.index_ready ? "yes" : "no");
 		source->active = false;
 		for (destination_rti = 1; destination_rti <= relation_count;
 			 destination_rti++)
@@ -715,7 +651,6 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 			source->materialization_token = source->prefetch_token;
 			source->prefetched = false;
 			source->prefetch_token = 0;
-			source->prefetch_rows = 0;
 		}
 
 		if (source->materialized)
@@ -804,7 +739,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 
 			INSTR_TIME_SET_CURRENT(filter_finalize_started);
 			filter_finalize_rows = bloompg_finalize_pending_filters(
-				pending_transfers, store, descriptor, rows_seen,
+				pending_transfers, store, rows_seen,
 				&one_pass_bitmap_builds);
 			filter_finalize_ms =
 				bloompg_transfer_elapsed_ms(filter_finalize_started);

@@ -62,10 +62,8 @@ typedef struct BloomPGTransferOutcome
 } BloomPGTransferOutcome;
 
 extern BloomPGTransferOutcome bloompg_apply_transfers(PlannedStmt *candidate,
-											 Query *analysis_query,
 											 BloomPGJoinGraph *graph,
 											 const char *query_string,
-											 int cursor_options,
 											 ParamListInfo bound_params,
 											 bool query_parallel_safe,
 											 const Bitmapset *native_parameterized_indexes);

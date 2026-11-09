@@ -8,9 +8,9 @@ OBJS = \
 	src/planner.o \
 	src/graph.o \
 	src/transfer_plan.o \
-	src/transfer_access.o \
 	src/transfer_index.o \
 	src/transfer_materialize.o \
+	src/transfer_worker_build.o \
 	src/transfer_parallel.o \
 	src/transfer_scan.o \
 	src/transfer_prefetch.o \

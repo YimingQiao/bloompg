@@ -216,14 +216,13 @@ bloompg_maybe_convert_to_bitmap(BloomPGPendingTransfer *pending,
  * owner instead of rescanning once per join edge. */
 uint64
 bloompg_finalize_pending_filters(List *pending_transfers,
-	BloomPGColumnStore *store, TupleDesc descriptor, uint64 rows,
+	BloomPGColumnStore *store, uint64 rows,
 	uint64 *one_pass_bitmap_builds)
 {
 	ListCell *cell;
 	bool needs_insert = false;
 	uint64 rows_examined = 0;
 
-	(void) descriptor;
 	*one_pass_bitmap_builds = 0;
 
 	foreach(cell, pending_transfers)

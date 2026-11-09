@@ -424,8 +424,8 @@ bloompg_planner(Query *parse,
 			BeginInternalSubTransaction("bloompg optimizer execution");
 			PG_TRY(_transfer);
 			{
-				transfer = bloompg_apply_transfers(result, analysis_query, graph,
-											 query_string, cursor_options, bound_params,
+				transfer = bloompg_apply_transfers(result, graph,
+											 query_string, bound_params,
 											 query_parallel_safe,
 											 native_parameterized_indexes);
 				ReleaseCurrentSubTransaction();

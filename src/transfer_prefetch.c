@@ -45,7 +45,6 @@ bloompg_record_prefetch(BloomPGRelationState *state, uint64 token,
 		descriptor, rows);
 	state->prefetched = true;
 	state->prefetch_token = token;
-	state->prefetch_rows = rows;
 	state->materialization_used_filters |= state->filters != NIL;
 	/* The detached parallel plan consumed all Apply nodes that existed when
 	 * the speculative scan started.  Filters installed by its batch peer after
@@ -123,7 +122,6 @@ bloompg_prefetch_would_lose_index(BloomPGRelationState *source,
 			continue;
 		if (producer == NULL || producer == peer ||
 			(producer != source && !producer->active) ||
-			producer->current_rows > (double) bloompg_index_transfer_max_keys ||
 			!bloompg_prefetch_edge_matches(edge, producer->rti, peer->rti) ||
 			!bloompg_relation_has_transfer_index(peer, probe.attribute,
 				edge->operator_oid, edge->input_collation))
@@ -152,8 +150,7 @@ bloompg_select_prefetch_peer(BloomPGRelationState *source,
 			candidate->materialized || candidate->prefetched ||
 			bloompg_transfer_worker_count(candidate, query_parallel_safe) <= 0)
 			continue;
-		if (candidate->join_index_sources != NULL &&
-			candidate->base_rows > (double) bloompg_index_guard_min_rows)
+		if (candidate->join_index_sources != NULL)
 			continue;
 		/* A shared heap wave is irreversible: it materializes the peer before
 		 * the source can publish its exact keys.  Do not trade away a B-tree
@@ -229,8 +226,7 @@ bloompg_prefetch_active_pair(BloomPGRelationState *source,
 	uint64 wave_id;
 
 	if (source->materialized || source->prefetched ||
-		(source->join_index_sources != NULL &&
-		 source->base_rows > (double) bloompg_index_guard_min_rows))
+		source->join_index_sources != NULL)
 		return false;
 	source_requested = bloompg_transfer_worker_count(source,
 		query_parallel_safe);

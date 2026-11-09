@@ -332,10 +332,11 @@ WHERE a.keep
   AND c.flag
   AND a.k2 <= (SELECT max(c2.k2) FROM c AS c2 WHERE c2.flag);
 SELECT bloompg_last_profile()->>'status' = 'complete'
-   AND (bloompg_last_profile()->'transfer'->'summary'
-        ->>'applied')::boolean
-   AND jsonb_array_length(
-        bloompg_last_profile()->'transfer'->'steps') > 0
+   AND (((bloompg_last_profile()->'transfer'->'summary'
+           ->>'applied')::boolean
+         AND jsonb_array_length(
+             bloompg_last_profile()->'transfer'->'steps') > 0)
+        OR bloompg_last_trace() LIKE '%native_index_terminal_bypass=%')
     AS prepared_initplan_transfer_ok;
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
@@ -481,17 +482,18 @@ CALL assert_plan_contains('p1_index_only_plan',
 SET bloompg.excitation_threshold = 0.002;
 CALL assert_same('p1_parameterized_index_rescan',
     'SELECT o.k, sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep GROUP BY o.k');
-CALL assert_plan_contains('p1_parameterized_index_filter',
-    'SELECT sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep',
-    'Custom Scan (BloomPG Filter)');
+-- The two-table native index guard also applies with all workers disabled.
+SET bloompg.transfer_workers = 0;
 CALL assert_plan_contains('p1_parameterized_index_path',
     'SELECT sum(i.payload) FROM p1_outer_param o JOIN p1_param_probe i ON o.k = i.k WHERE o.keep',
     'p1_param_probe_k_idx');
-SELECT COALESCE(
-    (bloompg_last_profile()->'planning'->'path_transform'->>'parameterized')::integer > 0
-    AND (bloompg_last_profile()->'planning'->'path_transform'->>'input_paths')::integer =
-        (bloompg_last_profile()->'planning'->'path_transform'->>'wrapped_paths')::integer,
-    false) AS parameterized_pathset_preserved_ok;
+SELECT current_setting('max_parallel_workers_per_gather')::integer = 0
+   AND current_setting('bloompg.transfer_workers')::integer = 0
+   AND bloompg_last_trace() LIKE '%native_index_terminal_bypass=%'
+   AND NOT (bloompg_last_profile()->'transfer'->'summary'->>'applied')::boolean
+   AND jsonb_array_length(bloompg_last_profile()->'transfer'->'steps') = 0
+    AS serial_native_index_guard_ok;
+RESET bloompg.transfer_workers;
 SET bloompg.excitation_threshold = 0.15;
 
 -- A local-qual-only Memory replacement remains semantically equivalent to
@@ -550,7 +552,6 @@ ANALYZE filter_src;
 SET bloompg.excitation_threshold = 1.0;
 SET bloompg.index_transfer = on;
 SET bloompg.index_transfer_max_fraction = 1.0;
-SET bloompg.index_guard_min_rows = 0;
 SET bloompg.transfer_progress_metric = 'rows';
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
@@ -558,41 +559,24 @@ SELECT count(*) = 400 AS index_transfer_query_ok
 FROM filter_src s JOIN filter_dst d ON s.k = d.k
 WHERE s.keep;
 SELECT COALESCE((
-    SELECT (
-        (relation->'materialization'->'index_probe'->>'scans')::integer > 0
-        AND (relation->'materialization'->'index_probe'->>'batches')::integer > 0
-        AND (relation->'materialization'->'index_probe'->>'keys')::integer = 100
-    ) OR (
-        (relation->'materialization'->'access_plan'->>'exact_keys')::integer = 100
-        AND (
-            (relation->'materialization'->'access_plan'->>'index_scans')::integer > 0
-            OR (relation->'materialization'->'access_plan'->>'index_only_scans')::integer > 0
-            OR (relation->'materialization'->'access_plan'->>'bitmap_heap_scans')::integer > 0
-        )
-    )
+    SELECT (relation->'materialization'->>'access_path') = 'bitmap-index-probe'
+       AND (relation->'materialization'->'index_probe'->>'bitmap_scans')::integer > 0
+       AND (relation->'materialization'->'index_probe'->>'keys')::integer = 100
     FROM jsonb_array_elements(
         bloompg_last_profile()->'transfer'->'relations') AS relation
     WHERE relation->>'alias' = 'd'
 ), false) AS index_transfer_profile_ok;
-SELECT EXISTS (
-        SELECT 1
-        FROM jsonb_array_elements(
-            bloompg_last_profile()->'transfer'->'steps') AS step
-        WHERE step->>'source' = 's'
-          AND (step->>'selection_guard_fallback')::boolean
-    ) AND EXISTS (
-        SELECT 1
-        FROM jsonb_array_elements(
-            bloompg_last_profile()->'transfer'->'steps') AS step
-        WHERE step->>'source' = 'd'
-          AND (step->>'selection_index_ready')::boolean
-    ) AND bloompg_last_profile()->'transfer'->'summary'
-        ->>'progress_metric' = 'rows' AS index_wait_guard_profile_ok;
+SELECT NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'steps') AS step
+    WHERE COALESCE(step->>'selection_state', '')
+          NOT IN ('eligible', 'index-ready')
+) AND bloompg_last_profile()->'transfer'->'summary'
+      ->>'progress_metric' = 'rows' AS smallest_output_schedule_ok;
 
 -- Index readiness controls the physical access path, not fixed-point
--- participation.  If every source is waiting, the smallest guarded relation
--- must be materialized even when its current filter targets an unindexed
--- column, so it can publish the later indexed-key domain.
+-- participation. An unindexed bridge must still be materialized so it can
+-- publish the later indexed-key domain.
 CREATE TABLE guard_seed(k integer, keep boolean);
 CREATE TABLE guard_middle(seed_key integer, indexed_key integer);
 CREATE TABLE guard_tail(indexed_key integer);
@@ -604,11 +588,10 @@ INSERT INTO guard_tail SELECT g FROM generate_series(1, 1000) AS g;
 CREATE INDEX guard_middle_indexed_key_idx
     ON guard_middle(indexed_key);
 ANALYZE guard_seed, guard_middle, guard_tail;
-SET bloompg.index_transfer_max_keys = 50;
-CALL assert_same('index_guard_wait_break',
+CALL assert_same('unindexed_bridge',
     'SELECT count(*) FROM guard_seed s JOIN guard_middle m ON s.k = m.seed_key JOIN guard_tail t ON m.indexed_key = t.indexed_key WHERE s.keep');
 SET bloompg.enable = on;
-SELECT count(*) = 100 AS index_guard_wait_break_query_ok
+SELECT count(*) = 100 AS unindexed_bridge_query_ok
 FROM guard_seed s
 JOIN guard_middle m ON s.k = m.seed_key
 JOIN guard_tail t ON m.indexed_key = t.indexed_key
@@ -625,13 +608,12 @@ SELECT COALESCE(
         WHERE relation->>'alias' = 'm'
           AND relation->>'replacement' = 'memory'
           AND (relation->'materialization'->'selection'
-              ->>'fallback')::boolean
+                  ->>'state') IN ('eligible', 'index-ready')
           AND (relation->'materialization'->>'exact_scans')::integer > 0),
-    false) AS index_guard_wait_break_profile_ok;
+    false) AS unindexed_bridge_profile_ok;
 
 -- A native parameterized path must not truncate propagation in a wider graph.
--- When the exact access planner rejects the key population, the scheduler
--- falls back to one physical scan and continues the equality-domain transfer.
+-- Physical index access must continue the equality-domain transfer.
 CREATE TABLE protected_dimension(id integer, keep boolean);
 CREATE TABLE protected_source(id integer, dimension_id integer);
 CREATE TABLE guarded_dimension(id integer, keep boolean);
@@ -654,12 +636,10 @@ CREATE INDEX protected_guarded_fact_guarded_idx
 ANALYZE protected_dimension, protected_source, guarded_dimension,
     protected_guarded_fact;
 SET bloompg.index_transfer_max_fraction = 0.15;
-SET bloompg.index_transfer_max_keys = 50;
-SET bloompg.index_transfer_planner_max_keys = 1;
-CALL assert_same('index_guard_complete_transfer',
+CALL assert_same('indexed_complete_transfer',
     'SELECT count(*) FROM protected_dimension d JOIN protected_source p ON d.id = p.dimension_id JOIN protected_guarded_fact f ON p.id = f.protected_id JOIN guarded_dimension g ON g.id = f.guarded_id WHERE d.keep AND g.keep');
 SET bloompg.enable = on;
-SELECT count(*) = 200 AS index_guard_complete_transfer_query_ok
+SELECT count(*) = 200 AS indexed_complete_transfer_query_ok
 FROM protected_dimension d
 JOIN protected_source p ON d.id = p.dimension_id
 JOIN protected_guarded_fact f ON p.id = f.protected_id
@@ -677,14 +657,96 @@ SELECT COALESCE(
         WHERE relation->>'alias' = 'f'
           AND relation->>'replacement' = 'memory'
           AND (relation->'materialization'->>'exact_scans')::integer > 0),
-    false) AS index_guard_complete_transfer_profile_ok;
+    false) AS indexed_complete_transfer_profile_ok;
+-- Joint residual selectivity must not admit individually broad indexes.
+CREATE TABLE bitmap_left(k integer, keep boolean);
+CREATE TABLE bitmap_right(k integer, keep boolean);
+CREATE TABLE bitmap_fact(a integer, b integer);
+INSERT INTO bitmap_left SELECT g, g < 2 FROM generate_series(0, 9) g;
+INSERT INTO bitmap_right SELECT g, g < 2 FROM generate_series(0, 9) g;
+INSERT INTO bitmap_fact SELECT g % 10, (g / 10) % 10 FROM generate_series(0, 999) g;
+CREATE INDEX ON bitmap_fact(a);
+CREATE INDEX ON bitmap_fact(b);
+ANALYZE bitmap_left, bitmap_right, bitmap_fact;
+SET bloompg.index_transfer_max_fraction = 0.10;
+SELECT count(*) = 40 AS bitmap_individual_sel_query_ok
+FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
+JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep;
+SELECT COALESCE((
+    SELECT (relation->'materialization'->'index_probe'->>'scans')::integer = 0
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS bitmap_individual_sel_uses_scan_ok;
+-- Access can use the 20% indexes without granting scheduling priority.
+SET bloompg.index_priority_max_fraction = 0.01;
+SET bloompg.index_transfer_max_fraction = 0.25;
+CALL assert_same('bitmap_two_indexes_results',
+    'SELECT count(*) FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 40 AS bitmap_two_indexes_query_ok
+FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
+JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep;
+SELECT COALESCE((
+    SELECT (relation->'materialization'->'index_probe'->>'bitmap_sources')::integer = 2
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS bitmap_intersection_ok;
+
+-- Raising only the priority threshold moves the fact before the second
+-- source: it starts with one index filter and applies the other later.
+SET bloompg.index_priority_max_fraction = 0.25;
+SELECT count(*) = 40 AS bitmap_priority_query_ok
+FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
+JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep;
+SELECT COALESCE((
+    SELECT (relation->'materialization'->'index_probe'->>'bitmap_sources')::integer = 1
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false)
+   AND bloompg_last_profile()->'transfer'->'steps'->1->>'source' = 'f'
+   AND (bloompg_last_profile()->'transfer'->'steps'->1
+        ->>'selection_index_ready')::boolean AS bitmap_priority_threshold_ok;
+RESET bloompg.index_priority_max_fraction;
+
+-- More than the former 100000-key cap, one native array scan, lossy rechecks.
+CREATE TABLE bitmap_large_source(k integer, keep boolean);
+CREATE TABLE bitmap_large_fact(k integer, payload integer, padding text);
+INSERT INTO bitmap_large_source
+SELECT g, g % 10 <> 0 FROM generate_series(1, 120000) g;
+INSERT INTO bitmap_large_fact
+SELECT 1 + (g % 120000), g, repeat(md5(g::text), 8)
+FROM generate_series(0, 219999) g;
+CREATE INDEX ON bitmap_large_fact(k);
+ANALYZE bitmap_large_source, bitmap_large_fact;
+SET work_mem = '64kB';
+SET bloompg.index_transfer_max_fraction = 1.0;
+CALL assert_same('bitmap_large_lossy_results',
+    'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 198000 AS bitmap_large_query_ok
+FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
+SELECT COALESCE((
+    SELECT (relation->'materialization'->>'access_path') = 'bitmap-index-probe'
+       AND (relation->'materialization'->'index_probe'->>'keys')::integer = 108000
+       AND (relation->'materialization'->'index_probe'->>'batches')::integer = 1
+       AND (relation->'materialization'->'index_probe'->>'bitmap_lossy_pages')::integer > 0
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS bitmap_large_lossy_profile_ok;
+SET bloompg.index_transfer_max_fraction = 0.10;
+SELECT count(*) = 198000 AS bitmap_high_sel_query_ok
+FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
+SELECT COALESCE((
+    SELECT (relation->'materialization'->>'access_path') = 'sequential-prefilter'
+       AND (relation->'materialization'->'index_probe'->>'scans')::integer = 0
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS bitmap_high_sel_uses_scan_ok;
+RESET work_mem;
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 RESET bloompg.transfer_progress_metric;
-RESET bloompg.index_guard_min_rows;
 RESET bloompg.index_transfer_max_fraction;
-RESET bloompg.index_transfer_max_keys;
-RESET bloompg.index_transfer_planner_max_keys;
 RESET bloompg.index_transfer;
 
 SET bloompg.excitation_threshold = 0.0;
@@ -750,7 +812,7 @@ SET bloompg.late_materialize = on;
 
 SET bloompg.enable = on;
 SELECT count(*) > 0 AND sum(length(a.payload)) > 0 AS wide_result_ok
-FROM a JOIN b ON a.k = b.k
+FROM a JOIN b ON a.k2 = b.k2
 WHERE a.keep;
 SELECT bloompg_last_trace() LIKE '%transfers=%' AS transfer_trace_ok;
 
@@ -766,7 +828,7 @@ CALL assert_same('parallel_composite',
 CALL assert_same('parallel_partition',
     'SELECT count(*) FROM pa JOIN b ON pa.k = b.k WHERE pa.keep');
 CALL assert_plan_contains('parallel_plan',
-    'SELECT count(*) FROM a JOIN b ON a.k = b.k WHERE a.keep',
+    'SELECT count(*) FROM a JOIN b ON a.k2 = b.k2 WHERE a.keep',
     'Parallel Custom Scan (BloomPG');
 
 -- A partial join can use a regular replacement as its replicated inner side,
@@ -1007,7 +1069,7 @@ SELECT COALESCE((
 ), false) AS system_column_projection_fail_closed_ok;
 SET bloompg.late_materialize = on;
 SELECT count(*) > 0 AS profiled_query_ok
-FROM a JOIN c ON a.k = c.k
+FROM a JOIN b ON a.k = b.k JOIN c ON a.k = c.k
 WHERE a.keep;
 SELECT bloompg_last_profile()->>'status' = 'complete'
    AND (bloompg_last_profile()->'planning'->>'transfer_ms')::numeric >= 0

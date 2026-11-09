@@ -128,6 +128,7 @@ class SettingsTests(unittest.TestCase):
             transfer_parallel_min_rows=100_000,
             index_transfer=True,
             index_transfer_max_fraction=0.15,
+            index_priority_max_fraction=0.01,
             index_transfer_batch_keys=65_536,
             index_transfer_max_keys=100_000,
             index_guard_min_rows=100_000,

@@ -43,6 +43,7 @@ sides, and unsupported equality classes use this normal path in either mode.
 | `bloompg.transfer_progress_metric` | `ndv` | Equality-transfer convergence signal: `rows` or `ndv`. |
 | `bloompg.materialization_memory` | up to `2GB` | Total memory budget for one query's optimizer-time materializations and parallel DSM copies. The default is one eighth of detected host/cgroup memory, capped at 2GB. |
 | `bloompg.transfer_workers` | `4` | Maximum workers for one eligible transfer scan; `0` is serial. |
+| `bloompg.parallel_filter_build` | `on` | Build private outgoing filters during direct parallel transfer scans, then merge them in the leader; `off` retains leader-side construction. |
 | `bloompg.transfer_parallel_min_rows` | `100000` | Minimum estimated input rows for parallel transfer scanning. |
 | `bloompg.replan_after_transfer` | `on` | Run the second PostgreSQL planning pass. |
 
@@ -51,26 +52,64 @@ optimizer work and executes the original PostgreSQL plan. It never silently
 turns the materialization into a disk spill. Use `bloompg_tune.py` to size the
 query-wide budget for dedicated analytical deployments and concurrency.
 
+## Worker-local filter construction
+
+Direct parallel transfer scans build one private filter per distinct outgoing
+key in each participant, including the leader when it scans rows. Bloom filters
+use the same global size and hash parameters and are merged by word-wise OR.
+Integer bitmap candidates retain their signed, word-aligned ranges and are
+merged with matching offsets. Duplicate destination keys reuse the merged filter.
+Surviving row vectors still pass through Gather for materialization; only filter
+construction moves to the scan participants. Filter summaries use bounded 64KiB
+word payloads rather than one large message.
+
+Private allocations are reserved against `materialization_memory` before the
+scan starts, including leader participation and temporary bitmap growth. If
+that reservation fails or a build hash function is not parallel-safe, the scan
+retains leader-side construction. Each worker's bitmap candidate is capped at
+8MB (and by `max_filter_bytes`); an abandoned or globally unsuitable bitmap uses
+the existing materialization-to-Bloom fallback. Parallel Append prefetch and
+in-memory compaction retain their existing construction paths.
+
+Per-relation materialization profiles expose `worker_filter_parts` (one private
+filter per participating process), `worker_filter_bytes` (summary payload bytes),
+`worker_filter_build_ms` (sum of participant build times), and
+`worker_filter_merge_ms` (leader merge time). Participant time overlaps scanning
+and must not be added to wall-clock query time. `filter_prepare_ms` counts the
+leader's inline construction or merge work; worker construction remains inside
+the parallel scan's elapsed time.
+
 ## Index-assisted materialization
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `bloompg.index_transfer` | `off` | Experimentally let exact incoming join keys drive a compatible B-tree path. |
-| `bloompg.index_transfer_max_fraction` | `0.15` | Maximum sampled survivor fraction for choosing that path. |
-| `bloompg.index_transfer_batch_keys` | `65536` | Exact keys in one direct B-tree probe batch. |
-| `bloompg.index_transfer_max_keys` | `100000` | Maximum exact distinct-key population eligible for index transfer. |
-| `bloompg.index_transfer_planner_max_keys` | `8192` | Maximum keys expanded into one private PostgreSQL access plan. |
-| `bloompg.index_guard_min_rows` | `100000` | Large indexed relations wait for an exact incoming join-key set. |
+| `bloompg.index_transfer` | `off` | Use native bitmap access for selective exact incoming join keys on a compatible B-tree index. |
+| `bloompg.index_transfer_max_fraction` | `0.10` | Maximum sampled selectivity of each index condition for bitmap access, evaluated separately from residual filters. |
+| `bloompg.index_priority_max_fraction` | `0.01` | Maximum individual index-filter selectivity for scheduling priority; the index must also qualify for bitmap access. |
+| `bloompg.index_guard_min_rows` | `100000` | Existing P1 protection against repeated large materialization rescans when an equivalent parameterized index path exists; does not change transfer scheduling. |
 
-Index-assisted materialization is opt-in. The index guard delays only
-relations whose base cardinality reaches the
-threshold and whose join key has a compatible B-tree index. If every active
-candidate is waiting, BloomPG materializes the smallest current candidate
-with the best available PostgreSQL access path, falling back to a sequential
-scan when no exact-key index path is ready. Index readiness controls how a
-relation is read; it never removes an excited relation from the equality-domain
-fixed point. Memory or execution-safety failures still retain the native
-PostgreSQL preview plan.
+With index transfer enabled, SSPT first considers active, unmaterialized tables
+with an eligible incoming index filter whose individual sampled selectivity is
+at or below both thresholds. Among these it selects the
+smallest estimated output. If none qualify, it selects the smallest estimated
+output among all active tables. Within the same priority tier, equal outputs
+prefer a table with eligible bitmap access, even if its index selectivity
+exceeds the priority threshold; remaining ties use table RTI. For the selected
+table, a compatible exact index filter with estimated selectivity at or below
+the access threshold drives a native B-tree bitmap scan, even if it did not
+qualify for scheduling priority. Without an eligible filter,
+BloomPG retains its scan path. Unknown individual selectivity does not qualify;
+it is not replaced by the combined selectivity of other filters.
+
+Each eligible key set is passed as one complete array scan key to PostgreSQL's
+index API. There is no auxiliary SQL/ANY expression, optimizer invocation,
+manual batch size, key-count threshold, or ordinary Index Scan fallback.
+Nonredundant eligible sources contribute TID bitmaps that are intersected before
+heap access. PostgreSQL manages the bitmap using `work_mem`; all local predicates
+and incoming filters are rechecked, including on lossy pages. Current support
+is for exact, one-column integral/date key sets with matching canonical equality
+and a compatible nonpartial B-tree index. Approximate Bloom filters remain
+residual filters. PostgreSQL allocation and array representation limits apply.
 
 ## P1 and materialization
 

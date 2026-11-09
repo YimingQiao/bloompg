@@ -80,8 +80,9 @@ bloompg_pending_bitmap_add_slow(BloomPGPendingTransfer *pending,
 {
 	const uint64 maximum_word = UINT64_MAX >> 6;
 	const uint64 initial_words = 64;
-	uint64 max_words = ((uint64) bloompg_max_filter_bytes *
-		BITS_PER_BYTE) / 64;
+	uint64 max_words = (pending->bitmap_candidate_max_bytes != 0 ?
+		pending->bitmap_candidate_max_bytes : (Size) bloompg_max_filter_bytes) /
+		sizeof(uint64);
 	uint64 lower_word;
 	uint64 upper_word;
 	uint64 word_count;
@@ -190,13 +191,6 @@ bloompg_pending_bitmap_set(BloomPGPendingTransfer *pending, int64 value)
 		return true;
 	}
 	return bloompg_pending_bitmap_add_slow(pending, biased, wanted_word);
-}
-
-static inline void
-bloompg_pending_bitmap_add(BloomPGPendingTransfer *pending, int64 value)
-{
-	if (bloompg_pending_bitmap_set(pending, value))
-		pending->bitmap_candidate_inserted++;
 }
 
 typedef struct BloomPGIntegralAccumulator
@@ -370,22 +364,6 @@ bloompg_process_pending_dense_chunk(List *pending_transfers,
 	bloompg_process_pending_chunk(pending_transfers, &view, selection, count);
 }
 
-bool
-bloompg_contains_materialized_filter(BloomPGFilter *filter,
-	const BloomPGColumnStoreChunkView *view, uint32 row,
-	const AttrNumber *attributes)
-{
-	if (filter->kind == BLOOMPG_FILTER_BITMAP && filter->nkeys == 1)
-	{
-		Datum value = (Datum) 0;
-		bool present = bloompg_column_chunk_get_datum(view, attributes[0], row,
-			&value);
-
-		return bloompg_filter_contains_bitmap_value(filter, value, !present);
-	}
-	return bloompg_filter_contains_vector(filter, view, row, attributes);
-}
-
 void
 bloompg_insert_materialized_filter(BloomPGFilter *filter,
 	const BloomPGColumnStoreChunkView *view, uint32 row,
@@ -409,12 +387,11 @@ bloompg_insert_materialized_filter(BloomPGFilter *filter,
  * column-oriented. */
 void
 bloompg_build_pending_from_materialization(List *pending,
-	BloomPGColumnStore *store, TupleDesc descriptor)
+	BloomPGColumnStore *store)
 {
 	uint32 chunk_count = bloompg_column_store_chunk_count(store);
 	uint32 chunk_index;
 
-	(void) descriptor;
 	for (chunk_index = 0; chunk_index < chunk_count; chunk_index++)
 	{
 		BloomPGColumnStoreChunkView view;

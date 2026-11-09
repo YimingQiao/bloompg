@@ -9,6 +9,7 @@
 #include "bloompg/scan_quals.h"
 #include "bloompg/transfer.h"
 #include "bloompg/transfer_internal.h"
+#include "bloompg/worker_build.h"
 
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc_d.h"
@@ -46,6 +47,7 @@ typedef struct BloomPGFilterReceiver
 	uint64		rows_seen;
 	double		inline_filter_ms;
 	bool		packed;
+	BloomPGRelationState *worker_build_state;
 	bool		owns_descriptor;
 } BloomPGFilterReceiver;
 typedef struct BloomPGPrefilterContext
@@ -83,9 +85,14 @@ bloompg_receive_filter_slot(TupleTableSlot *slot, DestReceiver *receiver)
 
 		if (is_null)
 			elog(ERROR, "bloompg parallel transfer returned a NULL packet");
+		if (filter_receiver->worker_build_state != NULL &&
+			bloompg_worker_build_receive(packet, filter_receiver->pending,
+				filter_receiver->worker_build_state))
+			return true;
 		filter_receiver->rows_seen += bloompg_receive_packed_chunk(packet,
 			filter_receiver->store, filter_receiver->descriptor,
-			filter_receiver->pending != NIL ?
+			filter_receiver->pending != NIL &&
+			filter_receiver->worker_build_state == NULL ?
 				bloompg_receive_pending_vectors : NULL,
 			filter_receiver);
 	}
@@ -142,8 +149,6 @@ bloompg_create_filter_receiver(List *pending, BloomPGColumnStore *store,
 {
 	BloomPGFilterReceiver *receiver = palloc0(sizeof(BloomPGFilterReceiver));
 
-	(void) pending;
-
 	receiver->receiver.receiveSlot = bloompg_receive_filter_slot;
 	receiver->receiver.rStartup = bloompg_receiver_startup;
 	receiver->receiver.rShutdown = bloompg_receiver_shutdown;
@@ -166,7 +171,8 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 	BloomPGColumnStore *store, TupleDesc *descriptor,
 	const char *query_string, ParamListInfo bound_params,
 	int parallel_workers, int *parallel_workers_launched,
-	TupleDesc packed_descriptor, double *inline_filter_ms)
+	TupleDesc packed_descriptor, double *inline_filter_ms,
+	BloomPGRelationState *worker_build_state)
 {
 	BloomPGFilterReceiver *receiver;
 	QueryDesc *query_desc = NULL;
@@ -174,6 +180,7 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 
 	receiver = bloompg_create_filter_receiver(pending, store,
 		packed_descriptor);
+	receiver->worker_build_state = worker_build_state;
 
 	PG_TRY();
 	{
@@ -224,40 +231,59 @@ bloompg_execute_source(BloomPGRelationState *state,
 	PlannedStmt *detached = copyObject(candidate);
 	Plan *build_plan;
 	TupleDesc packed_descriptor = NULL;
+	List *build_metadata = NIL;
+	Size build_memory = 0;
+	uint64 rows;
 
 	if (parallel_workers > 0)
+		build_metadata = bloompg_worker_build_metadata(pending, parallel_workers,
+			state->memory_budget, &build_memory);
+	PG_TRY();
 	{
-		MemoryContext old_context;
+		double merge_before = state->worker_filter_merge_ms;
 
-		build_plan = bloompg_make_parallel_source(state, parallel_workers,
-			next_plan_node_id);
-		old_context = MemoryContextSwitchTo(TopTransactionContext);
-		packed_descriptor = ExecCleanTypeFromTL(
-			state->fallback_plan->targetlist);
-		MemoryContextSwitchTo(old_context);
+		if (parallel_workers > 0)
+		{
+			MemoryContext old_context;
+
+			build_plan = bloompg_make_parallel_source(state, parallel_workers,
+				next_plan_node_id, build_metadata);
+			old_context = MemoryContextSwitchTo(TopTransactionContext);
+			packed_descriptor = ExecCleanTypeFromTL(
+				state->fallback_plan->targetlist);
+			MemoryContextSwitchTo(old_context);
+		}
+		else
+		{
+			build_plan = copyObject(source_plan);
+			bloompg_disable_parallel_flags(build_plan);
+		}
+		detached->planTree = build_plan;
+		detached->canSetTag = false;
+		detached->parallelModeNeeded = parallel_workers > 0;
+		detached->rowMarks = NIL;
+		detached->resultRelations = NIL;
+		detached->jitFlags = 0;
+		rows = bloompg_run_source_statement(detached, pending, store, descriptor,
+			query_string, bound_params, parallel_workers,
+			parallel_workers_launched, packed_descriptor, inline_filter_ms,
+			build_metadata != NIL ? state : NULL);
+		*inline_filter_ms += state->worker_filter_merge_ms - merge_before;
 	}
-	else
+	PG_FINALLY();
 	{
-		build_plan = copyObject(source_plan);
-		bloompg_disable_parallel_flags(build_plan);
+		if (build_memory != 0)
+			bloompg_memory_budget_release_reservation(state->memory_budget,
+				build_memory);
 	}
-	detached->planTree = build_plan;
-	detached->canSetTag = false;
-	detached->parallelModeNeeded = parallel_workers > 0;
-	detached->rowMarks = NIL;
-	detached->resultRelations = NIL;
-	detached->jitFlags = 0;
-	return bloompg_run_source_statement(detached, pending, store, descriptor,
-		query_string, bound_params, parallel_workers,
-		parallel_workers_launched, packed_descriptor, inline_filter_ms);
+	PG_END_TRY();
+	return rows;
 }
 
 typedef enum BloomPGAccessDecisionKind
 {
-	BLOOMPG_ACCESS_CORE_INDEX,
 	BLOOMPG_ACCESS_DIRECT_INDEX,
 	BLOOMPG_ACCESS_PARALLEL_SCAN,
-	BLOOMPG_ACCESS_CORE_SCAN,
 	BLOOMPG_ACCESS_SERIAL_SCAN,
 	BLOOMPG_ACCESS_NATIVE_LOCAL
 } BloomPGAccessDecisionKind;
@@ -267,56 +293,35 @@ typedef struct BloomPGAccessDecision
 	BloomPGAccessDecisionKind kind;
 	const char *name;
 	const char *reason;
-	PlannedStmt *core_plan;
 	int		workers;
 	Size	parallel_memory;
 } BloomPGAccessDecision;
 
-/* Keep fixed-point scheduling independent from physical access.  A bounded
- * exact domain is the only index fast path: core chooses among index, bitmap,
- * and index-only paths when the domain is small enough to plan, while the
- * direct probe covers the remaining bounded domains.  Everything else is a
- * scan, parallel when the configured worker and memory budgets allow it. */
+/* The schedule is already fixed. Use a native bitmap scan whenever an exact
+ * incoming key set has a compatible index; otherwise retain the scan path. */
 static BloomPGAccessDecision
-bloompg_choose_access(BloomPGRelationState *state, const char *query_string,
-	ParamListInfo bound_params, bool query_parallel_safe)
+bloompg_choose_access(BloomPGRelationState *state, bool query_parallel_safe)
 {
 	BloomPGAccessDecision decision = {
 		BLOOMPG_ACCESS_NATIVE_LOCAL, "native-local", "no-transfer-filter",
-		NULL, 0, 0
+		0, 0
 	};
-	bool core_planned;
-	bool core_indexed;
-	bool direct_indexed = false;
+	bool direct_indexed = state->filters != NIL &&
+		bloompg_index_prefilter_available(state,
+			bloompg_index_transfer_max_fraction);
 	bool scan_required;
 
-	core_planned = state->filters != NIL &&
-		bloompg_plan_transfer_access(state, query_string, bound_params,
-			&decision.core_plan);
-	core_indexed = core_planned &&
-		(state->access_plan_index_scans > 0 ||
-		 state->access_plan_index_only_scans > 0 ||
-		 state->access_plan_bitmap_heap_scans > 0);
-	if (!core_planned && state->filters != NIL)
-		direct_indexed = bloompg_index_prefilter_available(state);
-	if (core_indexed)
-	{
-		decision.kind = BLOOMPG_ACCESS_CORE_INDEX;
-		decision.name = "core-index";
-		decision.reason = "bounded-exact-domain";
-		return decision;
-	}
 	if (direct_indexed)
 	{
 		decision.kind = BLOOMPG_ACCESS_DIRECT_INDEX;
-		decision.name = "direct-index";
-		decision.reason = "bounded-exact-domain";
+		decision.name = "bitmap-index";
+		decision.reason = "exact-indexed-domain";
 		return decision;
 	}
 
-	scan_required = state->filters != NIL || core_planned;
+	scan_required = state->filters != NIL;
 	decision.workers = bloompg_transfer_worker_count(state,
-		query_parallel_safe || state->access_plan_parallel_safe);
+		query_parallel_safe);
 	if (decision.workers > 0)
 	{
 		decision.parallel_memory = bloompg_parallel_pack_memory(
@@ -333,13 +338,7 @@ bloompg_choose_access(BloomPGRelationState *state, const char *query_string,
 	}
 	decision.workers = 0;
 	decision.parallel_memory = 0;
-	if (core_planned)
-	{
-		decision.kind = BLOOMPG_ACCESS_CORE_SCAN;
-		decision.name = "core-scan";
-		decision.reason = "parallel-memory-unavailable";
-	}
-	else if (state->table->rte_kind == RTE_RELATION &&
+	if (state->table->rte_kind == RTE_RELATION &&
 		state->filters != NIL &&
 		bloompg_scan_has_base_slot_semantics(state->fallback_plan))
 	{
@@ -605,8 +604,7 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 
 	state->materialization_used_filters |= state->filters != NIL;
 	INSTR_TIME_SET_CURRENT(started);
-	decision = bloompg_choose_access(state, query_string, bound_params,
-		query_parallel_safe);
+	decision = bloompg_choose_access(state, query_parallel_safe);
 	state->access_decision_kind = decision.name;
 	state->access_decision_reason = decision.reason;
 	state->access_decision_workers = decision.workers;
@@ -630,16 +628,6 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 		}
 		PG_END_TRY();
 	}
-	else if (decision.kind == BLOOMPG_ACCESS_CORE_INDEX ||
-		decision.kind == BLOOMPG_ACCESS_CORE_SCAN)
-	{
-		decision.core_plan->rowMarks = NIL;
-		decision.core_plan->resultRelations = NIL;
-		decision.core_plan->jitFlags = 0;
-		rows = bloompg_run_source_statement(decision.core_plan, pending, store,
-			descriptor, query_string, bound_params, 0,
-			&parallel_workers_launched, NULL, &inline_filter_ms);
-	}
 	else if (decision.kind == BLOOMPG_ACCESS_DIRECT_INDEX ||
 		decision.kind == BLOOMPG_ACCESS_SERIAL_SCAN)
 		rows = bloompg_execute_prefiltered_base_scan(state, candidate, pending,
@@ -659,7 +647,7 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 		state->vector_filter_builds++;
 	else
 	{
-		bloompg_build_pending_from_materialization(pending, store, *descriptor);
+		bloompg_build_pending_from_materialization(pending, store);
 		state->vector_filter_builds++;
 	}
 	filter_ms = inline_filter_ms +

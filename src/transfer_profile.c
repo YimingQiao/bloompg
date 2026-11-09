@@ -46,10 +46,6 @@ bloompg_selection_name(BloomPGSelectionState selection)
 			return "unconsidered";
 		case BLOOMPG_SELECTION_ELIGIBLE:
 			return selection.index_ready ? "index-ready" : "eligible";
-		case BLOOMPG_SELECTION_WAITING:
-			return "waiting";
-		case BLOOMPG_SELECTION_WAIT_BREAK:
-			return "wait-break";
 	}
 	return "unknown";
 }
@@ -70,15 +66,10 @@ bloompg_transfer_profile_append_step(StringInfo json, int step,
 	appendStringInfo(json,
 		",\"selection_join_index_sources\":%d,"
 		"\"selection_state\":\"%s\","
-		"\"selection_index_ready\":%s,\"selection_guarded\":%s,"
-		"\"selection_guard_fallback\":%s,"
-		"\"selection_native_fallback\":false",
+		"\"selection_index_ready\":%s",
 		bms_num_members(source->join_index_sources),
 		bloompg_selection_name(source->selection),
-		source->selection.index_ready ? "true" : "false",
-		bloompg_selection_is_guarded(source->selection) ? "true" : "false",
-		source->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
-			"true" : "false");
+		source->selection.index_ready ? "true" : "false");
 	appendStringInfo(json, ",\"destination_rti\":%u,\"destination\":",
 		pending->destination->rti);
 	escape_json(json, pending->destination->table->alias != NULL ?
@@ -257,29 +248,6 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 						}
 					}
 				}
-				if (state->access_plan_attempts > 0)
-					appendStringInfo(&detail,
-						" access_plan=" UINT64_FORMAT ":%s exact="
-						UINT64_FORMAT "/" UINT64_FORMAT
-						" cost=%.2f..%.2f rows=%.0f plan=%.3fms"
-						" nodes=" UINT64_FORMAT "/" UINT64_FORMAT "/"
-						UINT64_FORMAT "/" UINT64_FORMAT "/" UINT64_FORMAT
-						" reject=%s",
-						state->access_plan_attempts,
-						state->access_plan_kind != NULL ?
-							state->access_plan_kind : "none",
-						state->access_plan_exact_filters,
-						state->access_plan_exact_keys,
-						state->access_plan_startup_cost,
-						state->access_plan_total_cost,
-						state->access_plan_rows, state->access_plan_ms,
-						state->access_plan_seq_scans,
-						state->access_plan_index_scans,
-						state->access_plan_index_only_scans,
-						state->access_plan_bitmap_heap_scans,
-						state->access_plan_bitmap_index_scans,
-						state->access_plan_rejection != NULL ?
-							state->access_plan_rejection : "none");
 				if (state->parallel_wave_id != 0)
 					appendStringInfo(&detail,
 						" wave=" UINT64_FORMAT ":%s:%s:%s peer=%u workers="
@@ -456,27 +424,17 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				"\"materialization\":{\"access_path\":\"%s\","
 				"\"decision\":{\"kind\":\"%s\",\"reason\":\"%s\","
 				"\"workers\":%d},"
-				"\"selection\":{\"policy\":\"index-wait-guard-v2\","
+				"\"selection\":{\"policy\":\"%s\","
 				"\"state\":\"%s\",\"join_index_sources\":%d,"
-				"\"index_ready\":%s,"
-				"\"guarded\":%s,\"fallback\":%s,"
-				"\"native_fallback\":false},"
-				"\"access_plan\":{\"attempts\":" UINT64_FORMAT
-				",\"planning_ms\":%.3f,\"kind\":\"%s\","
-				"\"rejection\":\"%s\",\"exact_filters\":" UINT64_FORMAT
-				",\"exact_keys\":" UINT64_FORMAT
-				",\"startup_cost\":%.6f,\"total_cost\":%.6f,"
-				"\"rows\":%.3f,\"seq_scans\":" UINT64_FORMAT
-				",\"index_scans\":" UINT64_FORMAT
-				",\"index_only_scans\":" UINT64_FORMAT
-				",\"bitmap_heap_scans\":" UINT64_FORMAT
-				",\"bitmap_index_scans\":" UINT64_FORMAT
-				",\"gathers\":" UINT64_FORMAT "},"
+				"\"index_ready\":%s},"
 				"\"exact_scans\":" UINT64_FORMAT
 				",\"exact_ms\":%.3f,\"base_scans\":" UINT64_FORMAT
 				",\"base_ms\":%.3f,\"compact_scans\":" UINT64_FORMAT
 				",\"compact_ms\":%.3f,\"column_compactions\":" UINT64_FORMAT
 					",\"vector_filter_builds\":" UINT64_FORMAT
+					",\"worker_filter_parts\":" UINT64_FORMAT
+					",\"worker_filter_bytes\":" UINT64_FORMAT
+					",\"worker_filter_build_ms\":%.3f,\"worker_filter_merge_ms\":%.3f"
 					",\"filter_prepare_ms\":%.3f,\"filter_finalize_ms\":%.3f,"
 					"\"filter_build_ms\":%.3f,\"one_pass_bitmap_builds\":"
 					UINT64_FORMAT ",\"filter_finalize_rescans\":" UINT64_FORMAT
@@ -508,33 +466,16 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				state->access_decision_reason != NULL ?
 					state->access_decision_reason : "none",
 				state->access_decision_workers,
+				bloompg_index_transfer ? "selective-index-first" : "smallest-output",
 				bloompg_selection_name(state->selection),
 				bms_num_members(state->join_index_sources),
 				state->selection.index_ready ? "true" : "false",
-				bloompg_selection_is_guarded(state->selection) ?
-					"true" : "false",
-				state->selection.disposition == BLOOMPG_SELECTION_WAIT_BREAK ?
-					"true" : "false",
-				state->access_plan_attempts, state->access_plan_ms,
-				state->access_plan_kind != NULL ?
-					state->access_plan_kind : "none",
-				state->access_plan_rejection != NULL ?
-					state->access_plan_rejection : "none",
-				state->access_plan_exact_filters,
-				state->access_plan_exact_keys,
-				state->access_plan_startup_cost,
-				state->access_plan_total_cost,
-				state->access_plan_rows,
-				state->access_plan_seq_scans,
-				state->access_plan_index_scans,
-				state->access_plan_index_only_scans,
-				state->access_plan_bitmap_heap_scans,
-				state->access_plan_bitmap_index_scans,
-				state->access_plan_gathers,
 				state->exact_scans, state->exact_scan_ms,
 				state->base_materializations, state->base_materialize_ms,
 				state->compactions, state->compact_ms,
 					state->column_compactions, state->vector_filter_builds,
+					state->worker_filter_parts, state->worker_filter_bytes,
+					state->worker_filter_build_ms, state->worker_filter_merge_ms,
 					state->filter_prepare_ms, state->filter_finalize_ms,
 					state->filter_build_ms, state->one_pass_bitmap_builds,
 					state->filter_finalize_rescans,

@@ -332,11 +332,14 @@ bloompg_make_parallel_child(BloomPGRelationState *state,
 
 Plan *
 bloompg_make_parallel_source(BloomPGRelationState *state, int workers,
-	int *next_plan_node_id)
+	int *next_plan_node_id, List *build_metadata)
 {
 	Plan *child = bloompg_make_parallel_child(state, next_plan_node_id);
 	Plan *packed = bloompg_make_pack_scan(child, (*next_plan_node_id)++, workers);
 
+	if (build_metadata != NIL)
+		((CustomScan *) packed)->custom_private = lappend(
+			((CustomScan *) packed)->custom_private, build_metadata);
 	return bloompg_make_parallel_gather(packed, workers,
 		(*next_plan_node_id)++);
 }

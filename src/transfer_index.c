@@ -19,19 +19,15 @@
 #include "utils/array.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/typcache.h"
 
-/*
- * Index-assisted transfer deliberately starts with the case for which Bloom
- * already owns a compact, exact and deduplicated key set: a one-column
- * canonical integral bitmap.  Iterating its set bits in value order gives a
- * batched, locality-friendly series of B-tree probes without constructing a
- * second hash table or a giant ScalarArrayOpExpr.  Every fetched tuple still
- * passes through the original scan qual and all incoming filters in
- * transfer_materialize.c, so the index is only an access-path optimization.
- */
+/* Exact integral key sets drive PostgreSQL's native B-tree bitmap interface.
+ * Each set is passed once as a complete array scan key, without SQL planning
+ * or manual batches. Heap tuples always recheck every filter and local qual,
+ * including when work_mem forces the TID bitmap to use lossy pages. */
 
 typedef struct BloomPGIndexCandidate
 {
@@ -88,8 +84,6 @@ static bool
 bloompg_index_candidate_less(const BloomPGIndexCandidate *left,
 	const BloomPGIndexCandidate *right)
 {
-	if (left->estimated_fraction != right->estimated_fraction)
-		return left->estimated_fraction < right->estimated_fraction;
 	if (left->distinct_keys != right->distinct_keys)
 		return left->distinct_keys < right->distinct_keys;
 	if (left->sample_filter->token != right->sample_filter->token)
@@ -112,7 +106,8 @@ bloompg_compare_index_candidates(const void *left, const void *right)
 
 static int
 bloompg_collect_index_candidates(Relation heap_relation,
-	BloomPGRelationState *state, BloomPGIndexCandidate **result)
+	BloomPGRelationState *state, double max_fraction,
+	BloomPGIndexCandidate **result)
 {
 	List	   *index_oids;
 	ListCell   *filter_cell;
@@ -132,11 +127,11 @@ bloompg_collect_index_candidates(Relation heap_relation,
 		BloomPGFilter *filter = sample_filter->filter;
 		TypeCacheEntry *type_cache;
 		uint64		distinct_keys;
-		double		estimated_fraction;
+		double		estimated_fraction = -1.0;
 		uint64		sample_rows = 0;
 		uint64		sample_matches = 0;
 		double		estimate_ms = 0.0;
-		const char *estimate_source;
+		const char *estimate_source = "sample";
 		ListCell   *index_cell;
 		Oid			best_index_oid = InvalidOid;
 		BlockNumber best_index_blocks = InvalidBlockNumber;
@@ -152,20 +147,7 @@ bloompg_collect_index_candidates(Relation heap_relation,
 		if (type_cache == NULL || !OidIsValid(type_cache->eq_opr))
 			continue;
 		distinct_keys = bloompg_bitmap_distinct_keys(filter);
-		if (distinct_keys == 0 ||
-			distinct_keys > (uint64) bloompg_index_transfer_max_keys)
-			continue;
-		if (bloompg_sample_workspace_filter_fraction(state->sample_workspace,
-				sample_filter, &estimated_fraction, &sample_rows,
-				&sample_matches, &estimate_ms))
-			estimate_source = "sample";
-		else
-		{
-			estimated_fraction = state->filter_sample_fraction;
-			estimate_source = "combined-fallback";
-		}
-		estimated_fraction = Min(Max(estimated_fraction, 0.0), 1.0);
-		if (estimated_fraction > bloompg_index_transfer_max_fraction)
+		if (distinct_keys == 0)
 			continue;
 		foreach(index_cell, index_oids)
 		{
@@ -188,6 +170,15 @@ bloompg_collect_index_candidates(Relation heap_relation,
 			}
 		}
 		if (!OidIsValid(best_index_oid))
+			continue;
+		/* Estimate this index condition alone, not the output after unrelated
+		 * residual filters. An unavailable estimate does not justify an index. */
+		if (!bloompg_sample_workspace_filter_fraction(state->sample_workspace,
+				sample_filter, &estimated_fraction, &sample_rows,
+				&sample_matches, &estimate_ms))
+			continue;
+		estimated_fraction = Min(Max(estimated_fraction, 0.0), 1.0);
+		if (estimated_fraction > max_fraction)
 			continue;
 		found[found_count].sample_filter = sample_filter;
 		found[found_count].index_oid = best_index_oid;
@@ -216,7 +207,7 @@ bloompg_collect_index_candidates(Relation heap_relation,
 
 static bool
 bloompg_find_index_candidate(Relation heap_relation,
-	BloomPGRelationState *state, BloomPGIndexCandidate *result,
+	BloomPGRelationState *state, double max_fraction, BloomPGIndexCandidate *result,
 	int *dominated_count);
 
 static bool
@@ -335,7 +326,7 @@ bloompg_mark_dominated_index_candidates(BloomPGIndexCandidate *candidates,
 
 static bool
 bloompg_find_index_candidate(Relation heap_relation,
-	BloomPGRelationState *state, BloomPGIndexCandidate *result,
+	BloomPGRelationState *state, double max_fraction, BloomPGIndexCandidate *result,
 	int *dominated_count)
 {
 	BloomPGIndexCandidate *candidates;
@@ -348,7 +339,7 @@ bloompg_find_index_candidate(Relation heap_relation,
 	if (dominated_count != NULL)
 		*dominated_count = 0;
 	count = bloompg_collect_index_candidates(heap_relation, state,
-		&candidates);
+		max_fraction, &candidates);
 	if (count == 0)
 		return false;
 	dominated = palloc0_array(bool, count);
@@ -406,42 +397,8 @@ bloompg_integral_scan_datum(int64 value, Oid type_oid, Datum *result)
 	}
 }
 
-static bool
-bloompg_probe_array_batch(IndexScanDesc index_scan, ScanKey scan_key,
-	TupleTableSlot *slot, Datum *values, int value_count, Oid element_type,
-	BloomPGIndexTupleCallback callback, void *callback_context,
-	uint64 *rows_fetched)
-{
-	ArrayType  *array;
-	int16		type_length;
-	bool		type_by_value;
-	char		type_alignment;
-	bool		keep_scanning = true;
-
-	Assert(value_count > 0);
-	get_typlenbyvalalign(element_type, &type_length, &type_by_value,
-		&type_alignment);
-	array = construct_array(values, value_count, element_type, type_length,
-		type_by_value, type_alignment);
-	scan_key->sk_argument = PointerGetDatum(array);
-	index_rescan(index_scan, scan_key, 1, NULL, 0);
-	while (index_getnext_slot(index_scan, ForwardScanDirection, slot))
-	{
-		CHECK_FOR_INTERRUPTS();
-		(*rows_fetched)++;
-		if (!callback(slot, callback_context))
-		{
-			keep_scanning = false;
-			break;
-		}
-	}
-	ExecClearTuple(slot);
-	pfree(array);
-	return keep_scanning;
-}
-
 static void
-bloompg_bitmap_array_batch(IndexScanDesc index_scan, ScanKey scan_key,
+bloompg_bitmap_array_scan(IndexScanDesc index_scan, ScanKey scan_key,
 	TIDBitmap *bitmap, Datum *values, int value_count, Oid element_type,
 	uint64 *index_tuples)
 {
@@ -465,93 +422,36 @@ bloompg_bitmap_array_batch(IndexScanDesc index_scan, ScanKey scan_key,
 }
 
 static int
-bloompg_select_bitmap_candidates(BloomPGRelationState *state,
-	BloomPGIndexCandidate *candidates, int count, int *selected,
-	int *dominated_count)
+bloompg_select_bitmap_candidates(BloomPGIndexCandidate *candidates,
+	int count, int *selected, int *dominated_count)
 {
-	bool *dominated;
-	double current_rows;
+	bool *dominated = palloc0_array(bool, count);
 	int selected_count = 0;
-	int candidate_index;
+	int index;
 
-	*dominated_count = 0;
-	if (count <= 0)
-		return 0;
-	dominated = palloc0_array(bool, count);
 	*dominated_count = bloompg_mark_dominated_index_candidates(candidates,
 		count, dominated);
-	current_rows = 0.0;
-	for (candidate_index = 0;
-		candidate_index < count &&
-			selected_count < BLOOMPG_MAX_INDEX_BITMAP_SOURCES;
-		candidate_index++)
-	{
-		double build_rows;
-		double saved_rows;
-
-		if (dominated[candidate_index])
-			continue;
-		if (selected_count == 0)
-		{
-			selected[selected_count++] = candidate_index;
-			current_rows = state->base_rows *
-				candidates[candidate_index].estimated_fraction;
-			continue;
-		}
-		build_rows = state->base_rows *
-			candidates[candidate_index].estimated_fraction;
-		saved_rows = current_rows *
-			(1.0 - candidates[candidate_index].estimated_fraction);
-
-		/* Building another bitmap is useful only if the extra index work is of
-		 * the same order as the heap candidates it is expected to remove.  This
-		 * deliberately avoids scanning a low-cardinality role index merely to
-		 * shave a few rows from an already selective movie-id bitmap. */
-		if (build_rows > saved_rows * 2.0)
-			continue;
-		selected[selected_count++] = candidate_index;
-		current_rows *= candidates[candidate_index].estimated_fraction;
-	}
+	for (index = 0; index < count; index++)
+		if (!dominated[index])
+			selected[selected_count++] = index;
 	pfree(dominated);
 	return selected_count;
-}
-
-static bool
-bloompg_bitmap_candidates_preferred(BloomPGRelationState *state,
-	BloomPGIndexCandidate *candidates, int count, int *selected,
-	int *selected_count, int *dominated_count)
-{
-	static const double bitmap_min_heap_candidates = 8192.0;
-	double estimated_rows;
-
-	*selected_count = bloompg_select_bitmap_candidates(state, candidates,
-		count, selected, dominated_count);
-	if (*selected_count == 0)
-		return false;
-	estimated_rows = state->base_rows *
-		candidates[selected[0]].estimated_fraction;
-	return estimated_rows >= bitmap_min_heap_candidates ||
-		(*selected_count > 1 && estimated_rows >= 1024.0);
 }
 
 static TIDBitmap *
 bloompg_build_candidate_bitmap(Snapshot snapshot,
 	BloomPGIndexCandidate *candidate, uint64 *keys_probed,
-	uint64 *batches, uint64 *index_tuples, uint64 key_stride)
+	uint64 *batches, uint64 *index_tuples)
 {
 	BloomPGFilter *filter = candidate->sample_filter->filter;
 	Relation index_relation = NULL;
 	IndexScanDesc index_scan = NULL;
 	TIDBitmap *bitmap = NULL;
 	ScanKeyData scan_key;
-	Datum *batch_values = NULL;
-	int batch_count = 0;
+	Datum *values = NULL;
+	int value_count = 0;
 	uint64 word_count;
-	uint64 key_ordinal = 0;
-	Size bitmap_bytes = Max(mul_size((Size) Max(work_mem, 1), (Size) 1024),
-		(Size) 1024 * 1024);
-
-	key_stride = Max(key_stride, UINT64CONST(1));
+	Size bitmap_bytes = mul_size((Size) Max(work_mem, 1), (Size) 1024);
 
 	index_relation = index_open(candidate->index_oid, AccessShareLock);
 	if (!bloompg_index_matches_filter(index_relation,
@@ -565,7 +465,13 @@ bloompg_build_candidate_bitmap(Snapshot snapshot,
 		BTEqualStrategyNumber, filter->keys[0].build_type,
 		index_relation->rd_indcollation[0],
 		get_opcode(candidate->equality_operator), (Datum) 0);
-	batch_values = palloc_array(Datum, bloompg_index_transfer_batch_keys);
+	/* These are PostgreSQL allocation/array representation limits, not
+	 * policy limits on how many keys should use the index. */
+	if (candidate->distinct_keys > INT_MAX ||
+		candidate->distinct_keys > MaxAllocSize / sizeof(Datum))
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			errmsg("transfer key array exceeds PostgreSQL allocation limits")));
+	values = palloc_array(Datum, candidate->distinct_keys);
 	PG_TRY();
 	{
 		uint64 word_index;
@@ -576,6 +482,7 @@ bloompg_build_candidate_bitmap(Snapshot snapshot,
 		{
 			uint64 word = filter->words[word_index];
 
+			CHECK_FOR_INTERRUPTS();
 			while (word != 0)
 			{
 				int bit = pg_rightmost_one_pos64(word);
@@ -584,39 +491,25 @@ bloompg_build_candidate_bitmap(Snapshot snapshot,
 				Datum argument;
 
 				word &= word - 1;
-				if (key_ordinal++ % key_stride != 0)
-					continue;
 				if (value > filter->bitmap_upper ||
 					!bloompg_integral_scan_datum(value,
 						filter->keys[0].build_type, &argument))
 					continue;
-				batch_values[batch_count++] = argument;
-				if (batch_count == bloompg_index_transfer_batch_keys)
-				{
-					bloompg_bitmap_array_batch(index_scan, &scan_key, bitmap,
-						batch_values, batch_count,
-						filter->keys[0].build_type, index_tuples);
-					*keys_probed += (uint64) batch_count;
-					(*batches)++;
-					batch_count = 0;
-				}
+				values[value_count++] = argument;
 			}
 		}
-		if (batch_count > 0)
-		{
-			bloompg_bitmap_array_batch(index_scan, &scan_key, bitmap,
-				batch_values, batch_count, filter->keys[0].build_type,
-				index_tuples);
-			*keys_probed += (uint64) batch_count;
-			(*batches)++;
-		}
+		Assert((uint64) value_count == candidate->distinct_keys);
+		bloompg_bitmap_array_scan(index_scan, &scan_key, bitmap,
+			values, value_count, filter->keys[0].build_type, index_tuples);
+		*keys_probed += (uint64) value_count;
+		(*batches)++;
 	}
 	PG_FINALLY();
 	{
 		if (index_scan != NULL)
 			index_endscan(index_scan);
-		if (batch_values != NULL)
-			pfree(batch_values);
+		if (values != NULL)
+			pfree(values);
 		index_close(index_relation, AccessShareLock);
 	}
 	PG_END_TRY();
@@ -649,17 +542,12 @@ bloompg_bitmap_prefilter_scan(BloomPGRelationState *state,
 	int selected_index;
 
 	count = bloompg_collect_index_candidates(heap_relation, state,
-		&candidates);
+		bloompg_index_transfer_max_fraction, &candidates);
 	if (count == 0)
 		return false;
 	selected = palloc_array(int, count);
-	if (!bloompg_bitmap_candidates_preferred(state, candidates, count,
-			selected, &selected_count, &dominated_count))
-	{
-		pfree(selected);
-		pfree(candidates);
-		return false;
-	}
+	selected_count = bloompg_select_bitmap_candidates(candidates, count,
+		selected, &dominated_count);
 	INSTR_TIME_SET_CURRENT(started);
 	PG_TRY();
 	{
@@ -673,7 +561,7 @@ bloompg_bitmap_prefilter_scan(BloomPGRelationState *state,
 			uint64 source_index_tuples = 0;
 			TIDBitmap *next = bloompg_build_candidate_bitmap(snapshot,
 				candidate, &source_keys, &source_batches,
-				&source_index_tuples, 1);
+				&source_index_tuples);
 
 			if (next == NULL)
 				continue;
@@ -779,7 +667,8 @@ bloompg_bitmap_prefilter_scan(BloomPGRelationState *state,
 }
 
 bool
-bloompg_index_prefilter_available(BloomPGRelationState *state)
+bloompg_index_prefilter_available(BloomPGRelationState *state,
+	double max_fraction)
 {
 	BloomPGIndexCandidate candidate;
 	Relation	heap_relation;
@@ -790,8 +679,8 @@ bloompg_index_prefilter_available(BloomPGRelationState *state)
 		!OidIsValid(state->table->relation_oid))
 		return false;
 	heap_relation = table_open(state->table->relation_oid, AccessShareLock);
-	available = bloompg_find_index_candidate(heap_relation, state, &candidate,
-		NULL);
+	available = bloompg_find_index_candidate(heap_relation, state, max_fraction,
+		&candidate, NULL);
 	table_close(heap_relation, AccessShareLock);
 	return available;
 }
@@ -855,114 +744,6 @@ bloompg_index_prefilter_scan(BloomPGRelationState *state,
 	Relation heap_relation, Snapshot snapshot,
 	BloomPGIndexTupleCallback callback, void *callback_context)
 {
-	BloomPGIndexCandidate candidate;
-	BloomPGFilter *filter;
-	Relation	index_relation = NULL;
-	IndexScanDesc index_scan = NULL;
-	TupleTableSlot *slot;
-	ScanKeyData scan_key;
-	instr_time	started;
-	uint64		word_count;
-	uint64		keys_probed = 0;
-	uint64		batches = 0;
-	uint64		rows_fetched = 0;
-	bool		keep_scanning = true;
-	Datum	   *batch_values;
-	int			batch_count = 0;
-	int			dominated_count = 0;
-
-	if (bloompg_bitmap_prefilter_scan(state, heap_relation, snapshot,
-			callback, callback_context))
-		return true;
-
-	if (!bloompg_find_index_candidate(heap_relation, state, &candidate,
-			&dominated_count))
-		return false;
-	filter = candidate.sample_filter->filter;
-	index_relation = index_open(candidate.index_oid, AccessShareLock);
-	if (!bloompg_index_matches_filter(index_relation,
-			candidate.sample_filter, candidate.equality_operator))
-	{
-		index_close(index_relation, AccessShareLock);
-		return false;
-	}
-	slot = table_slot_create(heap_relation, NULL);
-	ScanKeyEntryInitialize(&scan_key, SK_SEARCHARRAY, 1, BTEqualStrategyNumber,
-		filter->keys[0].build_type, index_relation->rd_indcollation[0],
-		get_opcode(candidate.equality_operator), (Datum) 0);
-	batch_values = palloc_array(Datum, bloompg_index_transfer_batch_keys);
-	INSTR_TIME_SET_CURRENT(started);
-	PG_TRY();
-	{
-		uint64 word_index;
-
-		index_scan = index_beginscan(heap_relation, index_relation, snapshot,
-			NULL, 1, 0);
-		word_count = filter->nbits / 64;
-		for (word_index = 0; word_index < word_count && keep_scanning;
-			 word_index++)
-		{
-			uint64 word = filter->words[word_index];
-
-			while (word != 0 && keep_scanning)
-			{
-				int bit = pg_rightmost_one_pos64(word);
-				uint64 bit_offset = word_index * 64 + (uint64) bit;
-				int64 value = filter->bitmap_lower + (int64) bit_offset;
-				Datum argument;
-
-				word &= word - 1;
-				if (value > filter->bitmap_upper ||
-					!bloompg_integral_scan_datum(value,
-						filter->keys[0].build_type, &argument))
-					continue;
-				batch_values[batch_count++] = argument;
-				if (batch_count == bloompg_index_transfer_batch_keys)
-				{
-					keep_scanning = bloompg_probe_array_batch(index_scan,
-						&scan_key, slot, batch_values, batch_count,
-						filter->keys[0].build_type, callback,
-						callback_context, &rows_fetched);
-					keys_probed += (uint64) batch_count;
-					batches++;
-					batch_count = 0;
-				}
-			}
-		}
-		if (batch_count > 0 && keep_scanning)
-		{
-			keep_scanning = bloompg_probe_array_batch(index_scan, &scan_key,
-				slot, batch_values, batch_count, filter->keys[0].build_type,
-				callback, callback_context, &rows_fetched);
-			keys_probed += (uint64) batch_count;
-			batches++;
-			batch_count = 0;
-		}
-	}
-	PG_FINALLY();
-	{
-		if (index_scan != NULL)
-			index_endscan(index_scan);
-		pfree(batch_values);
-		ExecDropSingleTupleTableSlot(slot);
-		index_close(index_relation, AccessShareLock);
-	}
-	PG_END_TRY();
-	state->index_probe_scans++;
-	state->index_probe_batches += batches;
-	state->index_probe_keys += keys_probed;
-	state->index_probe_rows += rows_fetched;
-	state->index_probe_ms += bloompg_transfer_elapsed_ms(started);
-	state->index_probe_fraction = candidate.estimated_fraction;
-	state->index_probe_oid = candidate.index_oid;
-	state->index_probe_attribute = candidate.sample_filter->attributes[0];
-	state->index_probe_filter_token = candidate.sample_filter->token;
-	state->index_probe_candidates += candidate.candidates;
-	state->index_probe_sample_rows += candidate.sample_rows;
-	state->index_probe_sample_matches += candidate.sample_matches;
-	state->index_probe_estimate_ms += candidate.estimate_ms;
-	state->index_probe_estimate_source = candidate.estimate_source;
-	state->index_probe_dominated_candidates += (uint64) dominated_count;
-	state->materialization_access_path = "index-probe";
-	return true;
+	return bloompg_bitmap_prefilter_scan(state, heap_relation, snapshot,
+		callback, callback_context);
 }

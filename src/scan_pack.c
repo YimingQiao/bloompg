@@ -4,6 +4,7 @@
 #include "bloompg/column_store.h"
 #include "bloompg/scan.h"
 #include "bloompg/scan_internal.h"
+#include "bloompg/worker_build.h"
 
 #include "catalog/pg_type_d.h"
 #include "access/detoast.h"
@@ -54,6 +55,14 @@ typedef struct BloomPGPackState
 	Size		packet_limit;
 	uint64		packets;
 	uint64		rows;
+	MemoryContext build_context;
+	List *build_metadata;
+	List *build_pending;
+	int build_index;
+	uint64 build_offset;
+	double build_ms;
+	bytea *build_packet;
+	bool input_done;
 } BloomPGPackState;
 
 static Node *bloompg_create_pack_state(CustomScan *scan);
@@ -275,10 +284,22 @@ bloompg_begin_pack(CustomScanState *custom_state, EState *estate, int eflags)
 
 	if (list_length(scan->custom_plans) != 1)
 		elog(ERROR, "invalid bloompg vector-pack child plan");
-	if (list_length(scan->custom_private) != 1 ||
+	if ((list_length(scan->custom_private) != 1 &&
+		 list_length(scan->custom_private) != 2) ||
 		!IsA(linitial(scan->custom_private), Integer) ||
 		intVal(linitial(scan->custom_private)) <= 0)
 		elog(ERROR, "invalid bloompg vector-pack worker count");
+	if (list_length(scan->custom_private) == 2)
+	{
+		MemoryContext old_context;
+
+		state->build_metadata = lsecond(scan->custom_private);
+		state->build_context = AllocSetContextCreate(estate->es_query_cxt,
+			"BloomPG worker filter build", ALLOCSET_DEFAULT_SIZES);
+		old_context = MemoryContextSwitchTo(state->build_context);
+		state->build_pending = bloompg_worker_build_begin(state->build_metadata);
+		MemoryContextSwitchTo(old_context);
+	}
 	state->child = ExecInitNode((Plan *) linitial(scan->custom_plans), estate,
 		eflags);
 	state->css.custom_ps = list_make1(state->child);
@@ -421,13 +442,16 @@ bloompg_exec_pack(CustomScanState *custom_state)
 			sizeof(uint64) * BLOOMPG_VALIDITY_WORDS);
 		vector->heap_used = 0;
 	}
-	while (rows < BLOOMPG_VECTOR_SIZE)
+	while (!state->input_done && rows < BLOOMPG_VECTOR_SIZE)
 	{
 		TupleTableSlot *slot = ExecProcNode(state->child);
 		Size row_heap_bytes = 0;
 
 		if (TupIsNull(slot))
+		{
+			state->input_done = true;
 			break;
+		}
 		slot_getallattrs(slot);
 		for (attribute = 0; attribute < state->descriptor->natts; attribute++)
 		{
@@ -446,13 +470,43 @@ bloompg_exec_pack(CustomScanState *custom_state)
 		if (heap_bytes >= state->packet_target)
 			break;
 	}
-	if (rows == 0)
-		return NULL;
 	ExecClearTuple(output);
-	output->tts_values[0] = PointerGetDatum(bloompg_pack_serialize(state, rows));
+	if (rows == 0)
+	{
+		MemoryContext old_context;
+
+		if (state->build_context == NULL)
+			return NULL;
+		old_context = MemoryContextSwitchTo(state->build_context);
+		if (state->build_packet != NULL)
+			pfree(state->build_packet);
+		state->build_packet = bloompg_worker_build_packet(state->build_pending,
+			state->build_metadata, &state->build_index, &state->build_offset,
+			state->build_ms);
+		MemoryContextSwitchTo(old_context);
+		if (state->build_packet == NULL)
+			return NULL;
+		output->tts_values[0] = PointerGetDatum(state->build_packet);
+	}
+	else
+	{
+		if (state->build_context != NULL)
+		{
+			MemoryContext old_context = MemoryContextSwitchTo(state->build_context);
+			instr_time started;
+
+			INSTR_TIME_SET_CURRENT(started);
+			bloompg_process_pending_dense_chunk(state->build_pending, state->vectors,
+				state->descriptor->natts, rows);
+			state->build_ms += bloompg_transfer_elapsed_ms(started);
+			MemoryContextSwitchTo(old_context);
+		}
+		output->tts_values[0] = PointerGetDatum(bloompg_pack_serialize(state, rows));
+	}
 	output->tts_isnull[0] = false;
 	ExecStoreVirtualTuple(output);
-	state->packets++;
+	if (rows > 0)
+		state->packets++;
 	state->rows += rows;
 	custom_state->ss.ps.ps_ExprContext->ecxt_scantuple = output;
 	if (custom_state->ss.ps.ps_ProjInfo != NULL)
@@ -467,6 +521,8 @@ bloompg_end_pack(CustomScanState *custom_state)
 
 	if (state->child != NULL)
 		ExecEndNode(state->child);
+	if (state->build_context != NULL)
+		MemoryContextDelete(state->build_context);
 }
 
 static void
@@ -474,6 +530,20 @@ bloompg_rescan_pack(CustomScanState *custom_state)
 {
 	BloomPGPackState *state = (BloomPGPackState *) custom_state;
 
+	state->input_done = false;
+	state->build_index = 0;
+	state->build_offset = 0;
+	state->build_ms = 0;
+	state->build_packet = NULL;
+	if (state->build_context != NULL)
+	{
+		MemoryContext old_context;
+
+		MemoryContextReset(state->build_context);
+		old_context = MemoryContextSwitchTo(state->build_context);
+		state->build_pending = bloompg_worker_build_begin(state->build_metadata);
+		MemoryContextSwitchTo(old_context);
+	}
 	if (state->child != NULL)
 		ExecReScan(state->child);
 }

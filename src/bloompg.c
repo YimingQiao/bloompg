@@ -24,12 +24,11 @@ bool bloompg_replan_after_transfer = true;
 bool bloompg_late_materialize = true;
 int bloompg_late_materialize_min_width = 128;
 int bloompg_transfer_workers = 4;
+bool bloompg_parallel_filter_build = true;
 int bloompg_transfer_parallel_min_rows = 100000;
 bool bloompg_index_transfer = false;
-double bloompg_index_transfer_max_fraction = 0.15;
-int bloompg_index_transfer_batch_keys = 65536;
-int bloompg_index_transfer_max_keys = 100000;
-int bloompg_index_transfer_planner_max_keys = 8192;
+double bloompg_index_transfer_max_fraction = 0.10;
+double bloompg_index_priority_max_fraction = 0.01;
 int bloompg_index_guard_min_rows = 100000;
 int bloompg_transfer_progress_metric = BLOOMPG_TRANSFER_PROGRESS_NDV;
 int bloompg_sample_size = 10000;
@@ -227,6 +226,10 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+	DefineCustomBoolVariable("bloompg.parallel_filter_build",
+		"Build private outgoing filters in scan workers and merge them in the leader.",
+		NULL, &bloompg_parallel_filter_build, true, PGC_USERSET, 0,
+		NULL, NULL, NULL);
 	DefineCustomIntVariable("bloompg.transfer_workers",
 							"Maximum PostgreSQL parallel workers for an eligible transfer scan; zero disables transfer parallelism.",
 							NULL,
@@ -252,8 +255,8 @@ _PG_init(void)
 							NULL,
 							NULL);
 	DefineCustomBoolVariable("bloompg.index_transfer",
-							 "Use exact transfer keys to drive matching B-tree indexes.",
-							 "Experimental; disabled by default because parallel scans can outperform medium-sized exact-key probes.",
+							 "Use selective exact transfer keys to drive native bitmap scans.",
+							 "Selective index access can also receive scheduling priority.",
 							 &bloompg_index_transfer,
 							 false,
 							 PGC_USERSET,
@@ -262,55 +265,15 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 	DefineCustomRealVariable("bloompg.index_transfer_max_fraction",
-							 "Maximum sampled survivor fraction for exact-key B-tree transfer scans.",
-							 NULL,
-							 &bloompg_index_transfer_max_fraction,
-							 0.15,
-							 0.0,
-							 1.0,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-	DefineCustomIntVariable("bloompg.index_transfer_batch_keys",
-							 "Exact keys in one PostgreSQL B-tree search-array batch.",
-							 NULL,
-							 &bloompg_index_transfer_batch_keys,
-							 65536,
-							 1,
-							 10000000,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-	DefineCustomIntVariable("bloompg.index_transfer_max_keys",
-							 "Maximum exact-key population eligible for an optimizer-time B-tree transfer scan.",
-							 NULL,
-							 &bloompg_index_transfer_max_keys,
-							 100000,
-							 1,
-							 1000000000,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
-	DefineCustomIntVariable("bloompg.index_transfer_planner_max_keys",
-							 "Maximum total exact keys expanded into one private PostgreSQL transfer access plan.",
-							 "Larger exact sets retain the batched direct-probe path to avoid excessive planner CPU.",
-							 &bloompg_index_transfer_planner_max_keys,
-							 8192,
-							 1,
-							 1000000000,
-							 PGC_USERSET,
-							 0,
-							 NULL,
-							 NULL,
-							 NULL);
+							 "Maximum individual index-filter selectivity for bitmap access.",
+							 NULL, &bloompg_index_transfer_max_fraction,
+							 0.10, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("bloompg.index_priority_max_fraction",
+							 "Maximum individual index-filter selectivity for scheduling priority.",
+							 NULL, &bloompg_index_priority_max_fraction,
+							 0.01, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("bloompg.index_guard_min_rows",
-							 "Minimum base-relation rows before a relation with a join-key index waits for exact transfer keys.",
+							 "Minimum materialized rows for the P1 parameterized-index rescan protection.",
 							 NULL,
 							 &bloompg_index_guard_min_rows,
 							 100000,

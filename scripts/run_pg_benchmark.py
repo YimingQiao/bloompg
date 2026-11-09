@@ -107,16 +107,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    parser.add_argument("--index-transfer-max-fraction", type=float, default=0.15)
-    parser.add_argument("--index-transfer-batch-keys", type=int, default=65_536)
-    parser.add_argument("--index-transfer-max-keys", type=int, default=100_000)
+    parser.add_argument("--index-transfer-max-fraction", type=float, default=0.10)
+    parser.add_argument("--index-priority-max-fraction", type=float, default=0.01)
     parser.add_argument(
         "--index-guard-min-rows",
         type=int,
         default=100_000,
         help=(
-            "Base rows above which a relation with a join-key index waits "
-            "for exact incoming keys (default: 100000)"
+            "Materialized rows above which P1 protects a parameterized index "
+            "against repeated full rescans (default: 100000)"
         ),
     )
     parser.add_argument(
@@ -201,8 +200,7 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         f"-c bloompg.transfer_parallel_min_rows={args.transfer_parallel_min_rows}",
         f"-c bloompg.index_transfer={'on' if args.index_transfer else 'off'}",
         f"-c bloompg.index_transfer_max_fraction={args.index_transfer_max_fraction}",
-        f"-c bloompg.index_transfer_batch_keys={args.index_transfer_batch_keys}",
-        f"-c bloompg.index_transfer_max_keys={args.index_transfer_max_keys}",
+        f"-c bloompg.index_priority_max_fraction={args.index_priority_max_fraction}",
         f"-c bloompg.index_guard_min_rows={args.index_guard_min_rows}",
         f"-c bloompg.transfer_progress_metric={args.transfer_progress_metric}",
         f"-c bloompg.profile={'on' if args.capture_profile else 'off'}",
@@ -428,10 +426,8 @@ SELECT json_build_object(
     ,'bloompg_index_transfer', current_setting('bloompg.index_transfer')
     ,'bloompg_index_transfer_max_fraction',
         current_setting('bloompg.index_transfer_max_fraction')
-    ,'bloompg_index_transfer_batch_keys',
-        current_setting('bloompg.index_transfer_batch_keys')
-    ,'bloompg_index_transfer_max_keys',
-        current_setting('bloompg.index_transfer_max_keys')
+    ,'bloompg_index_priority_max_fraction',
+        current_setting('bloompg.index_priority_max_fraction')
     ,'bloompg_index_guard_min_rows',
         current_setting('bloompg.index_guard_min_rows')
     ,'bloompg_transfer_progress_metric',
@@ -628,10 +624,8 @@ def main() -> int:
         raise SystemExit("--transfer-parallel-min-rows must be non-negative")
     if not 0.0 <= args.index_transfer_max_fraction <= 1.0:
         raise SystemExit("--index-transfer-max-fraction must be between 0 and 1")
-    if args.index_transfer_batch_keys < 1:
-        raise SystemExit("--index-transfer-batch-keys must be positive")
-    if args.index_transfer_max_keys < 1:
-        raise SystemExit("--index-transfer-max-keys must be positive")
+    if not 0.0 <= args.index_priority_max_fraction <= 1.0:
+        raise SystemExit("--index-priority-max-fraction must be between 0 and 1")
     if args.index_guard_min_rows < 0:
         raise SystemExit("--index-guard-min-rows must be non-negative")
     if args.queries_per_group is not None and args.queries_per_group < 1:
@@ -670,8 +664,7 @@ def main() -> int:
         "bloompg_transfer_parallel_min_rows": args.transfer_parallel_min_rows,
         "bloompg_index_transfer": "on" if args.index_transfer else "off",
         "bloompg_index_transfer_max_fraction": args.index_transfer_max_fraction,
-        "bloompg_index_transfer_batch_keys": args.index_transfer_batch_keys,
-        "bloompg_index_transfer_max_keys": args.index_transfer_max_keys,
+        "bloompg_index_priority_max_fraction": args.index_priority_max_fraction,
         "bloompg_index_guard_min_rows": args.index_guard_min_rows,
         "bloompg_transfer_progress_metric": args.transfer_progress_metric,
     }
