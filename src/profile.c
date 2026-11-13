@@ -31,8 +31,6 @@ typedef struct BloomPGPlannedProfile
 	double		transfer_ms;
 	double		statistics_ms;
 	double		p1_ms;
-	uint64		p1_cardinality_adjustments;
-	double		p1_cardinality_max_ratio;
 	int			work_mem_kb;
 	double		hash_mem_multiplier;
 	int			max_parallel_workers_per_gather;
@@ -188,14 +186,10 @@ bloompg_profile_build_json(BloomPGPlannedProfile *planned,
 		"\"native_preview_ms\":%.3f,"
 		"\"graph_ms\":%.3f,\"transfer_ms\":%.3f,"
 		"\"statistics_ms\":%.3f,\"p1_ms\":%.3f,"
-		"\"p1_cardinality_adjustments\":" UINT64_FORMAT ","
-		"\"p1_cardinality_max_ratio\":%.6f,"
 		"\"replanned\":%s,\"transfer_failed\":%s",
 		planned->planning_ms, planned->p0_ms, planned->native_preview_ms,
 		planned->graph_ms,
 		planned->transfer_ms, planned->statistics_ms, planned->p1_ms,
-		planned->p1_cardinality_adjustments,
-		planned->p1_cardinality_max_ratio,
 		planned->replanned ? "true" : "false",
 		planned->transfer_failed ? "true" : "false");
 	if (planned->transfer_failed)
@@ -554,10 +548,6 @@ bloompg_profile_remember_plan(PlannedStmt *statement,
 	profile->transfer_ms = input->transfer_ms;
 	profile->statistics_ms = input->statistics_ms;
 	profile->p1_ms = input->p1_ms;
-	profile->p1_cardinality_adjustments =
-		input->p1_cardinality_adjustments;
-	profile->p1_cardinality_max_ratio =
-		input->p1_cardinality_max_ratio;
 	profile->work_mem_kb = work_mem;
 	profile->hash_mem_multiplier = hash_mem_multiplier;
 	profile->max_parallel_workers_per_gather =

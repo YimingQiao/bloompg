@@ -1117,6 +1117,59 @@ RESET bloompg.transfer_progress_metric;
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 
+-- Post-transfer column statistics feed PostgreSQL's own join estimator.
+CREATE TABLE stats_parent AS
+SELECT 1 + g % 100 AS k, g % 100 < 10 AS keep
+FROM generate_series(1, 2000) AS g;
+CREATE TABLE stats_child AS
+SELECT 1 + g % 100 AS k FROM generate_series(1, 3000) AS g;
+ANALYZE stats_parent, stats_child;
+DO $$
+DECLARE
+    queries text[] := ARRAY[
+        'SELECT count(*) FROM stats_parent p JOIN stats_child c USING (k) WHERE p.keep',
+        'SELECT count(*) FROM stats_parent p JOIN stats_child c USING (k) WHERE p.keep AND p.k <= 5',
+        'SELECT count(*) FROM stats_parent p JOIN stats_parent c USING (k) WHERE p.keep'
+    ];
+    expected integer[] := ARRAY[6000, 3000, 4000];
+    plan_json jsonb;
+    join_node jsonb;
+    original_stats jsonb;
+    current_stats jsonb;
+    i integer;
+BEGIN
+    PERFORM set_config('bloompg.enable', 'off', true);
+    SELECT jsonb_agg(to_jsonb(s) ORDER BY starelid, staattnum, stainherit)
+    INTO original_stats FROM pg_statistic s
+    WHERE starelid IN ('stats_parent'::regclass, 'stats_child'::regclass);
+    PERFORM set_config('bloompg.enable', 'on', true);
+    PERFORM set_config('bloompg.late_materialize', 'off', true);
+    FOR i IN 1..array_length(queries, 1) LOOP
+        EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) ' || queries[i]
+        INTO plan_json;
+        join_node := plan_json->0->'Plan'->'Plans'->0;
+        IF (join_node->>'Plan Rows')::numeric <> expected[i]
+           OR (join_node->>'Actual Rows')::numeric <> expected[i]
+           OR NOT jsonb_path_exists(plan_json,
+               '$.** ? (@."Custom Plan Provider" == "BloomPG Memory")') THEN
+            RAISE EXCEPTION 'post-transfer NDV estimate % failed: %', i, plan_json;
+        END IF;
+    END LOOP;
+    PERFORM set_config('bloompg.enable', 'off', true);
+    SELECT jsonb_agg(to_jsonb(s) ORDER BY starelid, staattnum, stainherit)
+    INTO current_stats FROM pg_statistic s
+    WHERE starelid IN ('stats_parent'::regclass, 'stats_child'::regclass);
+    IF current_stats IS DISTINCT FROM original_stats THEN
+        RAISE EXCEPTION 'query-local statistics changed pg_statistic';
+    END IF;
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT count(*) FROM stats_parent JOIN stats_child USING (k)'
+    INTO plan_json;
+    IF (plan_json->0->'Plan'->'Plans'->0->>'Plan Rows')::numeric <> 60000 THEN
+        RAISE EXCEPTION 'post-transfer statistics leaked into native planning';
+    END IF;
+END
+$$;
+
 DROP SCHEMA bloompg_regress CASCADE;
 DROP EXTENSION bloompg;
 RESET client_min_messages;

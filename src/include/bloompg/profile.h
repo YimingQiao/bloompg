@@ -18,8 +18,6 @@ typedef struct BloomPGPlanProfileInput
 	double		transfer_ms;
 	double		statistics_ms;
 	double		p1_ms;
-	uint64		p1_cardinality_adjustments;
-	double		p1_cardinality_max_ratio;
 	bool		replanned;
 	bool		transfer_failed;
 	int		transfer_error_code;

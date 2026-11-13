@@ -8,9 +8,8 @@
 
 /*
  * Statistics for one equality-key vector shared by two relations.  A key can
- * contain several columns; estimating it as one composite value avoids the
- * severe underestimates caused by multiplying correlated per-column
- * selectivities.
+ * contain several columns.  A composite distinct count describes complete
+ * key tuples; it must not be used as a constituent column's NDV.
  *
  * The arrays describe this relation's side of the equality.  Hash procedures
  * are chosen from the equality operators, so cross-type hash joins retain

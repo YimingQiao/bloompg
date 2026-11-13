@@ -52,6 +52,23 @@ optimizer work and executes the original PostgreSQL plan. It never silently
 turns the materialization into a disk spill. Use `bloompg_tune.py` to size the
 query-wide budget for dedicated analytical deployments and concurrency.
 
+## Reoptimization
+
+BloomPG supplies reduced base-relation cardinalities and access paths to the
+second PostgreSQL planning pass. For materialized base relations, it also exposes
+collected single-column join-key NDVs and NULL fractions through PostgreSQL's
+`get_relation_stats_hook`. These query-local statistics do not modify
+`pg_statistic`; PostgreSQL estimates joins and chooses the execution plan.
+
+Statistics become visible after the corresponding base path is replaced, so
+original scan predicates are not estimated against already filtered rows.
+Original MCV lists and histograms are not attached to the updated column
+statistics. Composite-key NDVs are retained internally but are not passed as
+single-column NDVs: PostgreSQL 18's column-statistics hook cannot express them,
+and its extended statistics do not provide general multicolumn join estimation.
+Columns without collected single-column statistics keep PostgreSQL's normal
+statistics lookup. Tables with only pending filters likewise retain that lookup.
+
 ## Worker-local filter construction
 
 Direct parallel transfer scans build one private filter per distinct outgoing

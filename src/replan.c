@@ -5,25 +5,28 @@
 #include "bloompg/path_transform.h"
 #include "bloompg/replan.h"
 
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_statistic.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "catalog/pg_class.h"
-#include "optimizer/optimizer.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/selfuncs.h"
 
 static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
-static set_join_pathlist_hook_type previous_set_join_pathlist_hook = NULL;
+static get_relation_stats_hook_type previous_get_relation_stats_hook = NULL;
+static Bitmapset *active_statistics_relids = NULL;
+static MemoryContext active_replan_context = NULL;
 static List *active_replacements = NIL;
 static const BloomPGJoinGraph *active_graph = NULL;
-static uint64 cardinality_adjustments = 0;
-static double cardinality_max_ratio = 1.0;
-
-static void bloompg_set_join_pathlist(PlannerInfo *root,
-	RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel,
-	JoinType jointype, JoinPathExtraData *extra);
 
 static Plan *bloompg_plan_memory_path(PlannerInfo *root,
 									 RelOptInfo *rel,
@@ -74,6 +77,85 @@ bloompg_find_replacement(Index rti)
 	return NULL;
 }
 
+/*
+ * Supply query-local pg_statistic tuples, not join selectivity rules.  Enable
+ * them only after replacing the base path: original scan quals must still be
+ * costed against the original relation, rather than filtering its survivors
+ * a second time.  RTIs, not relation OIDs, distinguish self-join aliases.
+ */
+static bool
+bloompg_get_relation_stats(PlannerInfo *root, RangeTblEntry *rte,
+	AttrNumber attnum, VariableStatData *vardata)
+{
+	BloomPGReplacement *replacement;
+	BloomPGMaterializedStatistics *statistics;
+	ListCell *cell;
+	int rti = -1;
+
+	if (active_replacements == NIL || root->parent_root != NULL ||
+		rte->rtekind != RTE_RELATION || attnum <= 0)
+		goto fallback;
+	/* Some callers (e.g., BRIN costing) leave vardata's input fields unset. */
+	while ((rti = bms_next_member(active_statistics_relids, rti)) >= 0)
+	{
+		if (rti < root->simple_rel_array_size &&
+			root->simple_rte_array[rti] == rte)
+			break;
+	}
+	if (rti < 0)
+		goto fallback;
+	replacement = bloompg_find_replacement(rti);
+	if (replacement == NULL || replacement->statistics == NULL)
+		goto fallback;
+	statistics = replacement->statistics;
+	if (statistics->rows == 0)
+		goto fallback;
+	foreach(cell, statistics->join_keys)
+	{
+		BloomPGJoinKeyStatistics *keys = lfirst(cell);
+		Datum values[Natts_pg_statistic] = {0};
+		bool nulls[Natts_pg_statistic] = {false};
+		Relation catalog;
+		Bitmapset *attributes;
+		Oid typid;
+		Oid collid;
+		int32 typmod;
+		int column;
+
+		/* A composite NDV is not the NDV of any constituent column. */
+		if (keys->nkeys != 1 || keys->base_attributes[0] != attnum)
+			continue;
+		get_atttypetypmodcoll(rte->relid, attnum, &typid, &typmod, &collid);
+		values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(rte->relid);
+		values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(attnum);
+		values[Anum_pg_statistic_stainherit - 1] = BoolGetDatum(rte->inh);
+		values[Anum_pg_statistic_stanullfrac - 1] =
+			Float4GetDatum((float4) ((double) keys->null_rows / statistics->rows));
+		values[Anum_pg_statistic_stadistinct - 1] =
+			Float4GetDatum((float4) Min(keys->ndistinct, (double) keys->nonnull_rows));
+		values[Anum_pg_statistic_stawidth - 1] =
+			Int32GetDatum(get_typavgwidth(typid, typmod));
+		/* No post-filter MCVs or histograms were collected.  Do not attach
+		 * the original distribution to the new NDV and NULL fraction. */
+		for (column = Anum_pg_statistic_stanumbers1 - 1;
+			 column < Natts_pg_statistic; column++)
+			nulls[column] = true;
+		catalog = table_open(StatisticRelationId, AccessShareLock);
+		vardata->statsTuple = heap_form_tuple(RelationGetDescr(catalog),
+			values, nulls);
+		table_close(catalog, AccessShareLock);
+		vardata->freefunc = heap_freetuple;
+		attributes = bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber);
+		vardata->acl_ok = all_rows_selectable(root, rti, attributes);
+		bms_free(attributes);
+		return true;
+	}
+
+fallback:
+	return previous_get_relation_stats_hook != NULL &&
+		previous_get_relation_stats_hook(root, rte, attnum, vardata);
+}
+
 static bool
 bloompg_replacement_is_exact(Index rti)
 {
@@ -109,177 +191,6 @@ bloompg_parameterized_path_is_equivalent(BloomPGReplacement *replacement,
 			return false;
 	}
 	return true;
-}
-
-static BloomPGJoinKeyStatistics *
-bloompg_find_join_key_statistics(BloomPGReplacement *replacement,
-	Index peer_rti)
-{
-	ListCell *cell;
-
-	if (replacement == NULL || replacement->statistics == NULL)
-		return NULL;
-	foreach(cell, replacement->statistics->join_keys)
-	{
-		BloomPGJoinKeyStatistics *keys = lfirst(cell);
-
-		if (keys->peer_rti == peer_rti)
-			return keys;
-	}
-	return NULL;
-}
-
-static bool
-bloompg_join_key_statistics_compatible(
-	const BloomPGJoinKeyStatistics *outer,
-	const BloomPGJoinKeyStatistics *inner)
-{
-	int key;
-
-	if (outer == NULL || inner == NULL || outer->nkeys != inner->nkeys ||
-		outer->nkeys <= 0)
-		return false;
-	for (key = 0; key < outer->nkeys; key++)
-	{
-		if (outer->operators[key] != inner->operators[key] ||
-			outer->collations[key] != inner->collations[key])
-			return false;
-	}
-	return true;
-}
-
-/*
- * Estimate an inner join from statistics sealed after transfer.  Fixed-point
- * transfer makes the smaller surviving key domain approximately contained in
- * the larger one (exactly so for bitmap filters, modulo Bloom false positives
- * otherwise), making the classic max(NDV) denominator appropriate again.
- *
- * If several relation pairs cross the same join boundary, use the strongest
- * composite-key selectivity rather than multiplying them.  This deliberately
- * treats cycle-closing predicates as correlated and avoids recreating the
- * catastrophic multi-clause underestimates that post-transfer statistics are
- * intended to remove.
- */
-static bool
-bloompg_statistics_join_rows(RelOptInfo *outerrel, RelOptInfo *innerrel,
-	double *estimated_rows, int *key_pairs)
-{
-	double strongest_selectivity = 1.0;
-	double cartesian_rows;
-	bool found = false;
-	ListCell *cell;
-
-	*key_pairs = 0;
-	if (outerrel->rows <= 0.0 || innerrel->rows <= 0.0)
-		return false;
-	foreach(cell, active_replacements)
-	{
-		BloomPGReplacement *outer_replacement = lfirst(cell);
-		ListCell *key_cell;
-
-		if (!bms_is_member(outer_replacement->rti, outerrel->relids) ||
-			!bloompg_replacement_is_exact(outer_replacement->rti) ||
-			outer_replacement->statistics == NULL ||
-			outer_replacement->statistics->rows == 0)
-			continue;
-		foreach(key_cell, outer_replacement->statistics->join_keys)
-		{
-			BloomPGJoinKeyStatistics *outer_keys = lfirst(key_cell);
-			BloomPGReplacement *inner_replacement;
-			BloomPGJoinKeyStatistics *inner_keys;
-			double outer_nonnull_fraction;
-			double inner_nonnull_fraction;
-			double selectivity;
-
-			if (!bms_is_member(outer_keys->peer_rti, innerrel->relids) ||
-				!bloompg_replacement_is_exact(outer_keys->peer_rti))
-				continue;
-			inner_replacement = bloompg_find_replacement(outer_keys->peer_rti);
-			inner_keys = bloompg_find_join_key_statistics(inner_replacement,
-				outer_replacement->rti);
-			if (!bloompg_join_key_statistics_compatible(outer_keys, inner_keys) ||
-				inner_replacement->statistics == NULL ||
-				inner_replacement->statistics->rows == 0 ||
-				outer_keys->ndistinct <= 0.0 || inner_keys->ndistinct <= 0.0)
-				continue;
-			outer_nonnull_fraction = (double) outer_keys->nonnull_rows /
-				(double) outer_replacement->statistics->rows;
-			inner_nonnull_fraction = (double) inner_keys->nonnull_rows /
-				(double) inner_replacement->statistics->rows;
-			selectivity = outer_nonnull_fraction * inner_nonnull_fraction /
-				Max(outer_keys->ndistinct, inner_keys->ndistinct);
-			selectivity = Min(Max(selectivity, 0.0), 1.0);
-			strongest_selectivity = Min(strongest_selectivity, selectivity);
-			found = true;
-			(*key_pairs)++;
-		}
-	}
-	if (!found)
-		return false;
-	cartesian_rows = outerrel->rows * innerrel->rows;
-	*estimated_rows = clamp_row_est(cartesian_rows * strongest_selectivity);
-	return true;
-}
-
-static void
-bloompg_raise_join_path_rows(Path *path, double rows)
-{
-	double old_rows;
-
-	if (path == NULL || path->param_info != NULL || path->rows >= rows)
-		return;
-	old_rows = Max(path->rows, 1.0);
-	path->rows = rows;
-	/* Preserve the core path comparison while accounting for the additional
-	 * tuples projected by the corrected estimate. */
-	path->total_cost += (rows - old_rows) * cpu_tuple_cost;
-}
-
-static void
-bloompg_set_join_pathlist(PlannerInfo *root,
-	RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel,
-	JoinType jointype, JoinPathExtraData *extra)
-{
-	double old_rows;
-	double statistics_rows;
-	double ratio;
-	int key_pairs;
-	ListCell *cell;
-
-	if (previous_set_join_pathlist_hook != NULL)
-		previous_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
-			jointype, extra);
-	if (active_replacements == NIL || root->parent_root != NULL ||
-		jointype != JOIN_INNER ||
-		!bloompg_statistics_join_rows(outerrel, innerrel,
-			&statistics_rows, &key_pairs))
-		return;
-
-	old_rows = Max(joinrel->rows, 1.0);
-	/* In the first iteration use transfer statistics as a lower bound.  Core
-	 * can still retain a larger estimate from constraints or clauses that the
-	 * Bloom graph does not model. */
-	if (statistics_rows <= old_rows)
-		return;
-	ratio = statistics_rows / old_rows;
-	joinrel->rows = statistics_rows;
-	foreach(cell, joinrel->pathlist)
-		bloompg_raise_join_path_rows(lfirst(cell), statistics_rows);
-	/* Partial paths expose per-worker rows.  Preserve their prior ratio to the
-	 * unpartitioned estimate instead of assigning the full relation count. */
-	foreach(cell, joinrel->partial_pathlist)
-	{
-		Path *path = lfirst(cell);
-
-		if (path->param_info == NULL && path->rows > 0.0)
-			bloompg_raise_join_path_rows(path, path->rows * ratio);
-	}
-	cardinality_adjustments++;
-	cardinality_max_ratio = Max(cardinality_max_ratio, ratio);
-	if (bloompg_log_transfer_steps)
-		elog(LOG, "bloompg P1 raised inner join rows from %.0f to %.0f (%.2fx) using %d post-transfer key statistic%s",
-			old_rows, statistics_rows, ratio, key_pairs,
-			key_pairs == 1 ? "" : "s");
 }
 
 static bool
@@ -543,12 +454,15 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 
 	original_rows = Max(rel->rows, 1.0);
 	rows = Max(replacement->rows, 1.0);
+	/* Supply reduced base cardinalities; leave join estimation to PostgreSQL. */
 	rel->rows = rows;
-	if (replacement->kind == BLOOMPG_REPLACEMENT_MEMORY &&
+	if ((replacement->kind == BLOOMPG_REPLACEMENT_MEMORY ||
+		 replacement->kind == BLOOMPG_REPLACEMENT_TID) &&
 		replacement->statistics != NULL)
 	{
 		rel->tuples = rows;
-		if (replacement->statistics->average_width > 0)
+		if (replacement->kind == BLOOMPG_REPLACEMENT_MEMORY &&
+			replacement->statistics->average_width > 0)
 			rel->reltarget->width = replacement->statistics->average_width;
 	}
 	path = bloompg_replacement_path(replacement, rti, rel, fallback, rows,
@@ -601,6 +515,15 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 			parallel_workers);
 
 		add_partial_path(rel, &partial->path);
+	}
+	if (replacement->statistics != NULL &&
+		(replacement->kind == BLOOMPG_REPLACEMENT_MEMORY ||
+		 replacement->kind == BLOOMPG_REPLACEMENT_TID))
+	{
+		MemoryContext old_context = MemoryContextSwitchTo(active_replan_context);
+
+		active_statistics_relids = bms_add_member(active_statistics_relids, rti);
+		MemoryContextSwitchTo(old_context);
 	}
 	list_free(native_paths);
 	list_free(native_partial_paths);
@@ -696,11 +619,11 @@ void
 bloompg_replan_begin(List *replacements, const BloomPGJoinGraph *graph)
 {
 	Assert(active_replacements == NIL);
+	Assert(active_statistics_relids == NULL);
 	bloompg_path_transform_reset();
+	active_replan_context = CurrentMemoryContext;
 	active_replacements = replacements;
 	active_graph = graph;
-	cardinality_adjustments = 0;
-	cardinality_max_ratio = 1.0;
 }
 
 void
@@ -708,15 +631,9 @@ bloompg_replan_end(void)
 {
 	active_replacements = NIL;
 	active_graph = NULL;
-}
-
-void
-bloompg_replan_cardinality_stats(uint64 *adjustments, double *max_ratio)
-{
-	if (adjustments != NULL)
-		*adjustments = cardinality_adjustments;
-	if (max_ratio != NULL)
-		*max_ratio = cardinality_max_ratio;
+	bms_free(active_statistics_relids);
+	active_statistics_relids = NULL;
+	active_replan_context = NULL;
 }
 
 void
@@ -724,8 +641,8 @@ bloompg_replan_init(void)
 {
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = bloompg_set_rel_pathlist;
-	previous_set_join_pathlist_hook = set_join_pathlist_hook;
-	set_join_pathlist_hook = bloompg_set_join_pathlist;
+	previous_get_relation_stats_hook = get_relation_stats_hook;
+	get_relation_stats_hook = bloompg_get_relation_stats;
 }
 
 void
@@ -733,8 +650,11 @@ bloompg_replan_fini(void)
 {
 	if (set_rel_pathlist_hook == bloompg_set_rel_pathlist)
 		set_rel_pathlist_hook = previous_set_rel_pathlist_hook;
-	if (set_join_pathlist_hook == bloompg_set_join_pathlist)
-		set_join_pathlist_hook = previous_set_join_pathlist_hook;
+	if (get_relation_stats_hook == bloompg_get_relation_stats)
+		get_relation_stats_hook = previous_get_relation_stats_hook;
 	active_replacements = NIL;
 	active_graph = NULL;
+	bms_free(active_statistics_relids);
+	active_statistics_relids = NULL;
+	active_replan_context = NULL;
 }

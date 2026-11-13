@@ -403,8 +403,6 @@ bloompg_planner(Query *parse,
 			double native_preview_ms;
 			PlannedStmt *native_preview;
 			Bitmapset *native_parameterized_indexes;
-			uint64 p1_cardinality_adjustments = 0;
-			double p1_cardinality_max_ratio = 1.0;
 			uint64 runtime_mark = bloompg_runtime_next_token();
 			MemoryContext planner_context = CurrentMemoryContext;
 			ResourceOwner planner_owner = CurrentResourceOwner;
@@ -479,9 +477,6 @@ bloompg_planner(Query *parse,
 				PG_END_TRY(_replan);
 				bloompg_prepare_parallel_plan(
 					(PlannedStmt *) replacement_plan);
-				bloompg_replan_cardinality_stats(
-					&p1_cardinality_adjustments,
-					&p1_cardinality_max_ratio);
 				p1_ms = bloompg_planner_elapsed_ms(p1_started);
 				if (replacement_plan != NULL)
 				{
@@ -523,11 +518,9 @@ bloompg_planner(Query *parse,
 			appendStringInfo(&detail,
 				" phases=p0:%.3fms native:%.3fms graph:%.3fms"
 					" transfer:%.3fms p1:%.3fms"
-					" p1_parallel=core-cost"
-					" p1_cardinality=" UINT64_FORMAT ":%.2fx",
+					" p1_parallel=core-cost",
 					p0_ms, native_preview_ms, graph_ms, (double) transfer_ms,
-					(double) p1_ms,
-					p1_cardinality_adjustments, p1_cardinality_max_ratio);
+					(double) p1_ms);
 			appendStringInfo(&detail, " p1_paths=%s",
 				p1_path_transform_json);
 			if (p1_parameterized_index_guard)
@@ -559,10 +552,6 @@ bloompg_planner(Query *parse,
 			profile_input.transfer_ms = transfer_ms;
 			profile_input.statistics_ms = transfer.statistics_ms;
 			profile_input.p1_ms = p1_ms;
-			profile_input.p1_cardinality_adjustments =
-				p1_cardinality_adjustments;
-			profile_input.p1_cardinality_max_ratio =
-				p1_cardinality_max_ratio;
 			profile_input.replanned = replanned;
 			profile_input.transfer_failed = transfer_failed;
 			profile_input.transfer_error_code = transfer_error_code;
