@@ -36,24 +36,33 @@ queries continue to use PostgreSQL's native planner.
 
 ## Results
 
-PostgreSQL 18.4 on two Intel Xeon Platinum 8474C CPUs, using the SQL corpora
-from DataFusion-Bloom. Both sides use the same 16-worker global and per-Gather
-ceiling. BloomPG also uses 16 transfer workers, the default `ndv` progress
-metric, and a 2 GB materialization budget. Times include planning, transfer,
-materialization, execution, and complete output consumption.
+Measured on November 18, 2026 using BloomPG
+[`a2582a3`](https://github.com/YimingQiao/bloompg/commit/a2582a3cc66bffe58e3eaefd56ae48a65fdd31c0)
+and an unpatched PostgreSQL 18.4 release build, with the SQL corpora from
+DataFusion-Bloom. On a host with two Intel Xeon Platinum 8474C CPUs, both
+systems are pinned to the same **16 physical cores on one socket**. Both use
+15-worker global and per-Gather ceilings in addition to the leader;
+BloomPG also uses up to 15 transfer workers.
 
-| Workload | PostgreSQL storage | Completed | Native PG | BloomPG | Total speedup |
-|---|---|---:|---:|---:|---:|
-| CEB IMDB | 9.43 GB, indexed | 3,132/3,133 | 15,826.369 s | 3,822.980 s | **4.140x** |
-| JOB | 9.43 GB, indexed | 113/113 | 217.753 s | 69.337 s | **3.141x** |
-| STATS-CEB | 113 MB, indexed | 145/146 | 697.363 s | 237.348 s | **2.938x** |
-| TPC-H SF10 | 22.02 GB, indexed | 22/22 | 119.082 s | 114.413 s | **1.041x** |
+Both systems use `work_mem=512MB`, `hash_mem_multiplier=2`,
+`shared_buffers=128MB`, `effective_cache_size=384GB`, `random_page_cost=1.1`,
+`io_method=worker`, and `effective_io_concurrency=256`. BloomPG uses prepared
+samples targeting 10,000 rows per table, the default `ndv` progress metric,
+and a 2 GB materialization budget. Prepared sample construction is outside
+query timings.
 
-All completed Native/BloomPG pairs produced identical complete-output
-fingerprints. Each execution has a 300-second limit, and totals include only
-queries completed by both systems. BloomPG completed every query; native
-PostgreSQL reached the limit once in CEB and once in STATS-CEB. These historical
-measurements predate the current access and scheduling defaults.
+Each query and mode receives one warmup followed by three timed executions;
+mode order alternates between queries. Totals sum the per-query medians with
+warm caches and include planning, transfer, materialization, execution, and
+complete output consumption.
+
+| Workload | PostgreSQL storage | Completed | Native PG | BloomPG | Total speedup | Geomean speedup |
+|---|---|---:|---:|---:|---:|---:|
+| JOB | 9.43 GB, indexed | 113/113 | 197.969 s | 27.949 s | **7.083x** | 2.230x |
+| TPC-H SF10 | 22.02 GB, indexed | 22/22 | 99.624 s | 92.690 s | **1.075x** | 1.065x |
+
+All 135 Native/BloomPG pairs produced identical complete-output fingerprints.
+Both systems completed every query within the 300-second per-execution limit.
 
 ## Install
 
