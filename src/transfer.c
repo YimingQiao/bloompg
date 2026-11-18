@@ -130,18 +130,16 @@ bloompg_state_precedes(BloomPGRelationState *left,
 {
 	if (right == NULL)
 		return true;
-	if (left->current_rows != right->current_rows)
-		return left->current_rows < right->current_rows;
-	/* Within one priority tier, usable index access breaks output ties even
+	if (left->selection.score != right->selection.score)
+		return left->selection.score < right->selection.score;
+	/* Within one priority tier, usable index access breaks score ties even
 	 * when the index condition is too broad to earn scheduling priority. */
 	if (bloompg_index_transfer)
 	{
 		bool left_index = !left->materialized && left->filters != NIL &&
-			bloompg_index_prefilter_available(left,
-				bloompg_index_transfer_max_fraction);
+			bloompg_index_prefilter_available(left, false);
 		bool right_index = !right->materialized && right->filters != NIL &&
-			bloompg_index_prefilter_available(right,
-				bloompg_index_transfer_max_fraction);
+			bloompg_index_prefilter_available(right, false);
 
 		if (left_index != right_index)
 			return left_index;
@@ -177,7 +175,7 @@ bloompg_terminal_native_index_leaf(BloomPGRelationState *state,
 	return true;
 }
 
-/* Prefer selective incoming index access, then minimize estimated output. */
+/* Preserve index priority; within each tier use DuckDB Bloom's 2O + lambda T. */
 static BloomPGScheduleDecision
 bloompg_schedule_next(BloomPGRelationState **states, int count)
 {
@@ -190,11 +188,18 @@ bloompg_schedule_next(BloomPGRelationState **states, int count)
 
 		if (state == NULL || !state->active)
 			continue;
+		/* Local predicates have already run on materialized/prefetched rows.
+		 * Cheap runtime-filter CPU is left uncharged, as in DuckDB Bloom. */
+		state->selection.filter_ms =
+			bloompg_filter_cost_rows_per_ms > 0 &&
+			!state->materialized && !state->prefetched ?
+			bloompg_sample_workspace_evaluation_ms(state->sample_workspace,
+				state->base_rows) : 0.0;
+		state->selection.score = 2.0 * state->current_rows +
+			bloompg_filter_cost_rows_per_ms * state->selection.filter_ms;
 		state->selection.index_ready = bloompg_index_transfer &&
 			!state->materialized && state->filters != NIL &&
-			bloompg_index_prefilter_available(state,
-				Min(bloompg_index_priority_max_fraction,
-					bloompg_index_transfer_max_fraction));
+			bloompg_index_prefilter_available(state, true);
 		state->selection.disposition = BLOOMPG_SELECTION_ELIGIBLE;
 		if (decision.source == NULL ||
 			(state->selection.index_ready &&
@@ -361,6 +366,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 						const char *query_string,
 						ParamListInfo bound_params,
 						bool query_parallel_safe,
+						bool query_parallel_allowed,
 						const Bitmapset *native_parameterized_indexes)
 {
 	BloomPGTransferOutcome outcome = {0};
@@ -567,6 +573,10 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 		appendStringInfo(&detail,
 			" select=%u:index_ready=%s",
 			source->rti, source->selection.index_ready ? "yes" : "no");
+		if (bloompg_filter_cost_rows_per_ms > 0)
+			appendStringInfo(&detail, ":output=%.0f:filter_ms=%.3f:score=%.3f",
+				source->current_rows, source->selection.filter_ms,
+				source->selection.score);
 		source->active = false;
 		for (destination_rti = 1; destination_rti <= relation_count;
 			 destination_rti++)
@@ -914,7 +924,7 @@ bloompg_apply_transfers(PlannedStmt *candidate,
 	bloompg_equality_domains_finish(equality_domains, &outcome, &detail);
 
 	bloompg_finalize_replacements(candidate, graph, states, relation_count,
-		query_string, bound_params, query_parallel_safe,
+		query_string, bound_params, query_parallel_safe, query_parallel_allowed,
 		&next_plan_node_id, &outcome, &detail);
 	outcome.profile_json = bloompg_transfer_finish_profile(states,
 		relation_count, outcome, &detail,

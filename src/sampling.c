@@ -66,6 +66,25 @@ typedef struct BloomPGTidSample
 } BloomPGTidSample;
 
 /*
+ * A published filter is immutable; its selectivity on a query-local sample
+ * can be reused by scheduling and physical index-access decisions.
+ */
+typedef struct BloomPGSampleFilterFraction
+{
+	uint64		token;
+	int			nkeys;
+	AttrNumber *attributes;
+	uint64		matched;
+} BloomPGSampleFilterFraction;
+
+typedef struct BloomPGSamplePredicateCost
+{
+	/* Cumulative local survivors after this predicate, preserving qual order. */
+	bool	   *accepted;
+	double		ms_per_row;
+} BloomPGSamplePredicateCost;
+
+/*
  * A prepared sample persisted on disk intentionally contains CTIDs rather
  * than tuple values.  In-memory tuple values are a relaxed planning cache:
  * they may become stale after DML, but can only change transfer scheduling
@@ -83,11 +102,17 @@ struct BloomPGSampleWorkspace
 	bool	   *local_accepted;
 	bool	   *filter_accepted;
 	List	   *applied_filter_tokens;
+	List	   *filter_fractions;
+	uint64		index_filter_probes;
+	uint64		index_filter_cache_hits;
 	bool		filter_state_ready;
 	uint64		filter_rows;
 	uint64		combined_rows;
 	uint64		visible_rows;
 	uint64		local_rows;
+	List	   *predicate_costs;
+	bool		local_cost_valid;
+	double		local_cost_ms;
 	double		load_ms;
 	double		hydrate_ms;
 	double		qual_ms;
@@ -839,6 +864,57 @@ bloompg_sample_slot_flattened_size(TupleTableSlot *slot)
 	return bytes;
 }
 
+/* Profile each local conjunct once, preserving short-circuit evaluation.
+ * Tuple acquisition is finished before timing; masks and per-row costs are
+ * reused when incoming filters change. No per-tuple clock calls are needed. */
+static void
+bloompg_profile_sample_predicates(BloomPGSampleWorkspace *workspace,
+	List *quals, PlanState *plan_state)
+{
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(workspace->descriptor,
+		&TTSOpsMinimalTuple);
+	ExprContext *context = plan_state->ps_ExprContext;
+	bool *previous = NULL;
+	ListCell *cell;
+
+	workspace->qual_ms = 0.0;
+	foreach(cell, quals)
+	{
+		BloomPGSamplePredicateCost *cost = palloc0(sizeof(*cost));
+		ExprState *qual = ExecInitQual(list_make1(lfirst(cell)), plan_state);
+		uint64 inputs = 0;
+		uint64 survivors = 0;
+		uint64 i;
+		instr_time started;
+		double elapsed;
+
+		cost->accepted = palloc0_array(bool, workspace->visible_rows);
+		INSTR_TIME_SET_CURRENT(started);
+		for (i = 0; i < workspace->visible_rows; i++)
+		{
+			if (previous != NULL && !previous[i])
+				continue;
+			ResetExprContext(context);
+			ExecStoreMinimalTuple(workspace->tuples[i], slot, false);
+			context->ecxt_scantuple = slot;
+			inputs++;
+			cost->accepted[i] = ExecQual(qual, context);
+			survivors += cost->accepted[i];
+			ExecClearTuple(slot);
+		}
+		elapsed = bloompg_elapsed_ms(started);
+		cost->ms_per_row = inputs > 0 ? elapsed / (double) inputs : 0.0;
+		workspace->qual_ms += elapsed;
+		workspace->local_rows = survivors;
+		workspace->predicate_costs = lappend(workspace->predicate_costs, cost);
+		previous = cost->accepted;
+	}
+	if (previous != NULL)
+		memcpy(workspace->local_accepted, previous,
+			workspace->visible_rows * sizeof(bool));
+	ExecDropSingleTupleTableSlot(slot);
+}
+
 static BloomPGSampleWorkspace *
 bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 								   Oid relfilenode,
@@ -859,6 +935,7 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 	instr_time elapsed;
 	uint64 i;
 	bool use_tuple_cache;
+	bool profile_predicates = bloompg_filter_cost_rows_per_ms > 0;
 	Size cache_limit;
 	Size cache_used;
 
@@ -996,7 +1073,8 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 	plan_state.state = estate;
 	ExecAssignExprContext(estate, &plan_state);
 	expression_context = plan_state.ps_ExprContext;
-	qual_state = quals != NIL ? ExecInitQual(quals, &plan_state) : NULL;
+	qual_state = !profile_predicates && quals != NIL ?
+		ExecInitQual(quals, &plan_state) : NULL;
 	slot = use_tuple_cache ?
 		MakeSingleTupleTableSlot(workspace->descriptor, &TTSOpsMinimalTuple) :
 		table_slot_create(relation, NULL);
@@ -1028,6 +1106,8 @@ bloompg_build_sample_workspace(BloomPGTidSample *sample, Plan *scan,
 	workspace->qual_ms = bloompg_elapsed_ms(elapsed);
 	ExecClearTuple(slot);
 	ExecDropSingleTupleTableSlot(slot);
+	if (profile_predicates && quals != NIL && workspace->visible_rows > 0)
+		bloompg_profile_sample_predicates(workspace, quals, &plan_state);
 	FreeExecutorState(estate);
 	table_close(relation, AccessShareLock);
 	workspace->load_ms = bloompg_elapsed_ms(started);
@@ -1072,6 +1152,7 @@ bloompg_workspace_reset_filter_state(BloomPGSampleWorkspace *workspace)
 	workspace->filter_rows = workspace->visible_rows;
 	workspace->combined_rows = workspace->local_rows;
 	workspace->filter_state_ready = true;
+	workspace->local_cost_valid = false;
 	MemoryContextSwitchTo(old_context);
 }
 
@@ -1122,6 +1203,7 @@ bloompg_estimate_from_workspace(BloomPGSampleWorkspace *workspace,
 			workspace->probe_cache_hits++;
 		else
 		{
+			workspace->local_cost_valid = false;
 			old_context = MemoryContextSwitchTo(workspace->memory_context);
 			slot = MakeSingleTupleTableSlot(workspace->descriptor,
 				&TTSOpsMinimalTuple);
@@ -1186,6 +1268,39 @@ bloompg_estimate_from_workspace(BloomPGSampleWorkspace *workspace,
 	return true;
 }
 
+/* Estimate cheap incoming filters first, followed by local predicates.
+ * Count intersections on the SAME sample, without independence assumptions.
+ * Sampling and data-access time are not charged as predicate CPU time. */
+double
+bloompg_sample_workspace_evaluation_ms(BloomPGSampleWorkspace *workspace,
+	double base_rows)
+{
+	bool *previous = NULL;
+	ListCell *cell;
+
+	if (workspace == NULL || workspace->visible_rows == 0 || base_rows <= 0)
+		return 0.0;
+	if (!workspace->local_cost_valid)
+	{
+		workspace->local_cost_ms = 0.0;
+		foreach(cell, workspace->predicate_costs)
+		{
+			BloomPGSamplePredicateCost *cost = lfirst(cell);
+			uint64 inputs = 0;
+			uint64 i;
+
+			for (i = 0; i < workspace->visible_rows; i++)
+				if ((previous == NULL || previous[i]) &&
+					(!workspace->filter_state_ready || workspace->filter_accepted[i]))
+					inputs++;
+			workspace->local_cost_ms += cost->ms_per_row * (double) inputs;
+			previous = cost->accepted;
+		}
+		workspace->local_cost_valid = true;
+	}
+	return workspace->local_cost_ms * base_rows / (double) workspace->visible_rows;
+}
+
 bool
 bloompg_sample_workspace_order_costs(BloomPGSampleWorkspace *workspace,
 	double *local_sample_ms, double *filter_sample_ms)
@@ -1206,6 +1321,9 @@ bloompg_sample_workspace_filter_fraction(BloomPGSampleWorkspace *workspace,
 	uint64 *rows_matched, double *probe_ms)
 {
 	TupleTableSlot *slot;
+	ListCell *cell;
+	BloomPGSampleFilterFraction *cached;
+	MemoryContext old_context;
 	uint64 matched = 0;
 	uint64 index;
 	instr_time started;
@@ -1223,7 +1341,20 @@ bloompg_sample_workspace_filter_fraction(BloomPGSampleWorkspace *workspace,
 		filter->attributes == NULL)
 		return false;
 
+	foreach(cell, workspace->filter_fractions)
+	{
+		cached = lfirst(cell);
+		if (cached->token == filter->token && cached->nkeys == filter->nkeys &&
+			memcmp(cached->attributes, filter->attributes,
+				mul_size(filter->nkeys, sizeof(AttrNumber))) == 0)
+		{
+			matched = cached->matched;
+			workspace->index_filter_cache_hits++;
+			goto result;
+		}
+	}
 	INSTR_TIME_SET_CURRENT(started);
+	workspace->index_filter_probes++;
 	slot = MakeSingleTupleTableSlot(workspace->descriptor,
 		&TTSOpsMinimalTuple);
 	for (index = 0; index < workspace->visible_rows; index++)
@@ -1235,14 +1366,25 @@ bloompg_sample_workspace_filter_fraction(BloomPGSampleWorkspace *workspace,
 		ExecClearTuple(slot);
 	}
 	ExecDropSingleTupleTableSlot(slot);
+	old_context = MemoryContextSwitchTo(workspace->memory_context);
+	cached = palloc(sizeof(BloomPGSampleFilterFraction));
+	cached->token = filter->token;
+	cached->nkeys = filter->nkeys;
+	cached->attributes = palloc_array(AttrNumber, filter->nkeys);
+	memcpy(cached->attributes, filter->attributes,
+		mul_size(filter->nkeys, sizeof(AttrNumber)));
+	cached->matched = matched;
+	workspace->filter_fractions = lappend(workspace->filter_fractions, cached);
+	MemoryContextSwitchTo(old_context);
+	if (probe_ms != NULL)
+		*probe_ms = bloompg_elapsed_ms(started);
+result:
 	if (fraction != NULL)
 		*fraction = (double) matched / (double) workspace->visible_rows;
 	if (rows_examined != NULL)
 		*rows_examined = workspace->visible_rows;
 	if (rows_matched != NULL)
 		*rows_matched = matched;
-	if (probe_ms != NULL)
-		*probe_ms = bloompg_elapsed_ms(started);
 	return true;
 }
 
@@ -1273,7 +1415,6 @@ bloompg_sample_materialized_relation(BloomPGColumnStore *store,
 		elog(ERROR, "invalid bloompg intermediate sample source");
 	exact_rows = bloompg_column_store_live_rows(store);
 	INSTR_TIME_SET_CURRENT(started);
-	if (profile != NULL)
 
 	foreach(cell, filters)
 	{
@@ -1341,32 +1482,29 @@ bloompg_sample_materialized_relation(BloomPGColumnStore *store,
 			uint32 rank = (uint32) (((uint64) sample_index * nonempty_count) /
 				target_count);
 			BloomPGColumnStoreChunkView view;
-			uint32 selected;
+			uint32 survivor_count;
+			uint16 survivors[BLOOMPG_VECTOR_SIZE];
 
 			chunk_index = nonempty_chunks[rank];
 			if (!bloompg_column_store_chunk_view(store, chunk_index, &view))
 				elog(ERROR, "bloompg lost an intermediate sample chunk");
-			for (selected = 0; selected < view.selected_count; selected++)
+			survivor_count = view.selected_count;
+			memcpy(survivors, view.selection,
+				mul_size(survivor_count, sizeof(uint16)));
+			/* Reuse compaction's vector probe without modifying the store.
+			 * Keep the original sample population as the denominator. */
+			foreach(cell, filters)
 			{
-				uint32 row = view.selection[selected];
-				bool accepted = true;
+				BloomPGSampleFilter *sample_filter = lfirst(cell);
 
-				foreach(cell, filters)
-				{
-					BloomPGSampleFilter *sample_filter = lfirst(cell);
-
-					if (!bloompg_filter_contains_vector(sample_filter->filter,
-							&view, row,
-							sample_filter->materialized_attributes))
-					{
-						accepted = false;
-						break;
-					}
-				}
-				examined++;
-				if (accepted)
-					passed++;
+				survivor_count = bloompg_filter_select_vector(sample_filter->filter,
+					&view, sample_filter->materialized_attributes, survivors,
+					survivor_count, survivors);
+				if (survivor_count == 0)
+					break;
 			}
+			examined += view.selected_count;
+			passed += survivor_count;
 			CHECK_FOR_INTERRUPTS();
 		}
 		pfree(nonempty_chunks);
@@ -1766,7 +1904,9 @@ bloompg_sample_workspace_stats(BloomPGSampleWorkspace *workspace,
 								   uint64 *probe_rows_examined,
 								   uint64 *probe_filter_checks,
 								   uint64 *probe_filters_applied,
-								   uint64 *probe_cache_hits)
+								   uint64 *probe_cache_hits,
+								   uint64 *index_filter_probes,
+								   uint64 *index_filter_cache_hits)
 {
 	if (visible_rows != NULL)
 		*visible_rows = workspace != NULL ? workspace->visible_rows : 0;
@@ -1796,6 +1936,11 @@ bloompg_sample_workspace_stats(BloomPGSampleWorkspace *workspace,
 	if (probe_cache_hits != NULL)
 		*probe_cache_hits = workspace != NULL ?
 			workspace->probe_cache_hits : 0;
+	if (index_filter_probes != NULL)
+		*index_filter_probes = workspace != NULL ? workspace->index_filter_probes : 0;
+	if (index_filter_cache_hits != NULL)
+		*index_filter_cache_hits = workspace != NULL ?
+			workspace->index_filter_cache_hits : 0;
 }
 
 void

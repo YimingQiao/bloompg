@@ -66,10 +66,12 @@ bloompg_transfer_profile_append_step(StringInfo json, int step,
 	appendStringInfo(json,
 		",\"selection_join_index_sources\":%d,"
 		"\"selection_state\":\"%s\","
-		"\"selection_index_ready\":%s",
+		"\"selection_index_ready\":%s,"
+		"\"selection_filter_ms\":%.6f,\"selection_score\":%.6f",
 		bms_num_members(source->join_index_sources),
 		bloompg_selection_name(source->selection),
-		source->selection.index_ready ? "true" : "false");
+		source->selection.index_ready ? "true" : "false",
+		source->selection.filter_ms, source->selection.score);
 	appendStringInfo(json, ",\"destination_rti\":%u,\"destination\":",
 		pending->destination->rti);
 	escape_json(json, pending->destination->table->alias != NULL ?
@@ -143,6 +145,8 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 		uint64 probe_filter_checks = 0;
 		uint64 probe_filters_applied = 0;
 		uint64 probe_cache_hits = 0;
+		uint64 index_filter_probes = 0;
+		uint64 index_filter_cache_hits = 0;
 		double load_ms = 0.0;
 		double hydrate_ms = 0.0;
 		double qual_ms = 0.0;
@@ -299,7 +303,8 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				&visible_rows, &sample_local_rows, &load_ms, &hydrate_ms,
 				&qual_ms, &tuple_cache_hit, &probe_count, &probe_ms,
 				&probe_rows_examined, &probe_filter_checks,
-				&probe_filters_applied, &probe_cache_hits);
+				&probe_filters_applied, &probe_cache_hits,
+				&index_filter_probes, &index_filter_cache_hits);
 			appendStringInfo(&detail,
 				" samplemem=%u:" UINT64_FORMAT "/" UINT64_FORMAT
 				" load=%.3fms hydrate=%.3fms qual=%.3fms cache=%s"
@@ -397,7 +402,9 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 					"\"probe_rows_examined\":" UINT64_FORMAT
 					",\"probe_filter_checks\":" UINT64_FORMAT
 					",\"probe_filters_applied\":" UINT64_FORMAT
-					",\"probe_cache_hits\":" UINT64_FORMAT "},",
+					",\"probe_cache_hits\":" UINT64_FORMAT
+					",\"index_filter_probes\":" UINT64_FORMAT
+					",\"index_filter_cache_hits\":" UINT64_FORMAT "},",
 				state->sampling_profile.acquisitions,
 				state->sampling_profile.memory_hits,
 				state->sampling_profile.disk_hits,
@@ -407,7 +414,8 @@ bloompg_transfer_finish_profile(BloomPGRelationState **states,
 				sample_local_rows, load_ms, hydrate_ms, qual_ms,
 					tuple_cache_hit ? "true" : "false", probe_count, probe_ms,
 					probe_rows_examined, probe_filter_checks,
-					probe_filters_applied, probe_cache_hits);
+					probe_filters_applied, probe_cache_hits,
+					index_filter_probes, index_filter_cache_hits);
 			appendStringInfo(&profile_relations,
 				"\"intermediate_sampling\":{\"calls\":" UINT64_FORMAT
 				",\"source\":\"%s\",\"rows_examined\":" UINT64_FORMAT

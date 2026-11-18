@@ -26,10 +26,11 @@ int bloompg_late_materialize_min_width = 128;
 int bloompg_transfer_workers = 4;
 bool bloompg_parallel_filter_build = true;
 int bloompg_transfer_parallel_min_rows = 100000;
-bool bloompg_index_transfer = false;
-double bloompg_index_transfer_max_fraction = 0.10;
+bool bloompg_index_transfer = true;
 double bloompg_index_priority_max_fraction = 0.01;
-int bloompg_index_guard_min_rows = 100000;
+double bloompg_index_transfer_max_fraction = 0.07;
+double bloompg_filter_cost_rows_per_ms = 1000.0;
+double bloompg_parallel_tuple_cost_factor = 0.1;
 int bloompg_transfer_progress_metric = BLOOMPG_TRANSFER_PROGRESS_NDV;
 int bloompg_sample_size = 10000;
 int bloompg_sample_seed = 2;
@@ -255,35 +256,34 @@ _PG_init(void)
 							NULL,
 							NULL);
 	DefineCustomBoolVariable("bloompg.index_transfer",
-							 "Use selective exact transfer keys to drive native bitmap scans.",
+							 "Use exact transfer keys to drive native bitmap scans.",
 							 "Selective index access can also receive scheduling priority.",
 							 &bloompg_index_transfer,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL,
 							 NULL,
 							 NULL);
-	DefineCustomRealVariable("bloompg.index_transfer_max_fraction",
-							 "Maximum individual index-filter selectivity for bitmap access.",
-							 NULL, &bloompg_index_transfer_max_fraction,
-							 0.10, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("bloompg.index_priority_max_fraction",
 							 "Maximum individual index-filter selectivity for scheduling priority.",
 							 NULL, &bloompg_index_priority_max_fraction,
 							 0.01, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomIntVariable("bloompg.index_guard_min_rows",
-							 "Minimum materialized rows for the P1 parameterized-index rescan protection.",
-							 NULL,
-							 &bloompg_index_guard_min_rows,
-							 100000,
-							 0,
-							 INT_MAX,
-							 PGC_USERSET,
-							 0,
-								 NULL,
-								 NULL,
-								 NULL);
+	DefineCustomRealVariable("bloompg.index_transfer_max_fraction",
+							 "Maximum individual index-filter selectivity for indexed access.",
+							 "Independent of worker count; broader or unestimated conditions remain residual filters.",
+							 &bloompg_index_transfer_max_fraction,
+							 0.07, 0.0, 1.0, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("bloompg.filter_cost_rows_per_ms",
+							 "Schedule by twice the output rows plus this coefficient times estimated local predicate milliseconds.",
+							 "Zero retains output-only scheduling.",
+							 &bloompg_filter_cost_rows_per_ms,
+							 1000.0, 0.0, 1e12, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("bloompg.parallel_tuple_cost_factor",
+							 "Scale PostgreSQL's parallel tuple cost during SSPT reoptimization only.",
+							 "One preserves the current PostgreSQL cost; native and transfer planning are unaffected.",
+							 &bloompg_parallel_tuple_cost_factor,
+							 0.1, 0.0, 1000.0, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomEnumVariable("bloompg.transfer_progress_metric",
 							 "Choose the equality-transfer convergence signal.",
 							 "\"rows\" retains row-cardinality/lineage propagation; \"ndv\" also suppresses exact equality-domain no-ops.",

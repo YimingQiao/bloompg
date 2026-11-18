@@ -26,6 +26,7 @@ typedef struct BloomPGEqualityDomains BloomPGEqualityDomains;
 
 typedef struct BloomPGIndexBitmapInputProfile
 {
+	int			plan_node_id;
 	Oid			index_oid;
 	AttrNumber	attribute;
 	uint64		filter_token;
@@ -44,6 +45,8 @@ typedef struct BloomPGSelectionState
 {
 	BloomPGSelectionDisposition disposition;
 	bool		index_ready;
+	double		filter_ms;
+	double		score;
 } BloomPGSelectionState;
 
 typedef struct BloomPGRelationState
@@ -232,7 +235,7 @@ extern uint64 bloompg_execute_state_source(BloomPGRelationState *state,
 extern int bloompg_transfer_worker_count(BloomPGRelationState *state,
 	bool query_parallel_safe);
 extern Plan *bloompg_make_parallel_source(BloomPGRelationState *state,
-	int workers, int *next_plan_node_id, List *build_metadata);
+	int workers, int *next_plan_node_id, List *build_metadata, Plan *indexed_scan);
 
 /* Exact equality-domain propagation deduplication (transfer_domain.c). */
 extern BloomPGEqualityDomains *bloompg_equality_domains_create(
@@ -279,7 +282,7 @@ extern void bloompg_finalize_replacements(PlannedStmt *candidate,
 	BloomPGJoinGraph *graph, BloomPGRelationState **states,
 	int relation_count, const char *query_string,
 	ParamListInfo bound_params,
-	bool query_parallel_safe, int *next_plan_node_id,
+	bool query_parallel_safe, bool query_parallel_allowed, int *next_plan_node_id,
 	BloomPGTransferOutcome *outcome, StringInfoData *detail);
 extern void bloompg_transfer_profile_append_step(StringInfo json, int step,
 	BloomPGRelationState *source, BloomPGPendingTransfer *pending,
@@ -291,8 +294,11 @@ extern char *bloompg_transfer_finish_profile(
 
 /* Exact-bitmap-driven B-tree access (transfer_index.c). */
 typedef bool (*BloomPGIndexTupleCallback)(TupleTableSlot *slot, void *context);
+extern bool bloompg_collect_parallel_index_profile(PlanState *node, void *context);
+extern Plan *bloompg_make_parallel_index_source(BloomPGRelationState *state,
+	int *next_plan_node_id, ParamListInfo bound_params, ParamListInfo *scan_params);
 extern bool bloompg_index_prefilter_available(BloomPGRelationState *state,
-	double max_fraction);
+	bool require_selective);
 extern bool bloompg_relation_has_transfer_index(BloomPGRelationState *state,
 	AttrNumber attribute, Oid equality_operator, Oid collation);
 extern bool bloompg_index_prefilter_scan(BloomPGRelationState *state,

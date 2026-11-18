@@ -167,6 +167,8 @@ typedef struct BloomPGFilterState
 	Size		parallel_size;
 	bool		parallel_active;
 	bool		prefilter;
+	ExprState *prefilter_qual;
+	ProjectionInfo *prefilter_projection;
 } BloomPGFilterState;
 
 extern Size bloompg_parallel_filter_header_size(int nfilters);

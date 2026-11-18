@@ -33,7 +33,7 @@ sides, and unsupported equality classes use this normal path in either mode.
 | `bloompg.sample_mode` | `prepared` | Use persistent `prepared` or query-local `instant` samples. |
 | `bloompg.sample_size` | `10000` | Target rows per base-relation sample. |
 | `bloompg.sample_seed` | `2` | Deterministic prepared-reservoir seed. |
-| `bloompg.sample_rate` | `0.01` | Chunk fraction sampled from an already materialized relation. |
+| `bloompg.sample_rate` | `0.01` | Chunk fraction sampled from an already materialized relation; probes use the same vector filter interface as compaction without modifying the stored selection. |
 | `bloompg.sample_cache_dir` | `auto` | Prepared cache directory; `auto` uses `$PGDATA/bloompg_samples`. Superuser-only. |
 | `bloompg.sample_memory_cache` | `on` | Retain prepared samples in backend memory; cached CTIDs and hydrated tuples share a limit of half `materialization_memory`. |
 | `bloompg.excitation_threshold` | `1.0` | Re-excite below this fraction of the preceding cardinality. |
@@ -98,35 +98,104 @@ the parallel scan's elapsed time.
 
 ## Index-assisted materialization
 
+`bloompg.filter_cost_rows_per_ms` enables DuckDB Bloom's scheduling score:
+`2 * estimated_output_rows + coefficient * estimated_local_predicate_ms`.
+The default is `1000` rows/ms; `0` retains output-only scheduling. This is a
+conversion between time and tuple-cost units, not a measured PostgreSQL scan
+throughput.
+
+When enabled, local conjuncts are timed once on the existing sample, in their
+original order with short-circuit evaluation. Cached cumulative pass masks are
+intersected with incoming-filter survivors to estimate each predicate's input.
+New filters update these estimates without re-evaluating local predicates.
+Sample acquisition and I/O are excluded from predicate timing; per-row executor
+overhead remains included. Already materialized or prefetched rows incur no
+additional local-predicate charge. Lightweight runtime-filter CPU is uncharged,
+as in DuckDB Bloom. Missing sample costs contribute zero. The estimate assumes
+incoming filters precede local predicates; it does not model disk-read cost.
+
+Selective index access keeps its existing priority. Within either priority
+tier the score replaces output size; eligible bitmap access still breaks ties.
+Transfer-step profiles expose `selection_filter_ms` and `selection_score`.
+
+For controlled comparisons, `scripts/run_pg_benchmark.py` accepts
+`--filter-cost-rows-per-ms` and `--effective-io-concurrency`. Omit either option
+to inherit the corresponding server setting. The I/O setting applies equally
+to native PostgreSQL and BloomPG; the result metadata records both settings,
+as well as PostgreSQL's `io_method` and `io_workers`.
+Baseline reuse requires matching SQL and native settings; changing I/O or
+parallelism settings forces a fresh native run. Changing only BloomPG's
+predicate-cost coefficient can reuse a successful native baseline.
+
+Count I/O workers as part of the CPU budget. With PostgreSQL 18's
+`io_method=worker`, they compete with query execution when the server is pinned
+to one CPU. In warm OS-cache experiments, `effective_io_concurrency=0` can
+avoid that overhead: it requests synchronous reads, not zero reads. With
+multiple CPUs, asynchronous bitmap heap reads can instead be faster. Set CPU
+affinity on the postmaster before it starts so its children inherit the same
+allocation; limiting parallel-query workers alone does not constrain the CPU
+budget. Recheck the I/O setting for cold storage and different hardware.
+
 | Setting | Default | Purpose |
 |---|---:|---|
-| `bloompg.index_transfer` | `off` | Use native bitmap access for selective exact incoming join keys on a compatible B-tree index. |
-| `bloompg.index_transfer_max_fraction` | `0.10` | Maximum sampled selectivity of each index condition for bitmap access, evaluated separately from residual filters. |
-| `bloompg.index_priority_max_fraction` | `0.01` | Maximum individual index-filter selectivity for scheduling priority; the index must also qualify for bitmap access. |
-| `bloompg.index_guard_min_rows` | `100000` | Existing P1 protection against repeated large materialization rescans when an equivalent parameterized index path exists; does not change transfer scheduling. |
+| `bloompg.index_transfer` | `on` | Use native indexed access for exact incoming join keys on a compatible B-tree index. |
+| `bloompg.index_priority_max_fraction` | `0.01` | Additional individual index-filter selectivity limit for scheduling priority. |
+| `bloompg.index_transfer_max_fraction` | `0.07` | Maximum individual index-filter selectivity for indexed access, independent of worker count; broader or unestimated conditions remain residual filters. |
+
+Parallel bitmap heap scans use PostgreSQL's native executor: one participant
+builds the bitmap, then the leader and available workers retrieve matching
+heap pages. No PostgreSQL backend patch is required.
 
 With index transfer enabled, SSPT first considers active, unmaterialized tables
 with an eligible incoming index filter whose individual sampled selectivity is
-at or below both thresholds. Among these it selects the
-smallest estimated output. If none qualify, it selects the smallest estimated
-output among all active tables. Within the same priority tier, equal outputs
+at or below the priority threshold. Among these it selects the
+lowest scheduling score. If none qualify, it selects the lowest score
+among all active tables. Within the same priority tier, equal scores
 prefer a table with eligible bitmap access, even if its index selectivity
 exceeds the priority threshold; remaining ties use table RTI. For the selected
-table, a compatible exact index filter with estimated selectivity at or below
-the access threshold drives a native B-tree bitmap scan, even if it did not
-qualify for scheduling priority. Without an eligible filter,
-BloomPG retains its scan path. Unknown individual selectivity does not qualify;
-it is not replaced by the combined selectivity of other filters.
+table, each compatible exact index filter must separately meet the access
+threshold before contributing a bitmap. A small joint selectivity does not
+justify probing a broad individual index. Excluded conditions are still checked
+on retrieved rows. Without an eligible filter, BloomPG retains its
+scan path. Unknown individual selectivity does not grant index access or priority,
+and broader conditions remain residual filters. Priority never uses the
+combined selectivity of unrelated filters.
 
-Each eligible key set is passed as one complete array scan key to PostgreSQL's
-index API. There is no auxiliary SQL/ANY expression, optimizer invocation,
-manual batch size, key-count threshold, or ordinary Index Scan fallback.
-Nonredundant eligible sources contribute TID bitmaps that are intersected before
-heap access. PostgreSQL manages the bitmap using `work_mem`; all local predicates
-and incoming filters are rechecked, including on lossy pages. Current support
-is for exact, one-column integral/date key sets with matching canonical equality
-and a compatible nonpartial B-tree index. Approximate Bloom filters remain
-residual filters. PostgreSQL allocation and array representation limits apply.
+By default, each eligible key set is passed as one complete array scan key to PostgreSQL's
+index API. There is no auxiliary SQL query, optimizer invocation, manual batch
+size, or key-count truncation. Current support is for exact, one-column
+integral/date key sets with matching canonical equality and a compatible
+nonpartial B-tree index. Approximate Bloom filters remain residual filters.
+PostgreSQL allocation and array representation limits apply.
+
+Indexed access uses a fixed per-condition selectivity ceiling (7% by default).
+The ceiling is identical for serial and parallel access: it is not divided by
+worker count, and there is no key-count or NDV exception. Conditions that exceed
+the ceiling remain residual filters; if none qualify, BloomPG retains its scan
+path. This is an empirical access rule, not a prediction of elapsed time.
+
+When transfer workers, query safety, and the memory budget allow parallel
+execution, BloomPG can construct a native indexed scan under its existing Gather
+and materialization operators. The worker count determines execution parallelism,
+not the selectivity ceiling. Nonredundant eligible conditions remain available
+for bitmap intersection.
+
+Eligible index conditions construct TID bitmaps,
+intersected when multiple nonredundant conditions are available. Serial execution
+uses bitmap heap retrieval; parallel execution uses Parallel Bitmap Heap Scan.
+The choice does not depend on correlation, heap page count, or worker count.
+PostgreSQL owns shared scan state, work distribution, visibility checks,
+lossy-page rechecks, and worker cleanup. No available workers is handled by
+leader execution. Exact-key arrays are sent as executor parameters, avoiding
+repeated serialization in different copies of the index condition.
+
+Parallel eligibility also requires the estimated number of touched heap pages
+to meet PostgreSQL's `min_parallel_table_scan_size`. Smaller indexed scans and
+single-core configurations retain serial bitmap access. Runtime filters are
+evaluated before local predicates and payload projection. The profile reports
+`parallel-bitmap` or serial `bitmap-index-probe`, including bitmap page counters.
+Query workers and asynchronous I/O workers are separate: benchmark comparisons
+must fix both CPU affinity and PostgreSQL's I/O configuration.
 
 ## P1 and materialization
 
@@ -136,9 +205,28 @@ residual filters. PostgreSQL allocation and array representation limits apply.
 | `bloompg.late_materialize_min_width` | `128B` | Projected-width threshold for TID mode. |
 
 P1 exposes serial and parallel paths for exact in-memory materializations up
-to the configured worker ceiling. PostgreSQL's normal cost model chooses
-between them. A narrow safety comparison retains the native plan only when P1
-selects a more expensive parameterized-index Nested Loop shape.
+to the configured worker ceiling, along with logically equivalent parameterized
+index paths. Serial memory scans receive no additional disabled-node penalty.
+During reoptimization, an inner Nested Loop join whose outer path contains an
+Anti Join prefers equivalent parameterized index access over a full rescan of
+an SSPT memory table, including a rescan through Materialize. This guards
+against underestimated Anti Join output without penalizing memory scans in
+other joins. The rule applies to ordinary base tables with all index parameters
+supplied by the outer path; without an equivalent index path, normal costing
+is unchanged. After successful transfer and reoptimization, BloomPG executes
+the replacement plan without comparing its estimated total cost against the
+original plan. If transfer fails or produces no replacement, the native plan
+remains available. The former `bloompg.index_guard_min_rows` setting has been
+removed.
+
+`bloompg.parallel_tuple_cost_factor` scales PostgreSQL's current
+`parallel_tuple_cost` only while planning the reduced inputs (P1). The default
+factor is `0.1`; `1` retains PostgreSQL's original cost. Scan and index costs,
+native planning, and transfer planning are unchanged. The original value is
+restored after P1, including on errors; the setting does not force parallel
+execution or relax parallel-safety checks. It affects all Gather and Gather
+Merge costing within P1, so tune it against the workload rather than a single
+query.
 
 ## Diagnostics
 
@@ -159,3 +247,9 @@ SELECT bloompg_last_trace();
 
 Prepared samples affect scheduling and estimates only. Every row-eliminating
 filter is built from an exact scan under the active statement snapshot.
+
+Index-access selectivity checks reuse per-filter results on the query-local
+sample. The cache is keyed by the published filter token and bound columns, so
+scheduling and scan selection avoid probing unchanged filters again. Profiles
+expose `index_filter_probes` and `index_filter_cache_hits` in each relation's
+`sampling` object.

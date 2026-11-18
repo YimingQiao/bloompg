@@ -17,6 +17,25 @@ SELECT current_setting('bloompg.sample_mode') = 'prepared' AS prepared_by_defaul
  t
 (1 row)
 
+SELECT current_setting('bloompg.index_transfer') = 'on'
+   AND current_setting('bloompg.filter_cost_rows_per_ms')::numeric = 1000
+   AND current_setting('bloompg.index_transfer_max_fraction')::numeric = 0.07
+   AND current_setting('bloompg.parallel_tuple_cost_factor')::numeric = 0.1
+   AS index_scheduling_defaults_ok;
+ index_scheduling_defaults_ok 
+------------------------------
+ t
+(1 row)
+
+SELECT NOT EXISTS (
+    SELECT FROM pg_settings
+    WHERE name IN ('bloompg.index_access', 'bloompg.parallel_bitmap_build')
+) AS diagnostic_switches_removed;
+ diagnostic_switches_removed 
+-----------------------------
+ t
+(1 row)
+
 SELECT current_setting('bloompg.transfer_progress_metric') = 'ndv'
     AS transfer_progress_metric_default;
  transfer_progress_metric_default 
@@ -621,7 +640,8 @@ CREATE INDEX filter_src_k_idx ON filter_src(k);
 ANALYZE filter_src;
 SET bloompg.excitation_threshold = 1.0;
 SET bloompg.index_transfer = on;
-SET bloompg.index_transfer_max_fraction = 1.0;
+-- This fixture's indexed key set covers 20% of the receiver.
+SET bloompg.index_transfer_max_fraction = 0.25;
 SET bloompg.transfer_progress_metric = 'rows';
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
@@ -643,6 +663,18 @@ SELECT COALESCE((
 ), false) AS index_transfer_profile_ok;
  index_transfer_profile_ok 
 ---------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT (relation->'sampling'->>'index_filter_probes')::integer > 0
+       AND (relation->'sampling'->>'index_filter_cache_hits')::integer > 0
+    FROM jsonb_array_elements(
+        bloompg_last_profile()->'transfer'->'relations') AS relation
+    WHERE relation->>'alias' = 'd'
+), false) AS index_selectivity_cache_reused;
+ index_selectivity_cache_reused 
+--------------------------------
  t
 (1 row)
 
@@ -728,7 +760,6 @@ CREATE INDEX protected_guarded_fact_guarded_idx
     ON protected_guarded_fact(guarded_id);
 ANALYZE protected_dimension, protected_source, guarded_dimension,
     protected_guarded_fact;
-SET bloompg.index_transfer_max_fraction = 0.15;
 CALL assert_same('indexed_complete_transfer',
     'SELECT count(*) FROM protected_dimension d JOIN protected_source p ON d.id = p.dimension_id JOIN protected_guarded_fact f ON p.id = f.protected_id JOIN guarded_dimension g ON g.id = f.guarded_id WHERE d.keep AND g.keep');
 SET bloompg.enable = on;
@@ -761,7 +792,8 @@ SELECT COALESCE(
  t
 (1 row)
 
--- Joint residual selectivity must not admit individually broad indexes.
+-- Reject broad individual indexes even when their joint selectivity is small.
+SET bloompg.index_transfer_max_fraction = 0.10;
 CREATE TABLE bitmap_left(k integer, keep boolean);
 CREATE TABLE bitmap_right(k integer, keep boolean);
 CREATE TABLE bitmap_fact(a integer, b integer);
@@ -771,7 +803,6 @@ INSERT INTO bitmap_fact SELECT g % 10, (g / 10) % 10 FROM generate_series(0, 999
 CREATE INDEX ON bitmap_fact(a);
 CREATE INDEX ON bitmap_fact(b);
 ANALYZE bitmap_left, bitmap_right, bitmap_fact;
-SET bloompg.index_transfer_max_fraction = 0.10;
 SELECT count(*) = 40 AS bitmap_individual_sel_query_ok
 FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
 JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep;
@@ -784,15 +815,15 @@ SELECT COALESCE((
     SELECT (relation->'materialization'->'index_probe'->>'scans')::integer = 0
     FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
     WHERE relation->>'alias' = 'f'
-), false) AS bitmap_individual_sel_uses_scan_ok;
- bitmap_individual_sel_uses_scan_ok 
-------------------------------------
+), false) AS bitmap_individual_sel_limit_ok;
+ bitmap_individual_sel_limit_ok 
+--------------------------------
  t
 (1 row)
 
--- Access can use the 20% indexes without granting scheduling priority.
-SET bloompg.index_priority_max_fraction = 0.01;
+-- Raising the access threshold permits 20% indexes without granting priority.
 SET bloompg.index_transfer_max_fraction = 0.25;
+SET bloompg.index_priority_max_fraction = 0.01;
 CALL assert_same('bitmap_two_indexes_results',
     'SELECT count(*) FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep');
 SET bloompg.enable = on;
@@ -839,7 +870,8 @@ SELECT COALESCE((
 (1 row)
 
 RESET bloompg.index_priority_max_fraction;
--- More than the former 100000-key cap, one native array scan, lossy rechecks.
+-- Explicitly allow broad indexes to exercise large arrays and lossy rechecks.
+SET bloompg.index_transfer_max_fraction = 1.0;
 CREATE TABLE bitmap_large_source(k integer, keep boolean);
 CREATE TABLE bitmap_large_fact(k integer, payload integer, padding text);
 INSERT INTO bitmap_large_source
@@ -850,7 +882,6 @@ FROM generate_series(0, 219999) g;
 CREATE INDEX ON bitmap_large_fact(k);
 ANALYZE bitmap_large_source, bitmap_large_fact;
 SET work_mem = '64kB';
-SET bloompg.index_transfer_max_fraction = 1.0;
 CALL assert_same('bitmap_large_lossy_results',
     'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
 SET bloompg.enable = on;
@@ -874,7 +905,6 @@ SELECT COALESCE((
  t
 (1 row)
 
-SET bloompg.index_transfer_max_fraction = 0.10;
 SELECT count(*) = 198000 AS bitmap_high_sel_query_ok
 FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
  bitmap_high_sel_query_ok 
@@ -883,25 +913,188 @@ FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
 (1 row)
 
 SELECT COALESCE((
-    SELECT (relation->'materialization'->>'access_path') = 'sequential-prefilter'
-       AND (relation->'materialization'->'index_probe'->>'scans')::integer = 0
+    SELECT (relation->'materialization'->>'access_path') = 'bitmap-index-probe'
+       AND (relation->'materialization'->'index_probe'->>'scans')::integer > 0
     FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
     WHERE relation->>'alias' = 'f'
-), false) AS bitmap_high_sel_uses_scan_ok;
- bitmap_high_sel_uses_scan_ok 
-------------------------------
+), false) AS bitmap_high_sel_uses_index_ok;
+ bitmap_high_sel_uses_index_ok 
+-------------------------------
  t
 (1 row)
 
+-- Native parallel bitmap heap scans must preserve lossy-page rechecks and
+-- projected filter attributes, including when several indexes are intersected.
+SET max_parallel_workers_per_gather = 3;
+SET bloompg.transfer_workers = 3;
+SET bloompg.transfer_parallel_min_rows = 0;
+SET min_parallel_table_scan_size = 0;
+CALL assert_same('parallel_bitmap_lossy_results',
+    'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 198000 AS parallel_bitmap_query_ok
+FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
+ parallel_bitmap_query_ok 
+--------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT relation->'materialization'->>'access_path' = 'parallel-bitmap'
+       AND (relation->'materialization'->'parallel'->>'workers_launched')::integer > 0
+       AND (relation->'materialization'->'index_probe'->>'bitmap_lossy_pages')::integer > 0
+       AND (relation->'materialization'->'index_probe'->>'rows')::bigint >= 198000
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS parallel_bitmap_lossy_profile_ok;
+ parallel_bitmap_lossy_profile_ok 
+----------------------------------
+ t
+(1 row)
+
+CALL assert_same('parallel_bitmap_intersection_results',
+    'SELECT count(*) FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 40 AS parallel_bitmap_intersection_query_ok
+FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
+JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.keep;
+ parallel_bitmap_intersection_query_ok 
+---------------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT relation->'materialization'->>'access_path' = 'parallel-bitmap'
+       AND (relation->'materialization'->'index_probe'->>'bitmap_sources')::integer = 2
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS parallel_bitmap_intersection_profile_ok;
+ parallel_bitmap_intersection_profile_ok 
+-----------------------------------------
+ t
+(1 row)
+
+SET parallel_leader_participation = off;
+CALL assert_same('parallel_bitmap_workers_only',
+    'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
+RESET parallel_leader_participation;
+-- Resource exhaustion must retain correct leader-only execution.
+SET max_parallel_workers = 0;
+CALL assert_same('parallel_bitmap_without_workers',
+    'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
+RESET max_parallel_workers;
+SET max_parallel_workers_per_gather = 0;
+SET bloompg.transfer_workers = 0;
+RESET bloompg.transfer_parallel_min_rows;
+RESET min_parallel_table_scan_size;
+CALL assert_same('automatic_index_results',
+    'SELECT count(*), sum(f.payload) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep');
+SET bloompg.enable = on;
+SELECT count(*) = 198000 AS automatic_dense_query_ok
+FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
+ automatic_dense_query_ok 
+--------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT relation->'materialization'->>'access_path' = 'bitmap-index-probe'
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS automatic_dense_bitmap_ok;
+ automatic_dense_bitmap_ok 
+---------------------------
+ t
+(1 row)
+
+-- Above the fixed selectivity ceiling, use a full scan regardless of workers.
+SET bloompg.index_transfer_max_fraction = 0.05;
+SET max_parallel_workers_per_gather = 3;
+SET bloompg.transfer_workers = 3;
+SET bloompg.transfer_parallel_min_rows = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT count(*) = 198000 AS automatic_parallel_scan_query_ok
+FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.keep;
+ automatic_parallel_scan_query_ok 
+----------------------------------
+ t
+(1 row)
+
+SELECT COALESCE((
+    SELECT relation->'materialization'->>'access_path' = 'parallel-p0'
+       AND relation->'materialization'->'decision'->>'reason' = 'broad-domain'
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f'
+), false) AS automatic_parallel_scan_profile_ok;
+ automatic_parallel_scan_profile_ok 
+------------------------------------
+ t
+(1 row)
+
+-- The same <=5% index condition remains eligible with zero or three workers.
+-- More than 2,048 keys ensures this is not an absolute small-key exception.
+-- Use the full fixture as the sample to make the boundary check deterministic.
+SET bloompg.sample_size = 250000;
+-- Exercise SSPT access selection rather than the native nested-loop leaf guard.
+SET enable_nestloop = off;
+DO $$
+DECLARE
+    workers integer;
+    result_count bigint;
+    fact_profile jsonb;
+BEGIN
+    FOREACH workers IN ARRAY ARRAY[0, 3] LOOP
+        PERFORM set_config('max_parallel_workers_per_gather', workers::text, true);
+        PERFORM set_config('bloompg.transfer_workers', workers::text, true);
+        EXECUTE 'SELECT count(*) FROM bitmap_large_source s JOIN bitmap_large_fact f USING(k) WHERE s.k <= 4200'
+            INTO result_count;
+        SELECT relation INTO fact_profile
+        FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+        WHERE relation->>'alias' = 'f';
+        IF result_count <> 8400 OR
+           COALESCE((fact_profile->'materialization'->'index_probe'->>'scans')::integer, 0) = 0 OR
+           COALESCE(fact_profile->'materialization'->>'access_path', '') <>
+               (CASE WHEN workers = 0 THEN 'bitmap-index-probe' ELSE 'parallel-bitmap' END) THEN
+            RAISE EXCEPTION 'fixed index threshold failed with % workers: rows %, profile %', workers, result_count, fact_profile;
+        END IF;
+    END LOOP;
+END $$;
+RESET enable_nestloop;
+RESET bloompg.sample_size;
+SET max_parallel_workers_per_gather = 0;
+SET bloompg.transfer_workers = 0;
+RESET bloompg.transfer_parallel_min_rows;
+RESET min_parallel_table_scan_size;
+-- A narrow index remains usable; the broad condition is still enforced.
+SET bloompg.index_transfer_max_fraction = 0.10;
+DO $$
+DECLARE
+    result_count bigint;
+    fact_profile jsonb;
+BEGIN
+    SELECT count(*) INTO result_count
+    FROM bitmap_left l JOIN bitmap_fact f ON l.k = f.a
+    JOIN bitmap_right r ON r.k = f.b WHERE l.keep AND r.k = 0;
+    SELECT relation INTO fact_profile
+    FROM jsonb_array_elements(bloompg_last_profile()->'transfer'->'relations') relation
+    WHERE relation->>'alias' = 'f';
+    IF result_count <> 20 OR fact_profile IS NULL
+       OR (fact_profile->'materialization'->'index_probe'->>'bitmap_sources')::integer <> 1
+       OR (fact_profile->'materialization'->'index_probe'->>'attribute')::integer <> 2 THEN
+        RAISE EXCEPTION 'mixed-selectivity bitmap access failed: %, %', result_count, fact_profile;
+    END IF;
+END
+$$;
+RESET bloompg.index_transfer_max_fraction;
 RESET work_mem;
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
 RESET bloompg.transfer_progress_metric;
-RESET bloompg.index_transfer_max_fraction;
 RESET bloompg.index_transfer;
 SET bloompg.excitation_threshold = 0.0;
 SET bloompg.profile = on;
 SET bloompg.profile_log = off;
+SET parallel_tuple_cost = 0.27;
 SELECT count(*) > 0 AS native_fallback_query_ok
 FROM a JOIN b ON a.k = b.k
 WHERE a.keep;
@@ -913,6 +1106,7 @@ WHERE a.keep;
 SELECT (bloompg_last_profile()->'transfer'->'summary'->>'applied')::boolean = false
    AND (bloompg_last_profile()->'planning'->>'replanned')::boolean
    AND (bloompg_last_profile()->'planning'->>'native_preview_ms')::numeric >= 0
+   AND current_setting('parallel_tuple_cost')::numeric = 0.27
    AS native_fallback_replanned_ok;
  native_fallback_replanned_ok 
 ------------------------------
@@ -921,6 +1115,7 @@ SELECT (bloompg_last_profile()->'transfer'->'summary'->>'applied')::boolean = fa
 
 SET bloompg.profile = off;
 RESET bloompg.profile_log;
+RESET parallel_tuple_cost;
 SET bloompg.excitation_threshold = 1.0;
 CREATE TABLE exact_empty_src(k integer, keep boolean);
 CREATE TABLE exact_empty_dst(k integer, payload text);
@@ -1444,6 +1639,24 @@ BEGIN
     END IF;
 END
 $$;
+-- Cost-aware scheduling changes decisions, never predicate semantics.
+SET bloompg.filter_cost_rows_per_ms = 100000;
+SET bloompg.transfer_workers = 0;
+SET max_parallel_workers_per_gather = 0;
+SET bloompg.sample_mode = 'prepared';
+CALL assert_same('filter_cost_correlated',
+    'SELECT a.k, b.payload FROM a JOIN b ON a.k = b.k WHERE a.keep AND a.k < 200 AND b.payload LIKE ''bb%''');
+CALL assert_same('filter_cost_empty',
+    'SELECT count(*) FROM exact_empty_src s JOIN exact_empty_dst d USING (k) WHERE s.keep AND d.payload LIKE ''e%''');
+SET bloompg.sample_memory_cache = off;
+CALL assert_same('filter_cost_uncached',
+    'SELECT count(*) FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k WHERE a.keep AND c.flag AND b.payload LIKE ''bb%''');
+RESET bloompg.sample_memory_cache;
+SET bloompg.sample_mode = 'instant';
+CALL assert_same('filter_cost_instant',
+    'SELECT count(*) FROM a JOIN b ON a.k = b.k WHERE a.keep AND b.payload LIKE ''bb%''');
+RESET bloompg.filter_cost_rows_per_ms;
+RESET bloompg.transfer_workers;
 DROP SCHEMA bloompg_regress CASCADE;
 DROP EXTENSION bloompg;
 RESET client_min_messages;

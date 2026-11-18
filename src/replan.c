@@ -9,6 +9,7 @@
 #include "access/table.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
+#include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -22,6 +23,7 @@
 #include "utils/selfuncs.h"
 
 static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
+static set_join_pathlist_hook_type previous_set_join_pathlist_hook = NULL;
 static get_relation_stats_hook_type previous_get_relation_stats_hook = NULL;
 static Bitmapset *active_statistics_relids = NULL;
 static MemoryContext active_replan_context = NULL;
@@ -191,6 +193,134 @@ bloompg_parameterized_path_is_equivalent(BloomPGReplacement *replacement,
 			return false;
 	}
 	return true;
+}
+
+/* Look through wrappers without descending into a CustomPath's executor
+ * fallback: it is not part of the path PostgreSQL will actually execute. */
+static Path *
+bloompg_unary_subpath(Path *path)
+{
+	switch (nodeTag(path))
+	{
+		case T_MaterialPath:
+			return ((MaterialPath *) path)->subpath;
+		case T_ProjectionPath:
+			return ((ProjectionPath *) path)->subpath;
+		case T_SortPath:
+			return ((SortPath *) path)->subpath;
+		case T_IncrementalSortPath:
+			return ((IncrementalSortPath *) path)->spath.subpath;
+		case T_GatherPath:
+			return ((GatherPath *) path)->subpath;
+		case T_GatherMergePath:
+			return ((GatherMergePath *) path)->subpath;
+		case T_MemoizePath:
+			return ((MemoizePath *) path)->subpath;
+		default:
+			return NULL;
+	}
+}
+
+static bool
+bloompg_path_has_antijoin(Path *path)
+{
+	Path *subpath;
+
+	check_stack_depth();
+	if (IsA(path, NestPath) || IsA(path, MergePath) || IsA(path, HashPath))
+	{
+		JoinPath *join = (JoinPath *) path;
+
+		return join->jointype == JOIN_ANTI || join->jointype == JOIN_RIGHT_ANTI ||
+			bloompg_path_has_antijoin(join->outerjoinpath) ||
+			bloompg_path_has_antijoin(join->innerjoinpath);
+	}
+	subpath = bloompg_unary_subpath(path);
+	return subpath != NULL && bloompg_path_has_antijoin(subpath);
+}
+
+/* Anti-join estimates can collapse to one row.  Prefer equivalent keyed
+ * probes to repeatedly scanning an SSPT memory table beneath such an outer
+ * path.  This changes only the affected inner-join alternative, not the cost
+ * of memory scans used by hash joins or elsewhere in the plan. */
+static void
+bloompg_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+	RelOptInfo *outerrel, RelOptInfo *innerrel, JoinType jointype,
+	JoinPathExtraData *extra)
+{
+	List *replacements = NIL;
+	ListCell *cell;
+
+	if (previous_set_join_pathlist_hook != NULL)
+		previous_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+			jointype, extra);
+	if (active_replacements == NIL || root->parent_root != NULL ||
+		jointype != JOIN_INNER || innerrel->reloptkind != RELOPT_BASEREL ||
+		innerrel->top_parent_relids != NULL || outerrel->top_parent_relids != NULL)
+		return;
+
+	foreach(cell, joinrel->pathlist)
+	{
+		Path *path = lfirst(cell);
+		NestPath *nest;
+		Path *scan;
+		Path *subpath;
+		BloomPGReplacement *replacement;
+		ListCell *index_cell;
+		bool replaced = false;
+
+		if (!IsA(path, NestPath) || path->param_info != NULL)
+			continue;
+		nest = (NestPath *) path;
+		if (nest->jpath.jointype != JOIN_INNER ||
+			nest->jpath.outerjoinpath->parent != outerrel ||
+			nest->jpath.innerjoinpath->parent != innerrel ||
+			nest->jpath.outerjoinpath->param_info != NULL ||
+			nest->jpath.innerjoinpath->param_info != NULL)
+			continue;
+		scan = nest->jpath.innerjoinpath;
+		while ((subpath = bloompg_unary_subpath(scan)) != NULL)
+			scan = subpath;
+		if (!IsA(scan, CustomPath) ||
+			((CustomPath *) scan)->methods != &bloompg_memory_path_methods ||
+			!bloompg_path_has_antijoin(nest->jpath.outerjoinpath))
+			continue;
+		replacement = bloompg_find_replacement(innerrel->relid);
+		if (replacement == NULL)
+			continue;
+		foreach(index_cell, innerrel->pathlist)
+		{
+			Path *index = lfirst(index_cell);
+			JoinCostWorkspace workspace;
+			NestPath *keyed;
+
+			if ((!IsA(index, IndexPath) && !IsA(index, BitmapHeapPath)) ||
+				!bloompg_parameterized_path_is_equivalent(replacement, index) ||
+				!bms_is_subset(PATH_REQ_OUTER(index), outerrel->relids))
+				continue;
+			/* Rebuild with PostgreSQL's native costing and clause handling.
+			 * All index parameters are supplied by this exact outer path. */
+			initial_cost_nestloop(root, &workspace, JOIN_INNER,
+				nest->jpath.outerjoinpath, index, extra);
+			keyed = create_nestloop_path(root, joinrel, JOIN_INNER, &workspace,
+				extra, nest->jpath.outerjoinpath, index,
+				nest->jpath.joinrestrictinfo, path->pathkeys, NULL);
+			replacements = lappend(replacements, keyed);
+			replaced = true;
+		}
+		/* Only remove the full-rescan alternative after constructing a legal
+		 * equivalent.  Deferred add_path calls preserve iteration safety. */
+		if (replaced)
+		{
+			joinrel->pathlist = foreach_delete_current(joinrel->pathlist, cell);
+			if (bloompg_log_transfer_steps)
+				elog(LOG, "bloompg P1 prefers parameterized index for RTI %u after anti join",
+					innerrel->relid);
+		}
+	}
+	foreach(cell, replacements)
+		add_path(joinrel, lfirst(cell));
+	list_free(replacements);
 }
 
 static bool
@@ -467,16 +597,6 @@ bloompg_set_rel_pathlist(PlannerInfo *root,
 	}
 	path = bloompg_replacement_path(replacement, rti, rel, fallback, rows,
 		false, 0);
-	/* A large materialization whose exact incoming domain can also be enforced
-	 * by a parameterized index is a poor inner-rescan choice: a single bad
-	 * cardinality estimate can multiply a full vector scan thousands of times.
-	 * Soft-disable that unparameterized alternative.  PostgreSQL may still use
-	 * it to break a parameterization cycle, but otherwise prefers the keyed
-	 * path that already enforces the same domain. */
-	if (replacement->materialization_filter_sources != NULL &&
-		rows > (double) bloompg_index_guard_min_rows &&
-		equivalent_parameterized_paths != NIL)
-		path->path.disabled_nodes = 1;
 	add_path(rel, &path->path);
 	/* Keep only native parameterized paths that enforce every exact domain
 	 * consumed by the materialization.  PostgreSQL can then choose between one
@@ -641,6 +761,8 @@ bloompg_replan_init(void)
 {
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = bloompg_set_rel_pathlist;
+	previous_set_join_pathlist_hook = set_join_pathlist_hook;
+	set_join_pathlist_hook = bloompg_set_join_pathlist;
 	previous_get_relation_stats_hook = get_relation_stats_hook;
 	get_relation_stats_hook = bloompg_get_relation_stats;
 }
@@ -650,6 +772,8 @@ bloompg_replan_fini(void)
 {
 	if (set_rel_pathlist_hook == bloompg_set_rel_pathlist)
 		set_rel_pathlist_hook = previous_set_rel_pathlist_hook;
+	if (set_join_pathlist_hook == bloompg_set_join_pathlist)
+		set_join_pathlist_hook = previous_set_join_pathlist_hook;
 	if (get_relation_stats_hook == bloompg_get_relation_stats)
 		get_relation_stats_hook = previous_get_relation_stats_hook;
 	active_replacements = NIL;

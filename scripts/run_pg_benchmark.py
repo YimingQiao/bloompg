@@ -105,18 +105,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--index-transfer",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
-    parser.add_argument("--index-transfer-max-fraction", type=float, default=0.10)
     parser.add_argument("--index-priority-max-fraction", type=float, default=0.01)
     parser.add_argument(
-        "--index-guard-min-rows",
+        "--index-transfer-max-fraction",
+        type=float,
+        help="Index access selectivity limit; omitted to preserve the server setting",
+    )
+    parser.add_argument(
+        "--filter-cost-rows-per-ms",
+        type=float,
+        help="Predicate-cost weight; omitted to preserve the server setting",
+    )
+    parser.add_argument(
+        "--effective-io-concurrency",
         type=int,
-        default=100_000,
-        help=(
-            "Materialized rows above which P1 protects a parameterized index "
-            "against repeated full rescans (default: 100000)"
-        ),
+        help="PostgreSQL I/O concurrency, applied equally to native and Bloom runs",
     )
     parser.add_argument(
         "--transfer-progress-metric",
@@ -173,7 +178,7 @@ def parse_args() -> argparse.Namespace:
         "--reuse-base-from",
         type=Path,
         help=(
-            "Reuse a base result only when query ID and SQL SHA-256 match an "
+            "Reuse a base result only when query ID, SQL SHA-256, and native settings match an "
             "existing JSONL record; otherwise run both modes."
         ),
     )
@@ -199,9 +204,7 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         f"-c bloompg.transfer_workers={transfer_workers}",
         f"-c bloompg.transfer_parallel_min_rows={args.transfer_parallel_min_rows}",
         f"-c bloompg.index_transfer={'on' if args.index_transfer else 'off'}",
-        f"-c bloompg.index_transfer_max_fraction={args.index_transfer_max_fraction}",
         f"-c bloompg.index_priority_max_fraction={args.index_priority_max_fraction}",
-        f"-c bloompg.index_guard_min_rows={args.index_guard_min_rows}",
         f"-c bloompg.transfer_progress_metric={args.transfer_progress_metric}",
         f"-c bloompg.profile={'on' if args.capture_profile else 'off'}",
         "-c bloompg.profile_log=off",
@@ -210,6 +213,16 @@ def pgoptions(args: argparse.Namespace, enabled: bool) -> str:
         options.append(f"-c work_mem={args.work_mem}")
     if args.hash_mem_multiplier is not None:
         options.append(f"-c hash_mem_multiplier={args.hash_mem_multiplier}")
+    if args.index_transfer_max_fraction is not None:
+        options.append(
+            f"-c bloompg.index_transfer_max_fraction={args.index_transfer_max_fraction}"
+        )
+    if args.filter_cost_rows_per_ms is not None:
+        options.append(
+            f"-c bloompg.filter_cost_rows_per_ms={args.filter_cost_rows_per_ms}"
+        )
+    if args.effective_io_concurrency is not None:
+        options.append(f"-c effective_io_concurrency={args.effective_io_concurrency}")
     if not enabled and args.base_nestloop != "default":
         options.append(f"-c enable_nestloop={args.base_nestloop}")
     return " ".join(options)
@@ -413,6 +426,12 @@ SELECT json_build_object(
     'max_worker_processes', current_setting('max_worker_processes'),
     'random_page_cost', current_setting('random_page_cost'),
     'effective_io_concurrency', current_setting('effective_io_concurrency'),
+    'io_method', current_setting('io_method'),
+    'io_workers', current_setting('io_workers'),
+    'bloompg_filter_cost_rows_per_ms',
+        current_setting('bloompg.filter_cost_rows_per_ms'),
+    'bloompg_parallel_tuple_cost_factor',
+        current_setting('bloompg.parallel_tuple_cost_factor'),
     'bloompg_materialization_memory',
         current_setting('bloompg.materialization_memory'),
     'bloompg_sample_mode', current_setting('bloompg.sample_mode')
@@ -424,12 +443,10 @@ SELECT json_build_object(
     ,'bloompg_transfer_parallel_min_rows',
         current_setting('bloompg.transfer_parallel_min_rows')
     ,'bloompg_index_transfer', current_setting('bloompg.index_transfer')
-    ,'bloompg_index_transfer_max_fraction',
-        current_setting('bloompg.index_transfer_max_fraction')
     ,'bloompg_index_priority_max_fraction',
         current_setting('bloompg.index_priority_max_fraction')
-    ,'bloompg_index_guard_min_rows',
-        current_setting('bloompg.index_guard_min_rows')
+    ,'bloompg_index_transfer_max_fraction',
+        current_setting('bloompg.index_transfer_max_fraction')
     ,'bloompg_transfer_progress_metric',
         current_setting('bloompg.transfer_progress_metric')
     ,'database', current_database()
@@ -534,10 +551,28 @@ def load_records(path: Path) -> dict[str, dict]:
     return records
 
 
-def reusable_base(record: dict | None, query_sha256: str) -> dict | None:
+def reusable_base(
+    record: dict | None, query_sha256: str, settings: dict
+) -> dict | None:
     if record is None or record.get("query_sha256") != query_sha256:
         return None
-    return record.get("base")
+    previous = record.get("settings")
+    if previous is None:
+        return None
+
+    # Bloom-only knobs may change while reusing a native baseline. I/O and
+    # parallelism settings must not: they affect both sides of the comparison.
+    def native_settings(values):
+        return {
+            key: value
+            for key, value in values.items()
+            if not key.startswith("bloompg_")
+        }
+
+    if native_settings(previous) != native_settings(settings):
+        return None
+    base = record.get("base")
+    return base if base is not None and base.get("status") == "ok" else None
 
 
 def query_id(root: Path, path: Path) -> str:
@@ -622,12 +657,25 @@ def main() -> int:
         raise SystemExit("--transfer-workers must be non-negative")
     if args.transfer_parallel_min_rows < 0:
         raise SystemExit("--transfer-parallel-min-rows must be non-negative")
-    if not 0.0 <= args.index_transfer_max_fraction <= 1.0:
-        raise SystemExit("--index-transfer-max-fraction must be between 0 and 1")
     if not 0.0 <= args.index_priority_max_fraction <= 1.0:
         raise SystemExit("--index-priority-max-fraction must be between 0 and 1")
-    if args.index_guard_min_rows < 0:
-        raise SystemExit("--index-guard-min-rows must be non-negative")
+    if (
+        args.index_transfer_max_fraction is not None
+        and not 0 <= args.index_transfer_max_fraction <= 1
+    ):
+        raise SystemExit("--index-transfer-max-fraction must be between 0 and 1")
+    if args.filter_cost_rows_per_ms is not None and (
+        not math.isfinite(args.filter_cost_rows_per_ms)
+        or not 0 <= args.filter_cost_rows_per_ms <= 1e12
+    ):
+        raise SystemExit(
+            "--filter-cost-rows-per-ms must be finite and between 0 and 1e12"
+        )
+    if (
+        args.effective_io_concurrency is not None
+        and not 0 <= args.effective_io_concurrency <= 1000
+    ):
+        raise SystemExit("--effective-io-concurrency must be between 0 and 1000")
     if args.queries_per_group is not None and args.queries_per_group < 1:
         raise SystemExit("--queries-per-group must be positive")
     if not 0.0 <= args.sample_rate <= 1.0:
@@ -663,9 +711,7 @@ def main() -> int:
         "bloompg_transfer_workers": expected_transfer_workers,
         "bloompg_transfer_parallel_min_rows": args.transfer_parallel_min_rows,
         "bloompg_index_transfer": "on" if args.index_transfer else "off",
-        "bloompg_index_transfer_max_fraction": args.index_transfer_max_fraction,
         "bloompg_index_priority_max_fraction": args.index_priority_max_fraction,
-        "bloompg_index_guard_min_rows": args.index_guard_min_rows,
         "bloompg_transfer_progress_metric": args.transfer_progress_metric,
     }
     mismatches = {
@@ -693,7 +739,7 @@ def main() -> int:
             query_sha256 = hashlib.sha256(query_sql.encode("utf-8")).hexdigest()
             modes: dict[str, dict] = {}
             reuse_record = reused_bases.get(query_name)
-            reused_base = reusable_base(reuse_record, query_sha256)
+            reused_base = reusable_base(reuse_record, query_sha256, settings)
             if reused_base is not None:
                 modes["base"] = reused_base
                 order = [True]
@@ -704,7 +750,7 @@ def main() -> int:
             else:
                 if reuse_record is not None:
                     print(
-                        f"ignore stale base for {query_name}: SQL SHA-256 differs",
+                        f"ignore stale base for {query_name}: SQL/settings differ or base failed",
                         flush=True,
                     )
                 order = [False, True] if index % 2 == 0 else [True, False]

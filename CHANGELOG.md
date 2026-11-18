@@ -4,6 +4,22 @@ All notable changes to BloomPG are documented here.
 
 ## Unreleased
 
+- Use native serial and parallel bitmap heap access for selective exact-key
+  transfers, with the same 7% access threshold regardless of worker count.
+  Selective indexed inputs retain scheduling priority at 1%.
+- Include sampled local-predicate evaluation costs in table scheduling, with a
+  default weight of 1,000 row-cost units per millisecond. Cache immutable
+  filter selectivities and reuse vector probes for materialized inputs.
+- Preserve legal parallel reoptimization paths in queries containing parallel
+  restricted operations. Scale parallel tuple communication cost only during
+  reoptimization and restore the session value afterward.
+- Remove the global serial-materialization penalty and whole-plan cost
+  fallback. Prefer equivalent parameterized index probes for repeated memory
+  scans following an underestimated anti join.
+- Keep all execution paths compatible with unmodified PostgreSQL 18. Parallel
+  bitmap construction using a PostgreSQL backend patch remains a local
+  experiment and is not included.
+
 ## 0.1.2 - 2026-08-22
 
 - Add a PostgreSQL 18 Docker quickstart with an instant-sampling star-schema

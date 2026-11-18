@@ -16,10 +16,25 @@ SPEC.loader.exec_module(RUNNER)
 class QueryDiscoveryTests(unittest.TestCase):
     def test_reused_base_requires_identical_sql_hash(self):
         base = {"status": "ok"}
-        record = {"query_sha256": "same", "base": base}
-        self.assertIs(RUNNER.reusable_base(record, "same"), base)
-        self.assertIsNone(RUNNER.reusable_base(record, "different"))
-        self.assertIsNone(RUNNER.reusable_base(None, "same"))
+        settings = {"effective_io_concurrency": "0"}
+        record = {"query_sha256": "same", "base": base, "settings": settings}
+        self.assertIs(RUNNER.reusable_base(record, "same", settings), base)
+        self.assertIsNone(RUNNER.reusable_base(record, "different", settings))
+        self.assertIsNone(RUNNER.reusable_base(None, "same", settings))
+
+    def test_baseline_reuse_checks_native_settings_but_not_bloom_weight(self):
+        base = {"status": "ok"}
+        settings = {
+            "effective_io_concurrency": "0",
+            "bloompg_filter_cost_rows_per_ms": "0",
+        }
+        record = {"query_sha256": "same", "base": base, "settings": settings}
+        changed_weight = settings | {"bloompg_filter_cost_rows_per_ms": "500"}
+        self.assertIs(RUNNER.reusable_base(record, "same", changed_weight), base)
+        changed_io = settings | {"effective_io_concurrency": "256"}
+        self.assertIsNone(RUNNER.reusable_base(record, "same", changed_io))
+        record["base"] = {"status": "error"}
+        self.assertIsNone(RUNNER.reusable_base(record, "same", settings))
 
     def test_flat_query_id_is_unchanged(self):
         root = Path("/queries")
@@ -127,19 +142,19 @@ class SettingsTests(unittest.TestCase):
             transfer_workers=4,
             transfer_parallel_min_rows=100_000,
             index_transfer=True,
-            index_transfer_max_fraction=0.15,
             index_priority_max_fraction=0.01,
-            index_transfer_batch_keys=65_536,
-            index_transfer_max_keys=100_000,
-            index_guard_min_rows=100_000,
+            index_transfer_max_fraction=0.1,
             transfer_progress_metric="ndv",
             capture_profile=True,
             work_mem="512MB",
             hash_mem_multiplier=2.0,
+            filter_cost_rows_per_ms=1000.0,
+            effective_io_concurrency=0,
             sample_mode="instant",
             sample_size=20_000,
             sample_seed=2,
             sample_rate=0.01,
+            base_nestloop="default",
         )
 
         options = RUNNER.pgoptions(args, True)
@@ -149,6 +164,16 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("-c bloompg.transfer_progress_metric=ndv", options)
         self.assertIn("-c max_parallel_workers=8", options)
         self.assertIn("-c max_parallel_workers_per_gather=8", options)
+        self.assertIn("-c bloompg.index_transfer_max_fraction=0.1", options)
+        self.assertIn("-c bloompg.filter_cost_rows_per_ms=1000.0", options)
+        self.assertIn("-c effective_io_concurrency=0", options)
+        native_options = RUNNER.pgoptions(args, False)
+        self.assertIn("-c effective_io_concurrency=0", native_options)
+        args.effective_io_concurrency = None
+        args.filter_cost_rows_per_ms = None
+        inherited_options = RUNNER.pgoptions(args, True)
+        self.assertNotIn("effective_io_concurrency=", inherited_options)
+        self.assertNotIn("filter_cost_rows_per_ms=", inherited_options)
 
 
 if __name__ == "__main__":

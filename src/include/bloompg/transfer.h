@@ -66,6 +66,7 @@ extern BloomPGTransferOutcome bloompg_apply_transfers(PlannedStmt *candidate,
 											 const char *query_string,
 											 ParamListInfo bound_params,
 											 bool query_parallel_safe,
+											 bool query_parallel_allowed,
 											 const Bitmapset *native_parameterized_indexes);
 extern Bitmapset *bloompg_parameterized_index_relids(PlannedStmt *statement);
 extern void bloompg_finish_replacements(List *replacements,

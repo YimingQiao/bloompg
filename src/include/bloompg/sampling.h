@@ -81,10 +81,14 @@ extern void bloompg_sample_workspace_stats(BloomPGSampleWorkspace *workspace,
 										   uint64 *probe_rows_examined,
 										   uint64 *probe_filter_checks,
 										   uint64 *probe_filters_applied,
-										   uint64 *probe_cache_hits);
+										   uint64 *probe_cache_hits,
+										   uint64 *index_filter_probes,
+										   uint64 *index_filter_cache_hits);
 extern bool bloompg_sample_workspace_order_costs(
 	BloomPGSampleWorkspace *workspace, double *local_sample_ms,
 	double *filter_sample_ms);
+extern double bloompg_sample_workspace_evaluation_ms(
+	BloomPGSampleWorkspace *workspace, double base_rows);
 extern bool bloompg_sample_workspace_filter_fraction(
 	BloomPGSampleWorkspace *workspace, BloomPGSampleFilter *filter,
 	double *fraction, uint64 *rows_examined, uint64 *rows_matched,

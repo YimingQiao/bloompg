@@ -309,14 +309,13 @@ bloompg_transfer_worker_count(BloomPGRelationState *state,
 
 static Plan *
 bloompg_make_parallel_child(BloomPGRelationState *state,
-	int *next_plan_node_id)
+	int *next_plan_node_id, Plan *indexed_scan)
 {
-	SeqScan *scan = bloompg_make_seqscan_evaluator(state->fallback_plan);
-	Plan *child;
+	Plan *child = indexed_scan != NULL ? indexed_scan :
+		(Plan *) bloompg_make_seqscan_evaluator(state->fallback_plan);
 
-	if (scan == NULL)
+	if (child == NULL)
 		elog(ERROR, "bloompg cannot normalize the parallel transfer scan");
-	child = (Plan *) scan;
 	child->parallel_aware = true;
 	child->parallel_safe = true;
 	child->async_capable = false;
@@ -332,9 +331,10 @@ bloompg_make_parallel_child(BloomPGRelationState *state,
 
 Plan *
 bloompg_make_parallel_source(BloomPGRelationState *state, int workers,
-	int *next_plan_node_id, List *build_metadata)
+	int *next_plan_node_id, List *build_metadata, Plan *indexed_scan)
 {
-	Plan *child = bloompg_make_parallel_child(state, next_plan_node_id);
+	Plan *child = bloompg_make_parallel_child(state, next_plan_node_id,
+		indexed_scan);
 	Plan *packed = bloompg_make_pack_scan(child, (*next_plan_node_id)++, workers);
 
 	if (build_metadata != NIL)
@@ -444,8 +444,8 @@ bloompg_make_parallel_batch_plan(BloomPGRelationState *source,
 	BloomPGRelationState *peer, int workers, int *next_plan_node_id)
 {
 	Plan *source_child = bloompg_make_parallel_child(source,
-		next_plan_node_id);
-	Plan *peer_child = bloompg_make_parallel_child(peer, next_plan_node_id);
+		next_plan_node_id, NULL);
+	Plan *peer_child = bloompg_make_parallel_child(peer, next_plan_node_id, NULL);
 	Plan *source_packed = bloompg_make_pack_scan(source_child,
 		(*next_plan_node_id)++, workers);
 	Plan *peer_packed = bloompg_make_pack_scan(peer_child,

@@ -12,9 +12,11 @@
 
 #include "lib/stringinfo.h"
 #include "access/xact.h"
+#include "access/parallel.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc_d.h"
 #include "nodes/nodeFuncs.h"
+#include "miscadmin.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -85,121 +87,6 @@ bloompg_profile_materialization_tokens(List *replacements)
 		}
 	}
 	return tokens;
-}
-
-static bool
-bloompg_plan_contains_index_access(Plan *plan)
-{
-	List *children = NIL;
-	ListCell *cell;
-
-	if (plan == NULL)
-		return false;
-	if (IsA(plan, IndexScan) || IsA(plan, IndexOnlyScan) ||
-		IsA(plan, BitmapIndexScan))
-		return true;
-	if (bloompg_plan_contains_index_access(outerPlan(plan)) ||
-		bloompg_plan_contains_index_access(innerPlan(plan)))
-		return true;
-	switch (nodeTag(plan))
-	{
-		case T_Append:
-			children = castNode(Append, plan)->appendplans;
-			break;
-		case T_MergeAppend:
-			children = castNode(MergeAppend, plan)->mergeplans;
-			break;
-		case T_BitmapAnd:
-			children = castNode(BitmapAnd, plan)->bitmapplans;
-			break;
-		case T_BitmapOr:
-			children = castNode(BitmapOr, plan)->bitmapplans;
-			break;
-		case T_CustomScan:
-			children = castNode(CustomScan, plan)->custom_plans;
-			break;
-		case T_SubqueryScan:
-			return bloompg_plan_contains_index_access(
-				castNode(SubqueryScan, plan)->subplan);
-		default:
-			break;
-	}
-	foreach(cell, children)
-	{
-		if (bloompg_plan_contains_index_access((Plan *) lfirst(cell)))
-			return true;
-	}
-	return false;
-}
-
-/* Native and replacement costs are comparable only inside the same physical
- * access family.  Restrict the final safety comparison to a parameterized
- * index inner: this is the shape where a bad P1 choice can multiply keyed
- * rescans, while a hash/merge plan over exact Memory inputs must not be
- * discarded merely because its synthetic cost exceeds the heap plan. */
-static bool
-bloompg_plan_has_parameterized_index_loop(Plan *plan)
-{
-	List *children = NIL;
-	ListCell *cell;
-
-	if (plan == NULL)
-		return false;
-	if (IsA(plan, NestLoop) &&
-		castNode(NestLoop, plan)->nestParams != NIL &&
-		bloompg_plan_contains_index_access(innerPlan(plan)))
-		return true;
-	if (bloompg_plan_has_parameterized_index_loop(outerPlan(plan)) ||
-		bloompg_plan_has_parameterized_index_loop(innerPlan(plan)))
-		return true;
-	switch (nodeTag(plan))
-	{
-		case T_Append:
-			children = castNode(Append, plan)->appendplans;
-			break;
-		case T_MergeAppend:
-			children = castNode(MergeAppend, plan)->mergeplans;
-			break;
-		case T_BitmapAnd:
-			children = castNode(BitmapAnd, plan)->bitmapplans;
-			break;
-		case T_BitmapOr:
-			children = castNode(BitmapOr, plan)->bitmapplans;
-			break;
-		case T_CustomScan:
-			children = castNode(CustomScan, plan)->custom_plans;
-			break;
-		case T_SubqueryScan:
-			return bloompg_plan_has_parameterized_index_loop(
-				castNode(SubqueryScan, plan)->subplan);
-		default:
-			break;
-	}
-	foreach(cell, children)
-	{
-		if (bloompg_plan_has_parameterized_index_loop(
-				(Plan *) lfirst(cell)))
-			return true;
-	}
-	return false;
-}
-
-static bool
-bloompg_statement_has_parameterized_index_loop(PlannedStmt *statement)
-{
-	ListCell *cell;
-
-	if (statement == NULL)
-		return false;
-	if (bloompg_plan_has_parameterized_index_loop(statement->planTree))
-		return true;
-	foreach(cell, statement->subplans)
-	{
-		if (bloompg_plan_has_parameterized_index_loop(
-				(Plan *) lfirst(cell)))
-			return true;
-	}
-	return false;
 }
 
 static bool bloompg_query_scope_is_safe(Query *query);
@@ -368,8 +255,16 @@ bloompg_planner(Query *parse,
 		char *trace;
 		Query *analysis_query = copyObject(parse);
 		int bloom_cursor_options = cursor_options & ~CURSOR_OPT_PARALLEL_OK;
-		bool query_parallel_safe =
-			max_parallel_hazard(analysis_query) == PROPARALLEL_SAFE;
+		char parallel_hazard = max_parallel_hazard(analysis_query);
+		bool query_parallel_safe = parallel_hazard == PROPARALLEL_SAFE;
+		/* Like PG's parallelModeOK, allow restricted queries to have safe
+		 * parallel portions. This only permits DSM preparation for P1; it
+		 * must not relax the detached transfer executor's safety checks. */
+		bool query_parallel_allowed =
+			(cursor_options & CURSOR_OPT_PARALLEL_OK) != 0 &&
+			IsUnderPostmaster && !analysis_query->hasModifyingCTE &&
+			max_parallel_workers_per_gather > 0 && !IsParallelWorker() &&
+			parallel_hazard != PROPARALLEL_UNSAFE;
 		instr_time phase_started;
 		double p0_ms;
 		double graph_ms;
@@ -396,7 +291,6 @@ bloompg_planner(Query *parse,
 			BloomPGPlanProfileInput profile_input;
 			volatile bool replanned = false;
 			volatile bool transfer_failed = false;
-			volatile bool p1_parameterized_index_guard = false;
 			volatile int transfer_error_code = 0;
 			volatile double transfer_ms = 0.0;
 			volatile double p1_ms = 0.0;
@@ -425,6 +319,7 @@ bloompg_planner(Query *parse,
 				transfer = bloompg_apply_transfers(result, graph,
 											 query_string, bound_params,
 											 query_parallel_safe,
+											 query_parallel_allowed,
 											 native_parameterized_indexes);
 				ReleaseCurrentSubTransaction();
 				MemoryContextSwitchTo(planner_context);
@@ -461,17 +356,23 @@ bloompg_planner(Query *parse,
 				transfer.replacements != NIL)
 			{
 				PlannedStmt *volatile replacement_plan = NULL;
+				double saved_parallel_tuple_cost = parallel_tuple_cost;
 
 				bloompg_replan_begin(transfer.replacements, graph);
 				INSTR_TIME_SET_CURRENT(p1_started);
 				PG_TRY(_replan);
 				{
+					/* Local to P1: retain native scan/index costs and restore the
+					 * session's communication cost even when replanning fails. */
+					parallel_tuple_cost = saved_parallel_tuple_cost *
+						bloompg_parallel_tuple_cost_factor;
 					replacement_plan = bloompg_call_next_planner(
 						copyObject(analysis_query), query_string,
 						cursor_options, bound_params);
 				}
 				PG_FINALLY(_replan);
 				{
+					parallel_tuple_cost = saved_parallel_tuple_cost;
 					bloompg_replan_end();
 				}
 				PG_END_TRY(_replan);
@@ -480,23 +381,7 @@ bloompg_planner(Query *parse,
 				p1_ms = bloompg_planner_elapsed_ms(p1_started);
 				if (replacement_plan != NULL)
 				{
-					/* A parameterized index inner is the one physical family where
-					 * replacement and native costs remain meaningfully comparable.  If
-					 * P1 makes that rescan shape more expensive, retain the native plan;
-					 * finish_replacements() releases unused transfer artifacts. */
-					if (native_preview != NULL &&
-						native_preview->planTree != NULL &&
-						replacement_plan->planTree != NULL &&
-						bloompg_statement_has_parameterized_index_loop(
-							(PlannedStmt *) replacement_plan) &&
-						replacement_plan->planTree->total_cost >
-							native_preview->planTree->total_cost)
-					{
-						result = native_preview;
-						p1_parameterized_index_guard = true;
-					}
-					else
-						result = replacement_plan;
+					result = replacement_plan;
 					replanned = true;
 				}
 			}
@@ -523,9 +408,6 @@ bloompg_planner(Query *parse,
 					(double) p1_ms);
 			appendStringInfo(&detail, " p1_paths=%s",
 				p1_path_transform_json);
-			if (p1_parameterized_index_guard)
-				appendStringInfoString(&detail,
-					" p1_parameterized_index_guard=yes");
 			if (transfer_failed)
 				appendStringInfo(&detail,
 					" fallback=optimizer_execution_error sqlstate=%s",

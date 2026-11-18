@@ -101,6 +101,18 @@ bloompg_begin_filter(CustomScanState *custom_state, EState *estate, int eflags)
 	state->fallback_state = ExecInitNode((Plan *) linitial(scan->custom_plans),
 		estate, eflags);
 	state->css.custom_ps = list_make1(state->fallback_state);
+	/* Keep native indexed access and rechecks, but evaluate
+	 * runtime filters before local predicates and payload projection, just
+	 * as the existing sequential prefilter does. */
+	if (state->prefilter &&
+		(IsA(state->fallback_state, BitmapHeapScanState) ||
+		 IsA(state->fallback_state, IndexScanState)))
+	{
+		state->prefilter_qual = state->fallback_state->qual;
+		state->prefilter_projection = state->fallback_state->ps_ProjInfo;
+		state->fallback_state->qual = NULL;
+		state->fallback_state->ps_ProjInfo = NULL;
+	}
 	foreach(cell, scan->custom_private)
 	{
 		List *metadata = lfirst_node(List, cell);
@@ -362,10 +374,15 @@ bloompg_exec_prefilter(BloomPGFilterState *state)
 {
 	CustomScanState *custom_state = &state->css;
 	ScanState *output_state = &custom_state->ss;
-	SeqScanState *scan_state = castNode(SeqScanState, state->fallback_state);
-	TableScanDesc scan_descriptor = scan_state->ss.ss_currentScanDesc;
-	TupleTableSlot *scan_slot = scan_state->ss.ss_ScanTupleSlot;
-	ExprContext *expression_context = scan_state->ss.ps.ps_ExprContext;
+	ScanState *scan_state = (ScanState *) state->fallback_state;
+	bool indexed = IsA(state->fallback_state, BitmapHeapScanState) ||
+		IsA(state->fallback_state, IndexScanState);
+	TableScanDesc scan_descriptor = scan_state->ss_currentScanDesc;
+	TupleTableSlot *scan_slot = scan_state->ss_ScanTupleSlot;
+	ExprContext *expression_context = scan_state->ps.ps_ExprContext;
+	ExprState *qual = indexed ? state->prefilter_qual : scan_state->ps.qual;
+	ProjectionInfo *projection = indexed ? state->prefilter_projection :
+		scan_state->ps.ps_ProjInfo;
 	ListCell *cell;
 
 	foreach(cell, state->filters)
@@ -376,19 +393,26 @@ bloompg_exec_prefilter(BloomPGFilterState *state)
 			exec_filter->filter->inserted == 0)
 			return NULL;
 	}
-	if (scan_descriptor == NULL)
+	if (!indexed && scan_descriptor == NULL)
 	{
-		scan_descriptor = table_beginscan(
-			scan_state->ss.ss_currentRelation,
-			scan_state->ss.ps.state->es_snapshot, 0, NULL);
-		scan_state->ss.ss_currentScanDesc = scan_descriptor;
+		scan_descriptor = table_beginscan(scan_state->ss_currentRelation,
+			scan_state->ps.state->es_snapshot, 0, NULL);
+		scan_state->ss_currentScanDesc = scan_descriptor;
 	}
-	while (table_scan_getnextslot(scan_descriptor,
-			scan_state->ss.ps.state->es_direction, scan_slot))
+	for (;;)
 	{
 		TupleTableSlot *result_slot;
 		bool accepted = true;
 
+		if (indexed)
+		{
+			scan_slot = ExecProcNode(state->fallback_state);
+			if (TupIsNull(scan_slot))
+				break;
+		}
+		else if (!table_scan_getnextslot(scan_descriptor,
+				scan_state->ps.state->es_direction, scan_slot))
+			break;
 		ResetExprContext(expression_context);
 		expression_context->ecxt_scantuple = scan_slot;
 		foreach(cell, state->filters)
@@ -421,11 +445,9 @@ bloompg_exec_prefilter(BloomPGFilterState *state)
 		}
 		if (!accepted)
 			continue;
-		if (scan_state->ss.ps.qual != NULL &&
-			!ExecQual(scan_state->ss.ps.qual, expression_context))
+		if (qual != NULL && !ExecQual(qual, expression_context))
 			continue;
-		result_slot = scan_state->ss.ps.ps_ProjInfo != NULL ?
-			ExecProject(scan_state->ss.ps.ps_ProjInfo) : scan_slot;
+		result_slot = projection != NULL ? ExecProject(projection) : scan_slot;
 		ExecCopySlot(output_state->ss_ScanTupleSlot, result_slot);
 		output_state->ps.ps_ExprContext->ecxt_scantuple =
 			output_state->ss_ScanTupleSlot;
@@ -443,7 +465,10 @@ bloompg_exec_filter(CustomScanState *custom_state)
 	BloomPGFilterState *state = (BloomPGFilterState *) custom_state;
 	ScanState *scan_state = &custom_state->ss;
 
-	if (state->prefilter && IsA(state->fallback_state, SeqScanState))
+	if (state->prefilter &&
+		(IsA(state->fallback_state, SeqScanState) ||
+		 IsA(state->fallback_state, BitmapHeapScanState) ||
+		 IsA(state->fallback_state, IndexScanState)))
 		return bloompg_exec_prefilter(state);
 
 	for (;;)

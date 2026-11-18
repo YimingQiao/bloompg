@@ -17,6 +17,7 @@
 #include "access/tableam.h"
 #include "access/sysattr.h"
 #include "executor/executor.h"
+#include "executor/nodeGather.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -172,7 +173,7 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 	const char *query_string, ParamListInfo bound_params,
 	int parallel_workers, int *parallel_workers_launched,
 	TupleDesc packed_descriptor, double *inline_filter_ms,
-	BloomPGRelationState *worker_build_state)
+	BloomPGRelationState *worker_build_state, BloomPGRelationState *index_profile)
 {
 	BloomPGFilterReceiver *receiver;
 	QueryDesc *query_desc = NULL;
@@ -187,13 +188,20 @@ bloompg_run_source_statement(PlannedStmt *detached, List *pending,
 		query_desc = CreateQueryDesc(detached,
 								 query_string != NULL ? query_string : "<bloompg transfer>",
 								 GetActiveSnapshot(), InvalidSnapshot,
-								 (DestReceiver *) receiver, bound_params, NULL, 0);
+								 (DestReceiver *) receiver, bound_params, NULL,
+								 index_profile != NULL ? INSTRUMENT_ROWS : 0);
 		ExecutorStart(query_desc, 0);
 		ExecutorRun(query_desc, ForwardScanDirection, 0);
 		if (parallel_workers > 0 && IsA(query_desc->planstate, GatherState))
 			*parallel_workers_launched =
 				castNode(GatherState, query_desc->planstate)->nworkers_launched;
 		ExecutorFinish(query_desc);
+		if (index_profile != NULL)
+		{
+			ExecShutdownGather(castNode(GatherState, query_desc->planstate));
+			bloompg_collect_parallel_index_profile(query_desc->planstate,
+				index_profile);
+		}
 		ExecutorEnd(query_desc);
 		FreeQueryDesc(query_desc);
 		query_desc = NULL;
@@ -226,7 +234,7 @@ bloompg_execute_source(BloomPGRelationState *state,
 								   int parallel_workers,
 								   int *next_plan_node_id,
 								   int *parallel_workers_launched,
-								   double *inline_filter_ms)
+								   double *inline_filter_ms, Plan *indexed_scan)
 {
 	PlannedStmt *detached = copyObject(candidate);
 	Plan *build_plan;
@@ -247,7 +255,7 @@ bloompg_execute_source(BloomPGRelationState *state,
 			MemoryContext old_context;
 
 			build_plan = bloompg_make_parallel_source(state, parallel_workers,
-				next_plan_node_id, build_metadata);
+				next_plan_node_id, build_metadata, indexed_scan);
 			old_context = MemoryContextSwitchTo(TopTransactionContext);
 			packed_descriptor = ExecCleanTypeFromTL(
 				state->fallback_plan->targetlist);
@@ -267,7 +275,8 @@ bloompg_execute_source(BloomPGRelationState *state,
 		rows = bloompg_run_source_statement(detached, pending, store, descriptor,
 			query_string, bound_params, parallel_workers,
 			parallel_workers_launched, packed_descriptor, inline_filter_ms,
-			build_metadata != NIL ? state : NULL);
+			build_metadata != NIL ? state : NULL,
+			indexed_scan != NULL && bloompg_profile_enabled ? state : NULL);
 		*inline_filter_ms += state->worker_filter_merge_ms - merge_before;
 	}
 	PG_FINALLY();
@@ -297,25 +306,67 @@ typedef struct BloomPGAccessDecision
 	Size	parallel_memory;
 } BloomPGAccessDecision;
 
-/* The schedule is already fixed. Use a native bitmap scan whenever an exact
- * incoming key set has a compatible index; otherwise retain the scan path. */
+/* The schedule is already fixed. Use bitmap access for selective indexed
+ * domains, and retain the ordinary scan path for broader inputs. */
 static BloomPGAccessDecision
-bloompg_choose_access(BloomPGRelationState *state, bool query_parallel_safe)
+bloompg_choose_access(BloomPGRelationState *state, bool query_parallel_safe,
+	int *next_plan_node_id, ParamListInfo bound_params, Plan **indexed_scan,
+	ParamListInfo *indexed_params)
 {
 	BloomPGAccessDecision decision = {
 		BLOOMPG_ACCESS_NATIVE_LOCAL, "native-local", "no-transfer-filter",
 		0, 0
 	};
-	bool direct_indexed = state->filters != NIL &&
-		bloompg_index_prefilter_available(state,
-			bloompg_index_transfer_max_fraction);
 	bool scan_required;
+	ListCell *cell;
 
-	if (direct_indexed)
+	/* The serial prefilter already short-circuits an empty build. Route it
+	 * there before reserving parallel memory or launching scan workers. */
+	if (state->table->rte_kind == RTE_RELATION &&
+		bloompg_scan_has_base_slot_semantics(state->fallback_plan))
+	{
+		foreach(cell, state->filters)
+		{
+			BloomPGSampleFilter *filter = lfirst(cell);
+
+			if (filter->filter != NULL && filter->filter->valid &&
+				filter->filter->inserted == 0)
+			{
+				decision.kind = BLOOMPG_ACCESS_SERIAL_SCAN;
+				decision.name = "serial-scan";
+				decision.reason = "empty-transfer-domain";
+				return decision;
+			}
+		}
+	}
+	if (state->filters != NIL &&
+		bloompg_index_prefilter_available(state, false))
 	{
 		decision.kind = BLOOMPG_ACCESS_DIRECT_INDEX;
-		decision.name = "bitmap-index";
+		decision.name = "indexed-access";
 		decision.reason = "exact-indexed-domain";
+		decision.workers = bloompg_transfer_worker_count(state,
+			query_parallel_safe);
+		if (decision.workers > 0)
+		{
+			decision.parallel_memory = bloompg_parallel_pack_memory(decision.workers);
+			if (bloompg_memory_budget_reserve(state->memory_budget,
+					decision.parallel_memory))
+			{
+				*indexed_scan = bloompg_make_parallel_index_source(state,
+					next_plan_node_id, bound_params, indexed_params);
+				if (*indexed_scan != NULL)
+				{
+					decision.kind = BLOOMPG_ACCESS_PARALLEL_SCAN;
+					decision.name = "parallel-bitmap";
+					return decision;
+				}
+				bloompg_memory_budget_release_reservation(state->memory_budget,
+					decision.parallel_memory);
+			}
+		}
+		decision.workers = 0;
+		decision.parallel_memory = 0;
 		return decision;
 	}
 
@@ -331,8 +382,7 @@ bloompg_choose_access(BloomPGRelationState *state, bool query_parallel_safe)
 		{
 			decision.kind = BLOOMPG_ACCESS_PARALLEL_SCAN;
 			decision.name = "parallel-scan";
-			decision.reason = scan_required ? "broad-domain" :
-				"parallel-local-scan";
+			decision.reason = scan_required ? "broad-domain" : "parallel-local-scan";
 			return decision;
 		}
 	}
@@ -601,10 +651,13 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	int parallel_workers_launched = 0;
 	BloomPGAccessDecision decision;
 	bool used_parallel_source = false;
+	Plan *indexed_scan = NULL;
+	ParamListInfo indexed_params = NULL;
 
 	state->materialization_used_filters |= state->filters != NIL;
 	INSTR_TIME_SET_CURRENT(started);
-	decision = bloompg_choose_access(state, query_parallel_safe);
+	decision = bloompg_choose_access(state, query_parallel_safe,
+		next_plan_node_id, bound_params, &indexed_scan, &indexed_params);
 	state->access_decision_kind = decision.name;
 	state->access_decision_reason = decision.reason;
 	state->access_decision_workers = decision.workers;
@@ -614,12 +667,15 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	if (decision.kind == BLOOMPG_ACCESS_PARALLEL_SCAN)
 	{
 		used_parallel_source = true;
-		state->materialization_access_path = "parallel-p0";
+		state->materialization_access_path = indexed_scan != NULL ?
+			decision.name : "parallel-p0";
 		PG_TRY();
 		{
 			rows = bloompg_execute_source(state, candidate, source_plan, pending,
-				store, descriptor, query_string, bound_params, decision.workers,
-				next_plan_node_id, &parallel_workers_launched, &inline_filter_ms);
+				store, descriptor, query_string,
+				indexed_scan != NULL ? indexed_params : bound_params, decision.workers,
+				next_plan_node_id, &parallel_workers_launched, &inline_filter_ms,
+				indexed_scan);
 		}
 		PG_FINALLY();
 		{
@@ -637,7 +693,7 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 		state->materialization_access_path = "native-p0";
 		rows = bloompg_execute_source(state, candidate, source_plan, pending,
 			store, descriptor, query_string, bound_params, 0,
-			next_plan_node_id, &parallel_workers_launched, &inline_filter_ms);
+			next_plan_node_id, &parallel_workers_launched, &inline_filter_ms, NULL);
 	}
 	INSTR_TIME_SET_CURRENT(elapsed);
 	INSTR_TIME_SUBTRACT(elapsed, started);
@@ -653,6 +709,8 @@ bloompg_execute_state_source(BloomPGRelationState *state,
 	filter_ms = inline_filter_ms +
 		bloompg_transfer_elapsed_ms(filter_started);
 	scan_ms = Max(scan_ms - inline_filter_ms, 0.0);
+	if (indexed_scan != NULL)
+		state->index_probe_ms += scan_ms;
 	state->filter_prepare_ms += filter_ms;
 	state->filter_build_ms += filter_ms;
 	state->exact_scans++;

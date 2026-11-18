@@ -43,7 +43,8 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 	BloomPGJoinGraph *graph, BloomPGRelationState **states,
 	int relation_count, const char *query_string,
 	ParamListInfo bound_params,
-	bool query_parallel_safe, int *next_plan_node_id_target,
+	bool query_parallel_safe, bool query_parallel_allowed,
+	int *next_plan_node_id_target,
 	BloomPGTransferOutcome *outcome_target, StringInfoData *detail_target)
 {
 	BloomPGTransferOutcome outcome = *outcome_target;
@@ -230,8 +231,10 @@ bloompg_finalize_replacements(PlannedStmt *candidate,
 	/* A parallel CustomScan serializes its vectors or filters into DSM while the
 	 * originals remain resident. Reserve every possible copy only after all
 	 * materializations are complete, so path exposure cannot exceed the
-	 * query-wide budget. */
-	if (query_parallel_safe && query_budget != NULL)
+	 * query-wide budget. P1 checks each native path and added filter for
+	 * parallel safety; restricted operations elsewhere in the query do not
+	 * prevent safe scans from using these shared copies. */
+	if (query_parallel_allowed && query_budget != NULL)
 	{
 		ListCell *cell;
 

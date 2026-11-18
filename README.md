@@ -52,13 +52,13 @@ materialization, execution, and complete output consumption.
 All completed Native/BloomPG pairs produced identical complete-output
 fingerprints. Each execution has a 300-second limit, and totals include only
 queries completed by both systems. BloomPG completed every query; native
-PostgreSQL reached the limit once in CEB and once in STATS-CEB. PostgreSQL's
-normal indexes remain available to both sides, while BloomPG's experimental
-index-assisted transfer materialization is disabled for this table.
+PostgreSQL reached the limit once in CEB and once in STATS-CEB. These historical
+measurements predate the current access and scheduling defaults.
 
 ## Install
 
-BloomPG currently requires PostgreSQL 18 server headers and PGXS.
+BloomPG requires PostgreSQL 18 server headers and PGXS. No PostgreSQL backend
+patch is required.
 
 ### Docker quickstart
 
@@ -128,9 +128,6 @@ SET bloompg.transfer_workers = 8;
 `ndv` tracks only exact equality-key cardinality and is the recommended
 default. `rows` keeps the original row-count propagation algorithm. See
 [configuration](docs/CONFIGURATION.md) for all settings and memory guidance.
-Exact-key index-assisted materialization is available as an experimental,
-opt-in feature through `bloompg.index_transfer`; stable transfer uses scan
-paths by default.
 
 For query-level diagnostics:
 
